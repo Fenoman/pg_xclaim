@@ -1,0 +1,36 @@
+-- test/sql/twophase_reject.sql
+-- Two-Phase Commit Rejection
+-- BEGIN; acquire claim; PREPARE TRANSACTION => ERRCODE_FEATURE_NOT_SUPPORTED
+-- After abort: no leaked entries (xclaim.count() = 0, debug() empty)
+
+\set VERBOSITY terse
+\set ON_ERROR_STOP off
+
+CREATE EXTENSION IF NOT EXISTS pg_xclaim;
+
+-- Acquire a claim then attempt PREPARE TRANSACTION
+-- Expected: ERROR with ERRCODE_FEATURE_NOT_SUPPORTED (SQLSTATE 0A000)
+BEGIN;
+SELECT xclaim.try(1, 8001) AS acquired;
+SELECT xclaim.count() AS count_before_prepare;
+PREPARE TRANSACTION 'xclaim_2pc_test';
+
+-- If we get here PREPARE succeeded (should not happen)
+-- Clean up just in case (to not leave orphan prepared xact)
+ROLLBACK PREPARED 'xclaim_2pc_test';
+
+\set ON_ERROR_STOP on
+
+-- After the ERROR + implicit ABORT: count must be 0 (idempotent cleanup)
+SELECT xclaim.count() AS count_after_2pc_abort;
+
+-- debug() must show no leaked entries
+SELECT count(*) AS debug_empty_after_2pc FROM xclaim.debug();
+
+-- Verify the key is reusable (cleanup ran correctly on ABORT re-entry)
+BEGIN;
+SELECT xclaim.try(1, 8001) AS key_reusable_after_2pc_abort;
+COMMIT;
+
+-- No entries of any xclaim after test
+SELECT xclaim.count() AS final_count;

@@ -1,0 +1,36 @@
+# Build artifacts (PGXS)
+*.o
+*.a
+*.so
+*.bc
+*.dylib
+*.dSYM/
+.deps/
+
+# pg_regress runtime output (primary suite)
+test/log/
+test/results/
+test/tmp_check*/
+test/regression.diffs
+test/regression.out
+
+# pg_regress runtime output (capacity suite)
+test/capacity/log/
+test/capacity/results/
+test/capacity/tmp_check*/
+test/capacity/regression.diffs
+test/capacity/regression.out
+
+# pg_regress runtime output (nonpreload suite)
+test/nonpreload/log/
+test/nonpreload/results/
+test/nonpreload/tmp_check*/
+test/nonpreload/regression.diffs
+test/nonpreload/regression.out
+
+# pg_regress runtime output (lwlocks suite)
+test/lwlocks/log/
+test/lwlocks/results/
+test/lwlocks/tmp_check*/
+test/lwlocks/regression.diffs
+test/lwlocks/regression.out

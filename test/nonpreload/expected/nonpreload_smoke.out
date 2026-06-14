@@ -1,0 +1,22 @@
+-- test/sql_nonpreload/nonpreload_smoke.sql
+-- Non-preloaded Call Failure
+-- Server started WITHOUT pg_xclaim in shared_preload_libraries.
+-- LOAD 'pg_xclaim' succeeds silently (no FATAL).
+-- SELECT xclaim.try(1, 1) ERRORs with ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE.
+--
+-- Cluster started with test/nonpreload.conf (no shared_preload_libraries for pg_xclaim)
+\set VERBOSITY terse
+\set ON_ERROR_STOP on
+-- Create the extension (control file installs SQL objects; .so loaded lazily)
+CREATE EXTENSION IF NOT EXISTS pg_xclaim;
+-- LOAD succeeds silently -- _PG_init returns without side effects
+-- (xclaim_state_initialized remains false)
+LOAD 'pg_xclaim';
+-- Now try to use it -- must ERROR with OBJECT_NOT_IN_PREREQUISITE_STATE
+-- (XCLAIM_REQUIRE_INIT() check)
+\set ON_ERROR_STOP off
+BEGIN;
+SELECT xclaim.try(1, 1);
+ERROR:  pg_xclaim must be loaded via shared_preload_libraries
+ROLLBACK;
+\set ON_ERROR_STOP on

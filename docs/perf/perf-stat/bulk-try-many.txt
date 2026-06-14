@@ -1,0 +1,24 @@
+# Scenario: bulk-try-many
+# PG 17 on x86_64 Linux, 2026-05-25T17:03:17+00:00
+# Window: 12s, concurrent=0
+# Events: cycles,instructions,cache-references,cache-misses,LLC-load-misses,LLC-store-misses,branch-instructions,branch-misses,page-faults,context-switches,cpu-migrations
+
+# started on Mon May 25 17:03:17 2026
+
+
+ Performance counter stats for 'system wide':
+
+       29288910837      cycles                                                                  (66.67%)
+       33136801546      instructions                     #    1.13  insn per cycle              (66.67%)
+        1111219623      cache-references                                                        (66.66%)
+         377497245      cache-misses                     #   33.97% of all cache refs           (66.67%)
+   <not supported>      LLC-load-misses                                                       
+   <not supported>      LLC-store-misses                                                      
+        5978655584      branch-instructions                                                     (66.67%)
+         173346287      branch-misses                    #    2.90% of all branches             (66.66%)
+            264518      page-faults                                                           
+             76855      context-switches                                                      
+              2850      cpu-migrations                                                        
+
+      12.006921761 seconds time elapsed
+

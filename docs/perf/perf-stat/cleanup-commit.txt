@@ -1,0 +1,24 @@
+# Scenario: cleanup-commit
+# PG 17 on x86_64 Linux, 2026-05-25T17:03:48+00:00
+# Window: 12s, concurrent=0
+# Events: cycles,instructions,cache-references,cache-misses,LLC-load-misses,LLC-store-misses,branch-instructions,branch-misses,page-faults,context-switches,cpu-migrations
+
+# started on Mon May 25 17:03:48 2026
+
+
+ Performance counter stats for 'system wide':
+
+       23981512441      cycles                                                                  (66.66%)
+       14761942669      instructions                     #    0.62  insn per cycle              (66.67%)
+        1098668228      cache-references                                                        (66.67%)
+         412091491      cache-misses                     #   37.51% of all cache refs           (66.68%)
+   <not supported>      LLC-load-misses                                                       
+   <not supported>      LLC-store-misses                                                      
+        2726304220      branch-instructions                                                     (66.67%)
+         164528386      branch-misses                    #    6.03% of all branches             (66.66%)
+            229299      page-faults                                                           
+             89314      context-switches                                                      
+              3565      cpu-migrations                                                        
+
+      12.006800912 seconds time elapsed
+

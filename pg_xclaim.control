@@ -1,0 +1,9 @@
+default_version = '1.0.0-rc1'
+module_pathname = '$libdir/pg_xclaim'
+relocatable = false
+schema = xclaim
+requires = ''
+trusted = false
+superuser = true
+# Note: this extension is NOT supported on hot standby; remove from
+# shared_preload_libraries on replicas.

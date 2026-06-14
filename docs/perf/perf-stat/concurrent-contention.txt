@@ -1,0 +1,24 @@
+# Scenario: concurrent-contention
+# PG 17 on x86_64 Linux, 2026-05-25T17:04:23+00:00
+# Window: 15s, concurrent=10
+# Events: cycles,instructions,cache-references,cache-misses,LLC-load-misses,LLC-store-misses,branch-instructions,branch-misses,page-faults,context-switches,cpu-migrations
+
+# started on Mon May 25 17:04:23 2026
+
+
+ Performance counter stats for 'system wide':
+
+       39050637115      cycles                                                                  (66.67%)
+       29368996411      instructions                     #    0.75  insn per cycle              (66.66%)
+        1499801345      cache-references                                                        (66.67%)
+         485646979      cache-misses                     #   32.38% of all cache refs           (66.67%)
+   <not supported>      LLC-load-misses                                                       
+   <not supported>      LLC-store-misses                                                      
+        5578454514      branch-instructions                                                     (66.67%)
+         253822769      branch-misses                    #    4.55% of all branches             (66.67%)
+            527072      page-faults                                                           
+            103614      context-switches                                                      
+              5352      cpu-migrations                                                        
+
+      15.006648827 seconds time elapsed
+

@@ -1,0 +1,99 @@
+-- test/sql/bulk_array_shape.sql
+-- xclaim.try_many output array preserves input dimensions and lower
+-- bounds. A flat 1-D 1-indexed result for multi-dimensional or
+-- custom-lbound input would silently drop shape metadata that
+-- downstream queries rely on; pg_regress pins the invariant here.
+--
+-- Also covers the synthetic-large-array guard: passing an array larger
+-- than MaxAllocSize / sizeof(XClaimBulkSlot) elements must produce a
+-- typed ERROR (ERRCODE_PROGRAM_LIMIT_EXCEEDED) with an actionable HINT
+-- rather than a generic palloc failure or, on 32-bit, a silent heap
+-- overflow.
+\set VERBOSITY terse
+\set ON_ERROR_STOP on
+CREATE EXTENSION IF NOT EXISTS pg_xclaim;
+NOTICE:  extension "pg_xclaim" already exists, skipping
+-- 1. 1-D 1-indexed input (baseline).
+BEGIN;
+SELECT array_dims(xclaim.try_many(1, ARRAY[10, 20, 30]::int4[]))   AS pair_1d_dims,
+       array_dims(xclaim.try_many(ARRAY[1, 2, 3]::int8[]))         AS solo_1d_dims;
+ pair_1d_dims | solo_1d_dims 
+--------------+--------------
+ [1:3]        | [1:3]
+(1 row)
+
+ROLLBACK;
+-- 2. 2-D input -> 2-D output, same shape.
+BEGIN;
+SELECT array_dims(xclaim.try_many(1, ARRAY[[10, 20], [30, 40]]::int4[]))     AS pair_2d_dims;
+ pair_2d_dims 
+--------------
+ [1:2][1:2]
+(1 row)
+
+SELECT xclaim.try_many(1, ARRAY[[10, 20], [30, 40]]::int4[])                  AS pair_2d_result;
+ pair_2d_result 
+----------------
+ {{t,t},{t,t}}
+(1 row)
+
+SELECT array_dims(xclaim.try_many(ARRAY[[1, 2], [3, 4]]::int8[]))             AS solo_2d_dims;
+ solo_2d_dims 
+--------------
+ [1:2][1:2]
+(1 row)
+
+SELECT xclaim.try_many(ARRAY[[1, 2], [3, 4]]::int8[])                          AS solo_2d_result;
+ solo_2d_result 
+----------------
+ {{t,t},{t,t}}
+(1 row)
+
+ROLLBACK;
+-- 3. Custom lower bound preserved.
+BEGIN;
+SELECT array_dims(xclaim.try_many(2, '[0:2]={100,200,300}'::int4[]))          AS pair_lbound_dims;
+ pair_lbound_dims 
+------------------
+ [0:2]
+(1 row)
+
+SELECT xclaim.try_many(2, '[0:2]={100,200,300}'::int4[])                       AS pair_lbound_result;
+ pair_lbound_result 
+--------------------
+ [0:2]={t,t,t}
+(1 row)
+
+SELECT array_dims(xclaim.try_many('[5:7]={10,20,30}'::int8[]))                 AS solo_lbound_dims;
+ solo_lbound_dims 
+------------------
+ [5:7]
+(1 row)
+
+SELECT xclaim.try_many('[5:7]={10,20,30}'::int8[])                              AS solo_lbound_result;
+ solo_lbound_result 
+--------------------
+ [5:7]={t,t,t}
+(1 row)
+
+ROLLBACK;
+-- 4. Empty array returns empty (1-D, no shape to preserve).
+BEGIN;
+SELECT xclaim.try_many(1, ARRAY[]::int4[]) AS pair_empty,
+       xclaim.try_many(ARRAY[]::int8[])    AS solo_empty;
+ pair_empty | solo_empty 
+------------+------------
+ {}         | {}
+(1 row)
+
+ROLLBACK;
+-- 5. Synthetic large array -> typed ERROR, no crash.
+-- 50M int4 elements means slots array would want ~1.6 GB on 64-bit, well
+-- over MaxAllocSize (1 GB). We catch this before palloc with our own
+-- ERRCODE_PROGRAM_LIMIT_EXCEEDED + HINT.
+\set ON_ERROR_STOP off
+BEGIN;
+SELECT xclaim.try_many(0, ARRAY(SELECT generate_series(1, 50000000)::int4)) IS NOT NULL AS should_error;
+ERROR:  pg_xclaim: xclaim.try_many array too large (50000000 elements)
+ROLLBACK;
+\set ON_ERROR_STOP on

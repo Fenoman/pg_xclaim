@@ -1,0 +1,24 @@
+# Scenario: scalar-acquire
+# PG 17 on x86_64 Linux, 2026-05-25T17:02:45+00:00
+# Window: 12s, concurrent=0
+# Events: cycles,instructions,cache-references,cache-misses,LLC-load-misses,LLC-store-misses,branch-instructions,branch-misses,page-faults,context-switches,cpu-migrations
+
+# started on Mon May 25 17:02:45 2026
+
+
+ Performance counter stats for 'system wide':
+
+       20738620648      cycles                                                                  (66.67%)
+       13099058150      instructions                     #    0.63  insn per cycle              (66.66%)
+         887999386      cache-references                                                        (66.67%)
+         349081192      cache-misses                     #   39.31% of all cache refs           (66.67%)
+   <not supported>      LLC-load-misses                                                       
+   <not supported>      LLC-store-misses                                                      
+        2403490609      branch-instructions                                                     (66.67%)
+         140457680      branch-misses                    #    5.84% of all branches             (66.67%)
+            117401      page-faults                                                           
+             85991      context-switches                                                      
+              2366      cpu-migrations                                                        
+
+      12.006304709 seconds time elapsed
+

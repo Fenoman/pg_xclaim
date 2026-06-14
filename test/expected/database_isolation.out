@@ -1,0 +1,59 @@
+-- test/sql/database_isolation.sql
+-- Database Isolation
+-- XClaimKey includes dbid (MyDatabaseId) so claims are database-scoped.
+-- This single-session test verifies:
+--   1. The database_oid field in debug_snapshot() matches current db OID
+--   2. Claims acquired in this db cannot be observed as cross-db entries
+-- Cross-database multi-session conflict testing lives in the concurrency suite.
+\set VERBOSITY terse
+\set ON_ERROR_STOP on
+CREATE EXTENSION IF NOT EXISTS pg_xclaim;
+NOTICE:  extension "pg_xclaim" already exists, skipping
+-- Acquire a claim and verify database_oid in debug output matches current db
+BEGIN;
+SELECT xclaim.try(1, 3001) AS acquired;
+ acquired 
+----------
+ t
+(1 row)
+
+-- debug_snapshot() must show database_oid = MyDatabaseId
+SELECT
+    database_oid = (SELECT oid FROM pg_database WHERE datname = current_database()) AS db_oid_matches
+FROM xclaim.debug_snapshot()
+WHERE key = 3001;
+ db_oid_matches 
+----------------
+ t
+(1 row)
+
+COMMIT;
+-- Another sanity check: after commit, no lingering entries
+SELECT count(*) AS entries_after_commit FROM xclaim.debug_snapshot();
+ entries_after_commit 
+----------------------
+                    0
+(1 row)
+
+-- Verify that acquiring same (scope, key) in SAME db/session reuses reentrancy
+BEGIN;
+SELECT xclaim.try(1, 3002) AS first;
+ first 
+-------
+ t
+(1 row)
+
+SELECT xclaim.try(1, 3002) AS reentrant;
+ reentrant 
+-----------
+ t
+(1 row)
+
+-- Only 1 shared entry (reentrancy)
+SELECT count(*) AS one_shared_entry FROM xclaim.debug_snapshot() WHERE key = 3002;
+ one_shared_entry 
+------------------
+                1
+(1 row)
+
+COMMIT;

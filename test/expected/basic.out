@@ -1,0 +1,149 @@
+-- test/sql/basic.sql
+-- Basic SQL Tests
+-- Tests: extension loads, try returns true, reentrancy, different key/scope,
+--        count(), debug()/debug_snapshot(), NULL handling.
+--
+-- pg_regress runs this against a preloaded cluster (test/regress.conf).
+-- All timing-based assertions are exercised in the concurrency suite.
+\set VERBOSITY terse
+\set ON_ERROR_STOP on
+-- Extension loads when preloaded
+CREATE EXTENSION IF NOT EXISTS pg_xclaim;
+NOTICE:  extension "pg_xclaim" already exists, skipping
+-- try(scope, key) returns true
+BEGIN;
+SELECT xclaim.try(1, 100);
+ try 
+-----
+ t
+(1 row)
+
+COMMIT;
+-- Reentrant same key in same transaction returns true (no new entry)
+BEGIN;
+SELECT xclaim.try(1, 200) AS first_acquire;
+ first_acquire 
+---------------
+ t
+(1 row)
+
+SELECT xclaim.try(1, 200) AS reentrant;
+ reentrant 
+-----------
+ t
+(1 row)
+
+COMMIT;
+-- Different key in same transaction returns true
+BEGIN;
+SELECT xclaim.try(1, 300) AS key_300;
+ key_300 
+---------
+ t
+(1 row)
+
+SELECT xclaim.try(1, 301) AS key_301;
+ key_301 
+---------
+ t
+(1 row)
+
+COMMIT;
+-- Different scope (classid) in same transaction returns true
+BEGIN;
+SELECT xclaim.try(1, 400) AS scope_1;
+ scope_1 
+---------
+ t
+(1 row)
+
+SELECT xclaim.try(2, 400) AS scope_2;
+ scope_2 
+---------
+ t
+(1 row)
+
+COMMIT;
+-- count() reflects local claims
+BEGIN;
+SELECT xclaim.count() AS before_acquire;
+ before_acquire 
+----------------
+              0
+(1 row)
+
+SELECT xclaim.try(1, 500);
+ try 
+-----
+ t
+(1 row)
+
+SELECT xclaim.try(1, 501);
+ try 
+-----
+ t
+(1 row)
+
+SELECT xclaim.try(1, 502);
+ try 
+-----
+ t
+(1 row)
+
+SELECT xclaim.count() AS after_three_acquires;
+ after_three_acquires 
+----------------------
+                    3
+(1 row)
+
+COMMIT;
+SELECT xclaim.count() AS after_commit;
+ after_commit 
+--------------
+            0
+(1 row)
+
+-- debug() and debug_snapshot() see held locks
+BEGIN;
+SELECT xclaim.try(1, 600);
+ try 
+-----
+ t
+(1 row)
+
+SELECT xclaim.try(1, 601);
+ try 
+-----
+ t
+(1 row)
+
+-- Use COUNT so output is deterministic (no ordering assumptions)
+SELECT count(*) AS debug_count FROM xclaim.debug();
+ debug_count 
+-------------
+           2
+(1 row)
+
+SELECT count(*) AS snapshot_count FROM xclaim.debug_snapshot();
+ snapshot_count 
+----------------
+              2
+(1 row)
+
+COMMIT;
+-- NULL handling: CALLED ON NULL INPUT parity with pg_try_advisory_xact_lock.
+-- All NULL inputs should raise ERROR (not return NULL silently).
+\set ON_ERROR_STOP off
+BEGIN;
+SELECT xclaim.try(NULL::int8);
+ERROR:  pg_xclaim: xclaim.try argument must not be NULL
+ROLLBACK;
+BEGIN;
+SELECT xclaim.try(NULL::int4, 100);
+ERROR:  pg_xclaim: xclaim.try arguments must not be NULL
+ROLLBACK;
+BEGIN;
+SELECT xclaim.try(99, NULL::int4);
+ERROR:  pg_xclaim: xclaim.try arguments must not be NULL
+ROLLBACK;
+\set ON_ERROR_STOP on

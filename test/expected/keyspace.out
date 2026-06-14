@@ -1,0 +1,107 @@
+-- test/sql/keyspace.sql
+-- Keyspace Separation, No Sentinel
+-- xclaim.try(99::int8)  => FORM_SOLO, k1=99
+-- xclaim.try(0, 99)     => FORM_PAIR, k1=(0<<32 | 99)=99  BUT form field differs
+-- Both calls return true in same transaction (different hash keys due to form field)
+-- debug() shows TWO entries with same key=99 but different form values
+\set VERBOSITY terse
+\set ON_ERROR_STOP on
+CREATE EXTENSION IF NOT EXISTS pg_xclaim;
+NOTICE:  extension "pg_xclaim" already exists, skipping
+-- Test 1: solo and pair with numerically same k1 both succeed (different form)
+BEGIN;
+SELECT xclaim.try(99::int8) AS solo_99;
+ solo_99 
+---------
+ t
+(1 row)
+
+SELECT xclaim.try(0, 99)    AS pair_0_99;
+ pair_0_99 
+-----------
+ t
+(1 row)
+
+-- count() must show 2 (not 1 -- they are distinct keyspace entries)
+SELECT xclaim.count() AS two_distinct_entries;
+ two_distinct_entries 
+----------------------
+                    2
+(1 row)
+
+-- debug_snapshot() shows two entries, each with key=99, different form
+SELECT form, key
+FROM xclaim.debug_snapshot()
+WHERE key = 99
+ORDER BY form;
+ form | key 
+------+-----
+ pair |  99
+ solo |  99
+(2 rows)
+
+COMMIT;
+-- Test 2: reentrancy within same form (solo repeated = 1 entry, not 2)
+BEGIN;
+SELECT xclaim.try(99::int8) AS solo_first;
+ solo_first 
+------------
+ t
+(1 row)
+
+SELECT xclaim.try(99::int8) AS solo_reentrant;
+ solo_reentrant 
+----------------
+ t
+(1 row)
+
+-- Count is still 1 (reentrant, not doubled)
+SELECT xclaim.count() AS reentrant_count;
+ reentrant_count 
+-----------------
+               1
+(1 row)
+
+COMMIT;
+-- Test 3: verify no INT32_MIN sentinel in form or key columns
+-- XClaimForm INVALID=0, SOLO=1, PAIR=2 -- no negative values
+BEGIN;
+SELECT xclaim.try(1, 42);
+ try 
+-----
+ t
+(1 row)
+
+SELECT count(*) AS no_negative_form
+FROM xclaim.debug_snapshot()
+WHERE form NOT IN ('solo', 'pair');
+ no_negative_form 
+------------------
+                0
+(1 row)
+
+COMMIT;
+-- Test 4: solo and pair with scope=0 and key=99 are distinct across commits too
+BEGIN;
+SELECT xclaim.try(99::int8);
+ try 
+-----
+ t
+(1 row)
+
+COMMIT;
+BEGIN;
+SELECT xclaim.try(0, 99);
+ try 
+-----
+ t
+(1 row)
+
+COMMIT;
+-- Both commits clean, no cross-contamination
+SELECT xclaim.count() AS final_zero;
+ final_zero 
+------------
+          0
+(1 row)
+

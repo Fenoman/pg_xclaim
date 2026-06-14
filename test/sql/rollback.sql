@@ -1,0 +1,32 @@
+-- test/sql/rollback.sql
+-- Rollback Release
+-- BEGIN; acquire; ROLLBACK; verify key is reusable and count is 0.
+-- Constraint: ROLLBACK releases entry; xclaim.count() = 0 after rollback.
+
+\set VERBOSITY terse
+\set ON_ERROR_STOP on
+
+CREATE EXTENSION IF NOT EXISTS pg_xclaim;
+
+-- Baseline: count is 0 before any acquisition
+SELECT xclaim.count() AS initial_count;
+
+-- Acquire within a transaction, then roll back
+BEGIN;
+SELECT xclaim.try(1, 9001) AS acquired;
+SELECT xclaim.count() AS count_within_txn;
+ROLLBACK;
+
+-- After rollback: count must be 0 (cleanup ran)
+SELECT xclaim.count() AS count_after_rollback;
+
+-- debug() must show no entries for our key after rollback
+SELECT count(*) AS debug_entries_after_rollback FROM xclaim.debug();
+
+-- Key must be reusable after rollback
+BEGIN;
+SELECT xclaim.try(1, 9001) AS reusable_after_rollback;
+COMMIT;
+
+-- Final state: count = 0 after commit
+SELECT xclaim.count() AS final_count;

@@ -1,0 +1,88 @@
+-- test/capacity/sql/cap_bulk_subtxn_rollback.sql
+--
+-- Invariant: after a caught error inside xclaim.try_many(), the per-backend
+-- local set must remain in lock-step with the shared dynahash.
+--
+-- Why this matters: the bulk path inserts into shared first and mirrors
+-- into the local set. If a mid-batch capacity ERROR fires PG_CATCH inside
+-- xclaim_try_many_internal, the rollback MUST drop both sides for every
+-- partially-inserted row. A local-only ghost would let the SAME backend's
+-- reentrancy fast-path (xclaim_local_lookup) return true for a key whose
+-- shared row was already removed -- another backend could then acquire it
+-- concurrently, silently breaking mutual exclusion.
+--
+-- Strict consistency is enforced by xclaim_bulk_rollback_inserted, which
+-- pairs xclaim_local_remove() with every shared HASH_REMOVE.
+--
+-- Test design:
+--   1. Pre-flight: shared dynahash empty.
+--   2. Open outer xact, run try_many in a plpgsql DO block with
+--      EXCEPTION WHEN OTHERS that swallows the capacity ERROR (the
+--      DO block's BEGIN/EXCEPTION is itself a subtxn).
+--   3. After the caught error: outer xact still alive, but local set
+--      MUST be consistent with the shared dynahash.
+--   4. xclaim.count() == count(*) FROM xclaim.debug() -- strict
+--      consistency assertion.
+--   5. Rollback the outer xact and verify a fresh acquisition of the
+--      same keys works.
+--
+-- Cluster: test/capacity.conf -- max_claims=64, num_partitions=4.
+
+\set VERBOSITY terse
+\set ON_ERROR_STOP on
+
+CREATE EXTENSION IF NOT EXISTS pg_xclaim;
+
+-- Pre-flight: capacity_max from the test config.
+SELECT capacity_max FROM xclaim.stats();
+SHOW pg_xclaim.on_capacity_exhaustion;
+
+-- Pre-flight: shared dynahash empty before the test.
+SELECT count(*) AS pre_test_debug_rows FROM xclaim.debug();
+SELECT capacity_used AS pre_test_capacity_used FROM xclaim.stats();
+
+-- The subtxn-rollback scenario.
+BEGIN;
+
+-- Inside a plpgsql block with EXCEPTION the DO body is a subtxn.
+-- The capacity error fires mid-batch; PG_CATCH in
+-- xclaim_try_many_internal HASH_REMOVEs already-inserted shared rows
+-- AND drops the paired local-set entries -- both sides MUST be cleared
+-- atomically with respect to the rollback.
+DO $$
+BEGIN
+    BEGIN
+        PERFORM xclaim.try_many(7, ARRAY(SELECT generate_series(1, 100)::int4));
+        RAISE EXCEPTION 'try_many returned without ERROR (unexpected)';
+    EXCEPTION WHEN others THEN
+        -- Caught the ERRCODE_CONFIGURATION_LIMIT_EXCEEDED. Outer xact
+        -- continues; the catastrophic rollback already cleaned up.
+        NULL;
+    END;
+END $$;
+
+-- After caught error: strict consistency assertion. Local-set count
+-- and shared-dynahash row count MUST agree -- any divergence means a
+-- ghost local entry survived rollback and would corrupt mutual exclusion.
+SELECT xclaim.count() AS local_count_after_caught_error;
+SELECT count(*)       AS debug_rows_after_caught_error FROM xclaim.debug();
+
+-- The strict invariant: local count == shared row count.
+SELECT (xclaim.count() = (SELECT count(*) FROM xclaim.debug()))
+    AS local_matches_shared;
+
+ROLLBACK;
+
+-- Post-rollback: shared dynahash empty; capacity_used in lock-step.
+SELECT count(*) AS post_rollback_debug_rows FROM xclaim.debug();
+SELECT capacity_used AS post_rollback_capacity_used FROM xclaim.stats();
+
+-- Verify the same keys are acquirable in a fresh xact (no stale rows
+-- blocking). We stay well within capacity here -- 5 keys.
+BEGIN;
+SELECT count(*) FILTER (WHERE r) AS small_acquired
+  FROM unnest(xclaim.try_many(7, ARRAY[1,2,3,4,5]::int4[])) AS r;
+ROLLBACK;
+
+-- Final sanity.
+SELECT count(*) AS final_debug_rows FROM xclaim.debug();

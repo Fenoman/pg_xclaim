@@ -1,0 +1,183 @@
+---
+# .github/workflows/ci-pg-matrix.yml
+#
+# pg_xclaim build + test matrix on GitHub-hosted Ubuntu runners.
+# PG 16, 17, 18 covered on every push + PR.
+# ABI-compatible PostgreSQL forks are verified via manual local build.
+
+name: ci-pg-matrix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-pg-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: PG ${{ matrix.pg }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17, 18]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # Generate the locale FIRST, with the C locale in effect, so apt and
+      # locale-gen are not run under a not-yet-existing LC_ALL. Export the
+      # locale into $GITHUB_ENV so every subsequent step inherits it.
+      - name: Generate ru_RU.UTF-8 locale
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y locales
+          sudo locale-gen ru_RU.UTF-8
+          sudo update-locale LANG=ru_RU.UTF-8 LC_ALL=ru_RU.UTF-8
+          locale -a | grep -i ru_RU || (echo "ru_RU.UTF-8 missing" >&2; exit 1)
+          echo "LANG=ru_RU.UTF-8" >> "$GITHUB_ENV"
+          echo "LC_ALL=ru_RU.UTF-8" >> "$GITHUB_ENV"
+
+      - name: Install PostgreSQL ${{ matrix.pg }} + dev headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          # PGDG apt repo for matrix-version dev packages.
+          sudo apt-get install -y curl ca-certificates gnupg lsb-release \
+              build-essential python3
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+              | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+              | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+              postgresql-${{ matrix.pg }} \
+              postgresql-server-dev-${{ matrix.pg }} \
+              postgresql-client-${{ matrix.pg }}
+          # Stop the auto-started cluster so we don't conflict with temp clusters.
+          sudo pg_ctlcluster ${{ matrix.pg }} main stop || true
+
+      - name: Discover pg_config
+        id: pgcfg
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PG${{ matrix.pg }}_CONFIG="/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config"
+          PGC="$(bash scripts/find_pg_config.sh ${{ matrix.pg }})"
+          echo "pg_config=$PGC" >> "$GITHUB_OUTPUT"
+          echo "Discovered: $PGC"
+          "$PGC" --version
+
+      - name: Build (-Wall -Wextra -Werror)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PGC='${{ steps.pgcfg.outputs.pg_config }}'
+          make PG_CONFIG="$PGC" clean
+          make PG_CONFIG="$PGC" -j"$(nproc)"
+
+      - name: Install
+        shell: bash
+        run: |
+          set -euo pipefail
+          PGC='${{ steps.pgcfg.outputs.pg_config }}'
+          sudo make PG_CONFIG="$PGC" install
+
+      - name: Smoke gate (preloaded)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PGC='${{ steps.pgcfg.outputs.pg_config }}'
+          bash scripts/smoke_gate.sh "$PGC"
+
+      - name: Smoke gate (no preload)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PGC='${{ steps.pgcfg.outputs.pg_config }}'
+          bash scripts/smoke_gate_no_preload.sh "$PGC"
+
+      - name: Smoke gate (multi-preload)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PGC='${{ steps.pgcfg.outputs.pg_config }}'
+          bash scripts/smoke_gate_multi_preload.sh "$PGC"
+
+      - name: Regression suite (installcheck)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PGC='${{ steps.pgcfg.outputs.pg_config }}'
+          make PG_CONFIG="$PGC" installcheck
+
+      - name: Capacity suite (installcheck-capacity)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PGC='${{ steps.pgcfg.outputs.pg_config }}'
+          make PG_CONFIG="$PGC" installcheck-capacity
+
+      - name: Non-preload suite (installcheck-nonpreload)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PGC='${{ steps.pgcfg.outputs.pg_config }}'
+          make PG_CONFIG="$PGC" installcheck-nonpreload
+
+      - name: LWLock-budget guard suite (installcheck-lwlocks)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PGC='${{ steps.pgcfg.outputs.pg_config }}'
+          make PG_CONFIG="$PGC" installcheck-lwlocks
+
+      - name: Concurrency suite (--skip-slow)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PGC='${{ steps.pgcfg.outputs.pg_config }}'
+          export PG_CONFIG="$PGC"
+          bash test/concurrency/run_concurrency_suite.sh --skip-slow
+
+      - name: Bench try_many @ 750k (soft -- noisy on shared CI)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PGC='${{ steps.pgcfg.outputs.pg_config }}'
+          bash scripts/bench_try_many.sh --soft "$PGC"
+
+      - name: Upload test artefacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pg_xclaim-pg${{ matrix.pg }}-artifacts
+          path: |
+            test/regression.diffs
+            test/regression.out
+            test/log/
+            test/results/
+            test/capacity/results/
+            test/capacity/regression.diffs
+            test/capacity/regression.out
+            test/nonpreload/results/
+            test/nonpreload/regression.diffs
+            test/nonpreload/regression.out
+            test/lwlocks/results/
+            test/lwlocks/regression.diffs
+            test/lwlocks/regression.out
+            docs/perf/bench-*.csv
+          if-no-files-found: ignore
+          retention-days: 7
+

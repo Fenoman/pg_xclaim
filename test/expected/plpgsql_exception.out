@@ -1,0 +1,119 @@
+-- test/sql/plpgsql_exception.sql
+-- plpgsql EXCEPTION Block Compat
+-- HARD invariant: local set in TopMemoryContext survives plpgsql EXCEPTION rollback.
+-- Claims acquired inside an EXCEPTION block survive subtxn rollback.
+-- Only top-level ROLLBACK releases claims.
+\set VERBOSITY terse
+\set ON_ERROR_STOP on
+CREATE EXTENSION IF NOT EXISTS pg_xclaim;
+NOTICE:  extension "pg_xclaim" already exists, skipping
+-- Test 1: acquire inside plpgsql EXCEPTION block; claim survives subtxn rollback
+BEGIN;
+DO $$
+DECLARE
+    acquired boolean;
+BEGIN
+    SELECT xclaim.try(1, 6001) INTO acquired;
+    IF NOT acquired THEN
+        RAISE EXCEPTION 'unexpected: could not acquire 6001';
+    END IF;
+    -- Deliberately trigger subtransaction rollback via EXCEPTION
+    BEGIN
+        RAISE EXCEPTION 'inner_error';
+    EXCEPTION
+        WHEN others THEN
+            -- Exception caught; subtxn rolled back but claim should still be held
+            NULL;
+    END;
+END;
+$$;
+-- After DO block: claim from 6001 should still be held (TopMemoryContext invariant)
+SELECT xclaim.count() AS count_after_exception_block;
+ count_after_exception_block 
+-----------------------------
+                           1
+(1 row)
+
+SELECT count(*) AS debug_count_after_exception FROM xclaim.debug();
+ debug_count_after_exception 
+-----------------------------
+                           1
+(1 row)
+
+COMMIT;
+-- After commit: released
+SELECT xclaim.count() AS count_after_commit;
+ count_after_commit 
+--------------------
+                  0
+(1 row)
+
+-- Test 2: acquire THEN trigger EXCEPTION; verify count in handler
+BEGIN;
+DO $$
+DECLARE
+    cnt int8;
+BEGIN
+    PERFORM xclaim.try(1, 6002);
+    PERFORM xclaim.try(1, 6003);
+    BEGIN
+        -- Two keys acquired, then inner error
+        RAISE EXCEPTION 'inner_rollback';
+    EXCEPTION
+        WHEN others THEN
+            -- Both claims still held (advisory semantics)
+            SELECT xclaim.count() INTO cnt;
+            IF cnt < 2 THEN
+                RAISE EXCEPTION 'claims lost after subtxn rollback: count=%', cnt;
+            END IF;
+    END;
+END;
+$$;
+-- Claims still held after the DO block
+SELECT xclaim.count() AS count_after_do_block;
+ count_after_do_block 
+----------------------
+                    2
+(1 row)
+
+ROLLBACK;
+-- Released after top-level rollback
+SELECT xclaim.count() AS count_after_top_rollback;
+ count_after_top_rollback 
+--------------------------
+                        0
+(1 row)
+
+-- Test 3: verify TopMemoryContext invariant by confirming debug() still shows entries
+-- after nested EXCEPTION blocks (key acquired before the inner EXCEPTION)
+BEGIN;
+DO $$
+BEGIN
+    PERFORM xclaim.try(1, 6004);
+    BEGIN
+        PERFORM xclaim.try(1, 6005);
+        BEGIN
+            RAISE EXCEPTION 'level2_error';
+        EXCEPTION
+            WHEN others THEN NULL;
+        END;
+        -- 6005 still held here despite inner rollback
+    EXCEPTION
+        WHEN others THEN NULL;
+    END;
+    -- 6004 definitely still held
+END;
+$$;
+SELECT xclaim.count() AS count_after_nested_exception;
+ count_after_nested_exception 
+------------------------------
+                            2
+(1 row)
+
+COMMIT;
+SELECT xclaim.count() AS count_after_nested_commit;
+ count_after_nested_commit 
+---------------------------
+                         0
+(1 row)
+

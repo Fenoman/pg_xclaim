@@ -1,0 +1,43 @@
+-- test/capacity/sql/cap_warn_bulk_suppression.sql
+-- WARN-mode capacity exhaustion in xclaim.try_many emits ONE detail
+-- WARNING + ONE tail summary WARNING per bulk call, regardless of how
+-- many slots actually hit capacity. The stats counter remains exact
+-- (one tick per failed slot) for sizing observability.
+--
+-- Cluster started with test/capacity.conf: max_claims=64.
+
+\set VERBOSITY terse
+\set ON_ERROR_STOP on
+
+CREATE EXTENSION IF NOT EXISTS pg_xclaim;
+
+SET pg_xclaim.on_capacity_exhaustion = 'warn';
+
+-- Stats baseline (capacity_warnings is shared across the cluster's
+-- backends, so we record-then-compare deltas rather than asserting a
+-- specific absolute value).
+SELECT capacity_warnings AS warns_before FROM xclaim.stats() \gset
+
+-- Bulk try_many of 100 keys at max_claims=64: 64 should win, 36 should
+-- fail in WARN mode. The bulk path collapses per-slot WARNINGs into
+-- exactly TWO WARNING lines (one detail, one summary) regardless of
+-- how many slots fail; the `capacity_warnings` counter still reflects
+-- the true per-slot count. A capacity-watermark WARNING may also
+-- fire at the 95%/100% bands -- that is a separate, deliberate signal.
+BEGIN;
+SELECT
+    count(*) FILTER (WHERE acquired) AS acquired_count,
+    count(*) FILTER (WHERE NOT acquired) AS rejected_count
+FROM (
+    SELECT unnest(xclaim.try_many(1,
+        ARRAY(SELECT generate_series(1, 100)::int4))) AS acquired
+) sub;
+ROLLBACK;
+
+-- Stats delta must equal exact slot-failure count (36), proving the
+-- counter is unaffected by ereport-level suppression.
+SELECT capacity_warnings - :warns_before = 36 AS counter_exact
+FROM xclaim.stats();
+
+-- Sanity: after rollback the local set is empty.
+SELECT xclaim.count() AS after_rollback;
