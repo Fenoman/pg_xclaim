@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-Draw assets/concept.png deterministically: the partitioned-hash-table
-architecture diagram used in README.md / README_EN.md.
+Draw the partitioned-hash-table architecture diagram used in README.md /
+README_EN.md. Emitted in two languages: the bare filename is the Russian
+(primary) asset, the English one carries an _en suffix -- the same naming
+convention docs/ uses (runbook.md / runbook_en.md):
+
+    assets/concept.png      Russian (primary)
+    assets/concept_en.png   English
 
 This figure is fixed geometry (no measured data), so it is drawn with code
 rather than an image model. An image model renders the routing arrows
@@ -12,10 +17,13 @@ arrow land on its cell, the grid exactly 8x16, and the labels exact.
 Dependency: matplotlib (pip install matplotlib).
 
 Usage:
-    python3 scripts/draw_concept.py            # writes assets/concept.png
+    python3 scripts/draw_concept.py            # both langs -> concept.png + concept_en.png
+    python3 scripts/draw_concept.py --lang ru  # Russian only (bare name)
+    python3 scripts/draw_concept.py --lang en  # English only (_en name)
 """
 
 import os
+import sys
 
 import matplotlib
 
@@ -40,6 +48,30 @@ CELL_EC = "#c4d2e6"
 
 PNG_META = {"Software": None}
 
+# Per-language prose. C identifiers and macros (hash() & mask, ShmemInitHash,
+# HASH_PARTITION, HASH_BLOBS) stay verbatim in both languages, matching
+# README.md's house style; only the connective prose is translated.
+STRINGS = {
+    "en": {
+        "partitions_title": "128 partitions (default)",
+        "example_keys": "Example keys",
+        "shmem_caption": "Allocates the partitioned hash\ntable in shared memory with\n"
+                         "128 partitions.",
+        "lwlock": "one LWLock\nper partition",
+        "bottom_caption": "Each partition is an array of hash buckets (HASH_BLOBS);\n"
+                          "each bucket is a short chained list of entries.",
+    },
+    "ru": {
+        "partitions_title": "128 партиций (по умолчанию)",
+        "example_keys": "Примеры ключей",
+        "shmem_caption": "Размещает партиционированную\nхеш-таблицу в разделяемой\n"
+                         "памяти со 128 партициями.",
+        "lwlock": "один LWLock\nна партицию",
+        "bottom_caption": "Каждая партиция — массив хеш-бакетов (HASH_BLOBS);\n"
+                          "каждый бакет — короткий связный список записей.",
+    },
+}
+
 # Grid geometry: 16 columns x 8 rows = 128 partitions.
 NCOL, NROW = 16, 8
 GX0, GY0 = 4.3, 1.55      # bottom-left of the grid (data coords)
@@ -55,6 +87,27 @@ ROUTES = [
     ("42", OCHRE, 12, 3, True),     # filled -> "a slot actively held"
     ("1337", "#2a9d8f", 2, 6, False),
 ]
+
+
+def out_name(lang):
+    """Bare filename is the Russian (primary) asset; English gets an _en
+    suffix -- the same convention docs/ uses (runbook.md / runbook_en.md)."""
+    return "concept.png" if lang == "ru" else "concept_en.png"
+
+
+def parse_langs(argv):
+    """--lang en|ru|both (default both -> regenerate both assets in one run)."""
+    val = "both"
+    for i, a in enumerate(argv):
+        if a == "--lang" and i + 1 < len(argv):
+            val = argv[i + 1]
+        elif a.startswith("--lang="):
+            val = a.split("=", 1)[1]
+    if val == "both":
+        return ["ru", "en"]
+    if val in ("en", "ru"):
+        return [val]
+    raise SystemExit(f"--lang must be en|ru|both, got {val!r}")
 
 
 def cell_xy(col, row_from_top):
@@ -92,7 +145,8 @@ def key_token(ax, cx, cy, label, color):
             fontsize=13, color=INK, zorder=6)
 
 
-def main():
+def draw(lang, out):
+    S = STRINGS[lang]
     fig, ax = plt.subplots(figsize=(12.8, 7.2))  # 16:9 -> 1920x1080 at 150 dpi
     ax.set_xlim(0, 16.8)      # right headroom for the LWLock bracket + label
     ax.set_ylim(0, 8.0)
@@ -114,7 +168,7 @@ def main():
                 ha="right", va="center", fontsize=8.5, color=GRAYTEXT)
 
     ax.text(GX0 + NCOL * CW / 2, GY0 + NROW * CH + 0.42,
-            "128 partitions (default)", ha="center", va="bottom",
+            S["partitions_title"], ha="center", va="bottom",
             fontsize=15, fontweight="bold", color=NAVY)
 
     # ---- hash() & mask operator ----
@@ -162,15 +216,13 @@ def main():
             alpha=(0.85 if fill else 1.0), zorder=4,
         ))
 
-    ax.text(0.85, 1.95, "Example keys", ha="center", va="top",
+    ax.text(0.85, 1.95, S["example_keys"], ha="center", va="top",
             fontsize=9.5, color=GRAYTEXT)
 
     # ---- ShmemInitHash caption (top-left) ----
     ax.text(0.15, 7.62, "ShmemInitHash", ha="left", va="top",
             fontsize=12.5, fontweight="bold", color=NAVY)
-    ax.text(0.15, 7.18,
-            "Allocates the partitioned hash\ntable in shared memory with\n"
-            "128 partitions.",
+    ax.text(0.15, 7.18, S["shmem_caption"],
             ha="left", va="top", fontsize=9.5, color=GRAYTEXT)
 
     # ---- one LWLock per partition (right side) ----
@@ -191,23 +243,26 @@ def main():
         boxstyle="round,pad=0,rounding_size=0.05",
         linewidth=1.5, edgecolor=NAVY, facecolor="#eef3fa", zorder=4,
     ))
-    ax.text(pk_x + 0.34, pk_y, "one LWLock\nper partition", ha="left",
+    ax.text(pk_x + 0.34, pk_y, S["lwlock"], ha="left",
             va="center", fontsize=10.5, color=NAVY)
 
     # ---- bottom caption ----
     cap_cx = GX0 + NCOL * CW / 2
     ax.text(cap_cx, 1.12, "HASH_PARTITION + HASH_BLOBS",
             ha="center", va="top", fontsize=13, fontweight="bold", color=NAVY)
-    ax.text(cap_cx, 0.66,
-            "Each partition is an array of hash buckets (HASH_BLOBS);\n"
-            "each bucket is a short chained list of entries.",
+    ax.text(cap_cx, 0.66, S["bottom_caption"],
             ha="center", va="top", fontsize=10, color=GRAYTEXT)
 
     fig.subplots_adjust(left=0.005, right=0.995, top=0.995, bottom=0.005)
-    out = os.path.join(ASSETS, "concept.png")
     fig.savefig(out, dpi=150, metadata=PNG_META)
     plt.close(fig)
-    print("wrote assets/concept.png")
+    print(f"wrote assets/{os.path.basename(out)}")
+
+
+def main():
+    os.makedirs(ASSETS, exist_ok=True)
+    for lang in parse_langs(sys.argv):
+        draw(lang, os.path.join(ASSETS, out_name(lang)))
 
 
 if __name__ == "__main__":

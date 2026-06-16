@@ -4,9 +4,13 @@ Render the three data-driven figures used in README.md / README_EN.md
 straight from the authoritative benchmark CSVs, so the published numbers
 can never drift from the measurements.
 
-    assets/overview.png             headline throughput (disjoint, 6 impls)
-    assets/perf-tradeoffs.png       throughput / p95 / WAL at N=8 K=100k
-    assets/sorted-insert-finding.png  sorted-vs-unsorted crossover (overlap)
+Each figure is emitted in two languages. The bare filename is the Russian
+(primary) asset; the English one carries an _en suffix -- the same naming
+convention docs/ already uses (runbook.md / runbook_en.md):
+
+    assets/overview.png  / overview_en.png             headline throughput
+    assets/perf-tradeoffs.png / perf-tradeoffs_en.png  throughput / p95 / WAL
+    assets/sorted-insert-finding.png / ..._en.png      sorted-vs-unsorted crossover
 
 Source of truth (read, never hard-coded):
     docs/perf/bench-alternatives-20260524-disjoint-pg17.csv
@@ -20,7 +24,9 @@ README quotes, so the figure and the table are guaranteed consistent.
 Dependency: matplotlib (pip install matplotlib). No pandas required.
 
 Usage:
-    python3 scripts/plot_alternatives.py                # writes the 3 PNGs
+    python3 scripts/plot_alternatives.py                # both langs -> 6 PNGs
+    python3 scripts/plot_alternatives.py --lang ru      # Russian only (bare names)
+    python3 scripts/plot_alternatives.py --lang en      # English only (_en names)
     python3 scripts/plot_alternatives.py --check        # verify CSVs parse, no write
     DISJOINT_CSV=... OVERLAP_CSV=... python3 scripts/plot_alternatives.py
 """
@@ -70,7 +76,10 @@ COLOR = {
     "F": "#9a9a3a",  # olive    -- claim-table UNLOGGED + sorted
 }
 
-LABEL_LONG = {
+# Only C carries translatable prose ("row locks"). Every other label is
+# SQL/identifier text kept verbatim in both languages, mirroring README.md's
+# house style: UNLOGGED / LOGGED / sorted / pg_xclaim stay English.
+_LABEL_LONG = {
     "A": "A: pg_xclaim",
     "B": "B: claim-table UNLOGGED",
     "C": "C: row locks (FOR UPDATE NOWAIT)",
@@ -78,8 +87,12 @@ LABEL_LONG = {
     "E": "E: claim-table LOGGED + sorted",
     "F": "F: claim-table UNLOGGED + sorted",
 }
+LABEL_LONG = {
+    "en": _LABEL_LONG,
+    "ru": {**_LABEL_LONG, "C": "C: блокировки строк (FOR UPDATE NOWAIT)"},
+}
 
-LABEL_SHORT = {
+_LABEL_SHORT = {
     "A": "A\n(pg_xclaim)",
     "B": "B\n(UNLOGGED)",
     "C": "C\n(row locks)",
@@ -87,16 +100,107 @@ LABEL_SHORT = {
     "E": "E\n(LOGGED\n+sorted)",
     "F": "F\n(UNLOGGED\n+sorted)",
 }
+LABEL_SHORT = {
+    "en": _LABEL_SHORT,
+    "ru": {**_LABEL_SHORT, "C": "C\n(блокировки\nстрок)"},
+}
 
 K_VALUES = [1000, 10000, 100000]
 K_LABELS = ["1k", "10k", "100k"]
 
 COMMON_FOOT = "PG 17, ITERS=200, fsync=on, ACCOUNT_POOL=1M"
 
+# Per-language display strings. Technical jargon (tx/sec, p95, WAL, NOWAIT,
+# disjoint/overlap, UNLOGGED/LOGGED, deadlock, sort, INSERT) stays English in
+# BOTH languages, matching README.md's house style; only the connective prose
+# is translated. The deadlock count line is a .format() template.
+STRINGS = {
+    "en": {
+        "xlabel_keys": "Keys per transaction (K)",
+        "ylabel_tx": "Transactions / sec (total across 8 backends)",
+        "ov_title": "Throughput under concurrency without key conflicts "
+                    "(8 backends, disjoint keyspace)",
+        "ov_note": "Disjoint mode -- worker-shard keys, no conflicts. "
+                   "NOWAIT fail-fast cannot 'cheat' here; raw implementation "
+                   "cost is exposed.",
+        "full_data": "full data",
+        "tr_throughput": "Throughput (tx/sec, log scale)",
+        "tr_nowait": "* NOWAIT fail-fast\nartifact, see caveat",
+        "tr_p95": "p95 latency (ms, log scale)",
+        "tr_ux": "interactive UX boundary",
+        "tr_wal": "WAL bytes per scenario (log scale, disjoint only)",
+        "tr_nowal": "~0\n(no WAL)",
+        "tr_impl": "Implementation",
+        "tr_suptitle": "pg_xclaim trade-offs at N=8 K=100k (worst-case workload)",
+        "tr_legend_overlap": "overlap mode (~52% key overlap)",
+        "tr_legend_disjoint": "disjoint mode (no key overlap)",
+        "so_title": "Sorted INSERT under overlap concurrency: "
+                    "trading deadlocks for serialization",
+        "so_subtitle": "8 backends, ~52% key overlap, ITERS=200",
+        "so_crossover": "At high K, sorted (dashed) drops BELOW unsorted (solid):\n"
+                        "deterministic acquisition order kills deadlocks but\n"
+                        "serializes on overlapping keys.",
+        "so_lowk": "At low K: sorted is\nneutral or a small win\n(cache locality).",
+        "so_deadlocks": "Deadlocks per scenario:  B={B}  D={D}  E={E}  F={F}\n"
+                        "Sorting prevents deadlocks -- but the cure is not free.",
+    },
+    "ru": {
+        "xlabel_keys": "Ключей на транзакцию (K)",
+        "ylabel_tx": "Транзакций/сек (суммарно по 8 бэкендам)",
+        "ov_title": "Пропускная способность при конкуренции без конфликтов ключей "
+                    "(8 бэкендов, disjoint-пространство ключей)",
+        "ov_note": "Режим disjoint — ключи шардированы по воркерам, без конфликтов. "
+                   "Fail-fast NOWAIT здесь не может «сжульничать»; видна чистая "
+                   "стоимость реализации.",
+        "full_data": "полные данные",
+        "tr_throughput": "Пропускная способность (tx/sec, лог. шкала)",
+        "tr_nowait": "* артефакт fail-fast\nNOWAIT, см. оговорку",
+        "tr_p95": "p95 (мс, лог. шкала)",
+        "tr_ux": "граница интерактивного UX",
+        "tr_wal": "Байты WAL на сценарий (лог. шкала, только disjoint)",
+        "tr_nowal": "~0\n(нет WAL)",
+        "tr_impl": "Реализация",
+        "tr_suptitle": "Компромиссы pg_xclaim при N=8 K=100k (худший случай нагрузки)",
+        "tr_legend_overlap": "режим overlap (~52% пересечения ключей)",
+        "tr_legend_disjoint": "режим disjoint (без пересечения ключей)",
+        "so_title": "Sorted INSERT при overlap-конкуренции: "
+                    "deadlock'и в обмен на сериализацию",
+        "so_subtitle": "8 бэкендов, ~52% пересечения ключей, ITERS=200",
+        "so_crossover": "При высоком K sorted (пунктир) опускается НИЖЕ unsorted (сплошная):\n"
+                        "детерминированный порядок захвата убивает deadlock'и, но\n"
+                        "сериализует на пересекающихся ключах.",
+        "so_lowk": "При низком K: sort нейтрален\nили даёт небольшой выигрыш\n(cache locality).",
+        "so_deadlocks": "Deadlock'ов на сценарий:  B={B}  D={D}  E={E}  F={F}\n"
+                        "Sort устраняет deadlock'и — но лекарство не бесплатно.",
+    },
+}
+
 # Suppress matplotlib's default "Software: Matplotlib version X.Y" PNG chunk:
 # it embeds the local library version, which would churn the committed PNG
 # bytes across machines. None tells matplotlib to omit the key entirely.
 PNG_META = {"Software": None}
+
+
+def out_name(base, lang):
+    """Bare filename is the Russian (primary) asset; English gets an _en
+    suffix -- the same convention docs/ uses (runbook.md / runbook_en.md)."""
+    return f"{base}.png" if lang == "ru" else f"{base}_en.png"
+
+
+def parse_langs(argv):
+    """--lang en|ru|both (default both -> regenerate every asset in one run,
+    so a language can never be silently left stale)."""
+    val = "both"
+    for i, a in enumerate(argv):
+        if a == "--lang" and i + 1 < len(argv):
+            val = argv[i + 1]
+        elif a.startswith("--lang="):
+            val = a.split("=", 1)[1]
+    if val == "both":
+        return ["ru", "en"]
+    if val in ("en", "ru"):
+        return [val]
+    raise SystemExit(f"--lang must be en|ru|both, got {val!r}")
 
 
 # --------------------------------------------------------------------------
@@ -136,14 +240,15 @@ def human_bytes(n):
 # --------------------------------------------------------------------------
 # Figure 1: overview.png -- disjoint throughput, six lines, log-log.
 # --------------------------------------------------------------------------
-def plot_overview(disjoint, out):
+def plot_overview(disjoint, out, lang):
+    S = STRINGS[lang]
     fig, ax = plt.subplots(figsize=(12.8, 7.2))  # 16:9
 
     for impl in IMPLS:
         ys = [disjoint[impl][k]["tx"] for k in K_VALUES]
         ax.plot(
             K_VALUES, ys, marker="o", markersize=5, linewidth=2,
-            color=COLOR[impl], label=LABEL_LONG[impl],
+            color=COLOR[impl], label=LABEL_LONG[lang][impl],
         )
 
     ax.set_xscale("log")
@@ -153,21 +258,15 @@ def plot_overview(disjoint, out):
     ax.set_ylim(1, 20000)  # A peaks at 13505; 10000 would clip it
     ax.set_yticks([1, 10, 100, 1000, 10000])
     ax.set_yticklabels(["1", "10", "100", "1000", "10000"])
-    ax.set_xlabel("Keys per transaction (K)")
-    ax.set_ylabel("Transactions / sec (total across 8 backends)")
-    ax.set_title(
-        "Throughput under concurrency without key conflicts "
-        "(8 backends, disjoint keyspace)",
-        fontsize=13, fontweight="bold",
-    )
+    ax.set_xlabel(S["xlabel_keys"])
+    ax.set_ylabel(S["ylabel_tx"])
+    ax.set_title(S["ov_title"], fontsize=13, fontweight="bold")
     ax.grid(True, which="both", linewidth=0.4, alpha=0.4)
     ax.legend(loc="upper right", ncol=2, fontsize=8.5, framealpha=0.9)
 
     # Bottom band (below the lowest line) is the only fully clear zone.
     ax.text(
-        0.30, 0.05,
-        "Disjoint mode -- worker-shard keys, no conflicts. "
-        "NOWAIT fail-fast cannot 'cheat' here; raw implementation cost is exposed.",
+        0.30, 0.05, S["ov_note"],
         transform=ax.transAxes, ha="left", va="bottom", fontsize=8,
         color="#555", style="italic",
         bbox=dict(boxstyle="round", fc="white", ec="#ddd", lw=0.6, alpha=0.85),
@@ -175,7 +274,7 @@ def plot_overview(disjoint, out):
 
     fig.text(
         0.5, 0.012,
-        f"{COMMON_FOOT}; full data: {DISJOINT_CITE}",
+        f"{COMMON_FOOT}; {S['full_data']}: {DISJOINT_CITE}",
         ha="center", fontsize=7.5, color="#555",
     )
     fig.subplots_adjust(bottom=0.11, top=0.93, left=0.07, right=0.985)
@@ -186,13 +285,14 @@ def plot_overview(disjoint, out):
 # --------------------------------------------------------------------------
 # Figure 2: perf-tradeoffs.png -- 3 panels at N=8 K=100k.
 # --------------------------------------------------------------------------
-def plot_tradeoffs(disjoint, overlap, out):
+def plot_tradeoffs(disjoint, overlap, out, lang):
+    S = STRINGS[lang]
     K = 100000
     x = range(len(IMPLS))
     w = 0.38
     colors = [COLOR[i] for i in IMPLS]
 
-    fig, (axT, axP, axW) = plt.subplots(1, 3, figsize=(15.0, 7.0))
+    fig, (axT, axP, axW) = plt.subplots(1, 3, figsize=(16.8, 7.0))
 
     # ---- LEFT: throughput, overlap (dark) vs disjoint (light) ----
     ov = [overlap[i][K]["tx"] for i in IMPLS]
@@ -201,11 +301,11 @@ def plot_tradeoffs(disjoint, overlap, out):
     axT.bar([xi + w / 2 for xi in x], dj, w, color=colors, alpha=0.45)
     axT.set_yscale("log")
     axT.set_ylim(1, 10000)
-    axT.set_title("Throughput (tx/sec, log scale)", fontsize=11)
+    axT.set_title(S["tr_throughput"], fontsize=11)
     # NOWAIT artifact callout on the overlap C bar.
     c_idx = IMPLS.index("C")
     axT.annotate(
-        "* NOWAIT fail-fast\nartifact, see caveat",
+        S["tr_nowait"],
         xy=(c_idx - w / 2, overlap["C"][K]["tx"]), xytext=(c_idx - 0.4, 1300),
         fontsize=7.5, color="#444",
         arrowprops=dict(arrowstyle="->", color="#888", lw=0.8),
@@ -218,10 +318,10 @@ def plot_tradeoffs(disjoint, overlap, out):
     axP.bar([xi + w / 2 for xi in x], djp, w, color=colors, alpha=0.45)
     axP.set_yscale("log")
     axP.set_ylim(10, 10000)
-    axP.set_title("p95 latency (ms, log scale)", fontsize=11)
+    axP.set_title(S["tr_p95"], fontsize=11)
     axP.axhline(100, ls="--", lw=1, color="#999")
     # Place the label at the far left, above A/C bars (both < 100 ms there).
-    axP.text(-0.35, 112, "interactive UX boundary",
+    axP.text(-0.35, 112, S["tr_ux"],
              ha="left", va="bottom", fontsize=7.5, color="#777")
 
     # ---- RIGHT: WAL bytes, disjoint only ----
@@ -232,10 +332,10 @@ def plot_tradeoffs(disjoint, overlap, out):
     axW.bar(list(x), heights, w * 1.6, color=colors, alpha=0.7)
     axW.set_yscale("log")
     axW.set_ylim(floor, 1e11)  # 100 B .. 100 GB
-    axW.set_title("WAL bytes per scenario (log scale, disjoint only)", fontsize=11)
+    axW.set_title(S["tr_wal"], fontsize=11)
     for xi, v in zip(x, djw):
         if v < floor:
-            axW.text(xi, floor * 1.15, "~0\n(no WAL)", ha="center", va="bottom",
+            axW.text(xi, floor * 1.15, S["tr_nowal"], ha="center", va="bottom",
                      fontsize=7.5, color="#444")
         else:
             axW.text(xi, v * 1.25, human_bytes(v), ha="center", va="bottom",
@@ -243,27 +343,24 @@ def plot_tradeoffs(disjoint, overlap, out):
 
     for ax in (axT, axP, axW):
         ax.set_xticks(list(x))
-        ax.set_xticklabels([LABEL_SHORT[i] for i in IMPLS], fontsize=7.5)
-        ax.set_xlabel("Implementation", fontsize=9)
+        ax.set_xticklabels([LABEL_SHORT[lang][i] for i in IMPLS], fontsize=7)
+        ax.set_xlabel(S["tr_impl"], fontsize=9)
         ax.grid(True, axis="y", which="both", linewidth=0.4, alpha=0.35)
 
-    fig.suptitle(
-        "pg_xclaim trade-offs at N=8 K=100k (worst-case workload)",
-        fontsize=13, fontweight="bold",
-    )
+    fig.suptitle(S["tr_suptitle"], fontsize=13, fontweight="bold")
     # Shared legend: shade = mode.
     legend_handles = [
-        Patch(facecolor="#555", label="overlap mode (~52% key overlap)"),
-        Patch(facecolor="#555", alpha=0.45, label="disjoint mode (no key overlap)"),
+        Patch(facecolor="#555", label=S["tr_legend_overlap"]),
+        Patch(facecolor="#555", alpha=0.45, label=S["tr_legend_disjoint"]),
     ]
     fig.legend(handles=legend_handles, loc="upper center", ncol=2,
                bbox_to_anchor=(0.5, 0.945), fontsize=9, frameon=False)
     fig.text(
         0.5, 0.012,
-        f"{COMMON_FOOT}; full data: docs/perf/bench-alternatives-20260524-*.csv",
+        f"{COMMON_FOOT}; {S['full_data']}: docs/perf/bench-alternatives-20260524-*.csv",
         ha="center", fontsize=7.5, color="#555",
     )
-    fig.subplots_adjust(bottom=0.13, top=0.86, left=0.06, right=0.985, wspace=0.22)
+    fig.subplots_adjust(bottom=0.13, top=0.86, left=0.06, right=0.985, wspace=0.26)
     fig.savefig(out, dpi=150, metadata=PNG_META)
     plt.close(fig)
 
@@ -271,13 +368,16 @@ def plot_tradeoffs(disjoint, overlap, out):
 # --------------------------------------------------------------------------
 # Figure 3: sorted-insert-finding.png -- overlap, B/F + D/E, solid/dashed.
 # --------------------------------------------------------------------------
-def plot_sorted(overlap, out):
+def plot_sorted(overlap, out, lang):
+    S = STRINGS[lang]
     fig, ax = plt.subplots(figsize=(12.8, 7.2))
 
     # Color by STORAGE FAMILY (not the global per-impl palette): the whole
     # point of this figure is the unsorted-vs-sorted contrast WITHIN each
     # storage type, so UNLOGGED (B,F) share one hue and LOGGED (D,E) another,
-    # with solid = unsorted and dashed = sorted.
+    # with solid = unsorted and dashed = sorted. The series labels are
+    # SQL/identifier text (sorted/unsorted INSERT) -- kept English in both
+    # languages, exactly as README.md's 2x2 table writes them.
     GRAY = "#7a7a72"   # UNLOGGED family
     RED = "#d9542b"    # LOGGED family
     series = [
@@ -299,14 +399,10 @@ def plot_sorted(overlap, out):
     ax.set_ylim(1, 10000)
     ax.set_yticks([1, 10, 100, 1000, 10000])
     ax.set_yticklabels(["1", "10", "100", "1000", "10000"])
-    ax.set_xlabel("Keys per transaction (K)")
-    ax.set_ylabel("Transactions / sec (total across 8 backends)")
-    ax.set_title(
-        "Sorted INSERT under overlap concurrency: "
-        "trading deadlocks for serialization",
-        fontsize=13, fontweight="bold", pad=24,
-    )
-    ax.text(0.5, 1.012, "8 backends, ~52% key overlap, ITERS=200",
+    ax.set_xlabel(S["xlabel_keys"])
+    ax.set_ylabel(S["ylabel_tx"])
+    ax.set_title(S["so_title"], fontsize=13, fontweight="bold", pad=24)
+    ax.text(0.5, 1.012, S["so_subtitle"],
             transform=ax.transAxes, ha="center", va="bottom",
             fontsize=10, color="#555")
     ax.grid(True, which="both", linewidth=0.4, alpha=0.4)
@@ -315,31 +411,29 @@ def plot_sorted(overlap, out):
     # Crossover message: arrow into the sorted E point at K=100k (the lowest),
     # text parked in the empty upper-right band (all lines have descended).
     ax.annotate(
-        "At high K, sorted (dashed) drops BELOW unsorted (solid):\n"
-        "deterministic acquisition order kills deadlocks but\n"
-        "serializes on overlapping keys.",
+        S["so_crossover"],
         xy=(100000, overlap["E"][100000]["tx"]),
         xytext=(8500, 1300), fontsize=8.5, color="#333", ha="left",
         arrowprops=dict(arrowstyle="->", color="#888", lw=0.9),
     )
     # Low-K aside (clear band just under the K=1k cluster).
-    ax.text(770, 25,
-            "At low K: sorted is\nneutral or a small win\n(cache locality).",
+    ax.text(770, 25, S["so_lowk"],
             fontsize=8, color="#555", style="italic", ha="left", va="top")
     # Deadlock-count box, bottom-center clear zone.
     dl = overlap
     ax.text(
         0.52, 0.045,
-        f"Deadlocks per scenario:  B={dl['B'][100000]['deadlocks']}  "
-        f"D={dl['D'][100000]['deadlocks']}  E={dl['E'][100000]['deadlocks']}  "
-        f"F={dl['F'][100000]['deadlocks']}\nSorting prevents deadlocks -- but the cure is not free.",
+        S["so_deadlocks"].format(
+            B=dl["B"][100000]["deadlocks"], D=dl["D"][100000]["deadlocks"],
+            E=dl["E"][100000]["deadlocks"], F=dl["F"][100000]["deadlocks"],
+        ),
         transform=ax.transAxes, fontsize=8.5, color="#333", ha="center", va="bottom",
         bbox=dict(boxstyle="round", fc="#f4f4f4", ec="#ccc", lw=0.8),
     )
 
     fig.text(
         0.5, 0.012,
-        f"{COMMON_FOOT}, log_lock_waits=on; full data: {OVERLAP_CITE}",
+        f"{COMMON_FOOT}, log_lock_waits=on; {S['full_data']}: {OVERLAP_CITE}",
         ha="center", fontsize=7.5, color="#555",
     )
     fig.subplots_adjust(bottom=0.11, top=0.90, left=0.07, right=0.985)
@@ -358,11 +452,15 @@ def main():
         return
 
     os.makedirs(ASSETS, exist_ok=True)
-    plot_overview(disjoint, os.path.join(ASSETS, "overview.png"))
-    plot_tradeoffs(disjoint, overlap, os.path.join(ASSETS, "perf-tradeoffs.png"))
-    plot_sorted(overlap, os.path.join(ASSETS, "sorted-insert-finding.png"))
-    print("wrote assets/overview.png, assets/perf-tradeoffs.png, "
-          "assets/sorted-insert-finding.png")
+    for lang in parse_langs(sys.argv):
+        plot_overview(disjoint, os.path.join(ASSETS, out_name("overview", lang)), lang)
+        plot_tradeoffs(disjoint, overlap,
+                       os.path.join(ASSETS, out_name("perf-tradeoffs", lang)), lang)
+        plot_sorted(overlap,
+                    os.path.join(ASSETS, out_name("sorted-insert-finding", lang)), lang)
+        print(f"wrote [{lang}]: " + ", ".join(
+            "assets/" + out_name(b, lang)
+            for b in ("overview", "perf-tradeoffs", "sorted-insert-finding")))
 
 
 if __name__ == "__main__":

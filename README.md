@@ -10,7 +10,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/Fenoman/pg_xclaim?style=social)](https://github.com/Fenoman/pg_xclaim/stargazers)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-![pg_xclaim — experimental high-cardinality claim primitive for PostgreSQL](assets/banner.png)
+![pg_xclaim — экспериментальный примитив claim'ов высокой кардинальности для PostgreSQL](assets/banner.png)
 
 > ### Прежде чем рассматривать pg_xclaim — 3 правила
 >
@@ -78,7 +78,7 @@ GUC), а из-за конкуренции на partition-LWLock'ах самог�
 ниже). Это нужно, чтобы можно было мигрировать старый код через
 текстовую замену.
 
-![Architecture: partitioned shared-memory claim storage](assets/concept.png)
+![Архитектура: партиционированное хранилище claim'ов в разделяемой памяти](assets/concept.png)
 
 ---
 
@@ -387,7 +387,7 @@ pg_xclaim/
 
 ## Производительность
 
-![Throughput under concurrency without key conflicts — true raw cost of 6 implementations on N=8 disjoint keyspace](assets/overview.png)
+![Пропускная способность при конкуренции без конфликтов ключей — чистая стоимость 6 реализаций на N=8 disjoint-пространстве ключей](assets/overview.png)
 
 Числа ниже — синтетические измерения, не универсальные утверждения о производительности. Сверяйтесь с
 актуальным CSV в `docs/perf/` и измеряйте на своей нагрузке.
@@ -438,7 +438,7 @@ cluster-wide local        ≈ per-backend × число активных бэк�
 
 ### Сравнение с альтернативами
 
-![Tradeoffs at N=8 K=100k — throughput, p95 latency, WAL bytes across 6 implementations in overlap and disjoint modes](assets/perf-tradeoffs.png)
+![Компромиссы при N=8 K=100k — throughput, p95, байты WAL для 6 реализаций в режимах overlap и disjoint](assets/perf-tradeoffs.png)
 
 Репозиторий содержит бенчмарк pg_xclaim против пяти стандартных
 альтернатив, образующих полную 2×2 матрицу `{UNLOGGED, LOGGED} ×
@@ -594,7 +594,7 @@ partitioning по другому ключу. FOR UPDATE на тысячах ст
 
 ### Q3: «Почему не `INSERT INTO claim_table ... ON CONFLICT DO NOTHING`?»
 
-![Sorted INSERT trades deadlocks for serialization — 4-line counter-intuitive finding (B/D/F/E throughput vs K under overlap)](assets/sorted-insert-finding.png)
+![Sorted INSERT меняет deadlock'и на сериализацию — контринтуитивный вывод (throughput B/D/F/E vs K на overlap)](assets/sorted-insert-finding.png)
 
 Семантически вариант работает, мы его проверили. Основная проблема
 под нагрузкой: на UNIQUE-индексе возникают deadlock'и (см.

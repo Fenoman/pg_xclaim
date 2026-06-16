@@ -76,7 +76,7 @@ The `xclaim.try(int4, int4)` and `xclaim.try(int8)` overloads have
 below). This is so that legacy call sites can be migrated by textual
 replacement.
 
-![Architecture: partitioned shared-memory claim storage](assets/concept.png)
+![Architecture: partitioned shared-memory claim storage](assets/concept_en.png)
 
 ---
 
@@ -384,7 +384,7 @@ pg_xclaim/
 
 ## Performance
 
-![Throughput under concurrency without key conflicts — true raw cost of 6 implementations on N=8 disjoint keyspace](assets/overview.png)
+![Throughput under concurrency without key conflicts — true raw cost of 6 implementations on N=8 disjoint keyspace](assets/overview_en.png)
 
 Numbers below are synthetic measurements, not universal performance claims. Cross-check against the latest CSV
 in `docs/perf/` and measure on your own workload.
@@ -436,7 +436,7 @@ that kind of workload does not need pg_xclaim in the first place.
 
 ### Comparison with alternatives
 
-![Tradeoffs at N=8 K=100k — throughput, p95 latency, WAL bytes across 6 implementations in overlap and disjoint modes](assets/perf-tradeoffs.png)
+![Tradeoffs at N=8 K=100k — throughput, p95 latency, WAL bytes across 6 implementations in overlap and disjoint modes](assets/perf-tradeoffs_en.png)
 
 The repository contains a benchmark of pg_xclaim against five
 standard alternatives forming a full 2×2 matrix of
@@ -594,7 +594,7 @@ for measured numbers.
 
 ### Q3: "Why not `INSERT INTO claim_table ... ON CONFLICT DO NOTHING`?"
 
-![Sorted INSERT trades deadlocks for serialization — 4-line counter-intuitive finding (B/D/F/E throughput vs K under overlap)](assets/sorted-insert-finding.png)
+![Sorted INSERT trades deadlocks for serialization — 4-line counter-intuitive finding (B/D/F/E throughput vs K under overlap)](assets/sorted-insert-finding_en.png)
 
 It works semantically, we tested it. The main problem shows up
 under load: deadlocks on the UNIQUE index (see

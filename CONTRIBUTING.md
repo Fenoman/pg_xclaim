@@ -146,19 +146,25 @@ PR — we'll discuss.
   Don't update its numbers casually — re-run perf and update both
   language versions with reproduced measurements.
 - Every README figure is generated from code, not drawn by hand, so they
-  stay exact and reproducible. The generators need only matplotlib
-  (`pip install matplotlib`, the sole extra dependency):
+  stay exact and reproducible. The charts are bilingual, following the same
+  convention as the docs: the bare filename is Russian (primary), the
+  English one carries an `_en` suffix (`overview.png` / `overview_en.png`).
+  The banner is language-neutral and shared by both READMEs. By default each
+  chart generator emits both languages in one run, so a language can never be
+  left stale. The generators need only matplotlib (`pip install matplotlib`,
+  the sole extra dependency):
 
   ```bash
   # the three benchmark charts, straight from docs/perf/bench-alternatives-*.csv
   # (regenerate these whenever you regenerate a CSV, so the figures match
-  #  the README tables):
-  python3 scripts/plot_alternatives.py   # overview / perf-tradeoffs / sorted-insert
+  #  the README tables). Default writes RU (bare) + EN (_en) in one run:
+  python3 scripts/plot_alternatives.py            # *.png + *_en.png (both langs)
+  python3 scripts/plot_alternatives.py --lang en  # English only, if needed
 
   # the architecture diagram (fixed geometry, no data input):
-  python3 scripts/draw_concept.py        # concept.png
+  python3 scripts/draw_concept.py        # concept.png + concept_en.png
 
-  # the hero banner (wordmark + padlock):
+  # the hero banner (wordmark + padlock; language-neutral, single file):
   python3 scripts/draw_banner.py         # banner.png
   ```
 
