@@ -1,5 +1,3 @@
-pg_xclaim — High-cardinality transaction-level claims for PostgreSQL
-
 Copyright (c) 2026, E. Pavlichenko
 
 Permission to use, copy, modify, and distribute this software and its
