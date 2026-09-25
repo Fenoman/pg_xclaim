@@ -161,7 +161,7 @@ if [[ -f "$SCAN_OUT" ]]; then
     # ERROR=ОШИБКА, FATAL=ВАЖНО, PANIC=ПАНИКА. Match both English and RU forms.
     #
     # `grep -c` returns exit 1 when there are zero matches (still
-    # printing "0" to stdout); we do NOT want `|| echo "0"` here, that
+    # printing "0" to stdout). We do NOT want `|| echo "0"` here: that
     # would append a second "0" line and break the subsequent arithmetic.
     set +e
     SCAN_ERRS="$(grep -cE '^(ERROR|FATAL|PANIC|ОШИБКА|ВАЖНО|ПАНИКА):' "$SCAN_OUT" 2>/dev/null)"

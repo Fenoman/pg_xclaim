@@ -15,12 +15,16 @@
  *                                              XClaimCtl->next_token and
  *                                              publishes it into
  *                                              XClaimBackendInfos[procno].
+ *                                              The first call in a backend
+ *                                              also registers
+ *                                              xclaim_shmem_exit_cb
+ *                                              (on_shmem_exit).
  *   * Owner identity capture (acquisition):
  *         xclaim_capture_acquisition_identity(out_procno, out_lxid, out_token)
  *   * Lookup / insert / remove:
  *         xclaim_local_lookup(key, &out)
  *         xclaim_local_lookup_with_hash(key, hashvalue, &out)
- *           bulk/precomputed-hash fast path; forwards to simplehash's
+ *           bulk/precomputed-hash fast path that forwards to simplehash's
  *           `_hash` variant.
  *         xclaim_local_insert_held(key, hashvalue, partition_id)
  *         xclaim_local_remove(key)
@@ -33,13 +37,13 @@
  *           (mid-xact, MyProc intact).
  *   * Cleanup:
  *         xclaim_local_cleanup_held()      -- group-by-partition cleanup
- *                                              driver (MANDATORY); truncates
+ *                                              driver (MANDATORY). Truncates
  *                                              the local set in place.
  *         xclaim_local_gather_pointers(buf, cap)
  *                                          -- fills a caller-provided pointer
  *                                              array for the cleanup driver.
  *         xclaim_local_clear_owner_token() -- rotates owner_token on
- *                                              session_reset / pooler handoff.
+ *                                              session_reset.
  *   * Stats / observability:
  *         xclaim_local_count()
  *         xclaim_local_peak()
@@ -63,7 +67,7 @@
  *     xact callback fires.
  *
  *   * MyProc->vxid.procNumber is FORBIDDEN as the compat surface. PG 17+
- *     exposes process identity as MyProcNumber; vxid.procNumber is an
+ *     exposes process identity as MyProcNumber, while vxid.procNumber is an
  *     implementation detail embedded in the VXID struct. We use
  *     MyProcNumber (PG 17+) / MyProc->pgprocno (PG 16) via the compat
  *     helper xclaim_get_current_procno().
@@ -103,7 +107,7 @@ typedef struct XClaimLocalEntry
     int32               saved_procno;   /* CAPTURED at acquisition time     */
     LocalTransactionId  saved_lxid;     /* CAPTURED at acquisition time     */
     uint64              saved_token;    /* CAPTURED at acquisition time     */
-    uint8               held;           /* 1 = held; other values invalid   */
+    uint8               held;           /* 1 = held, other values invalid   */
     char                status;         /* SH_STATUS slot (mandated)        */
 } XClaimLocalEntry;
 
@@ -162,9 +166,9 @@ xclaim_shared_matches_saved_owner(const XClaimEntry *shared,
 /*
  * xclaim_local_lookup
  *      O(1) reentrancy fast-path probe. Returns true iff `key` is
- *      currently held by this backend; on hit, *out is set
+ *      currently held by this backend. On hit, *out is set
  *      to the underlying simplehash entry (caller may inspect saved_*
- *      fields for diagnostics; MUST NOT mutate `key`).
+ *      fields for diagnostics but MUST NOT mutate `key`).
  *
  *      On miss *out is left untouched.
  */
@@ -193,7 +197,7 @@ extern bool xclaim_local_lookup_with_hash(const XClaimKey *key,
  *      Insert a freshly-acquired entry. PRECONDITION: caller has already
  *      verified the key is NOT present (via xclaim_local_lookup) AND
  *      xclaim_ensure_owner_token() has run. Allocates inside
- *      XClaimLocalContext via the simplehash machinery; status is
+ *      XClaimLocalContext via the simplehash machinery, and status is
  *      initialised by simplehash.
  *
  *      Updates per-backend count and peak watermark.
@@ -221,7 +225,7 @@ extern void xclaim_local_remove(const XClaimKey *key);
 /* The simplehash itself supports iteration but does NOT order entries  */
 /* by partition_id. The cleanup driver sorts an array of pointers by    */
 /* partition_id. We expose a `gather` helper that fills a caller-       */
-/* provided pointer array; caller then counting-sorts by partition_id   */
+/* provided pointer array. The caller counting-sorts by partition_id    */
 /* (O(N + num_partitions), keyspace bounded to num_partitions) and      */
 /* processes one partition at a time.                                   */
 /* -------------------------------------------------------------------- */
@@ -251,9 +255,9 @@ extern uint64 xclaim_local_peak(void);
 /*
  * xclaim_local_reset_peak_warning
  *      Clear the per-session one-shot peak-warning flag so that a
- *      backend which has already logged "peak crossed 75% of
- *      expected_claims_per_backend" can emit a fresh hint after
- *      session_reset() if it climbs past the threshold again.
+ *      backend which has already logged "crossed 75% of
+ *      pg_xclaim.expected_claims_per_backend" can emit a fresh hint
+ *      after session_reset() if it climbs past the threshold again.
  */
 extern void xclaim_local_reset_peak_warning(void);
 
@@ -289,10 +293,14 @@ extern uint64 xclaim_local_my_owner_token(void);
  *      Invoked from:
  *        * xclaim_xact_callback (COMMIT / PARALLEL_COMMIT / ABORT /
  *          PARALLEL_ABORT) -- the canonical xact-end hook.
- *        * xclaim_shmem_exit_cb (before_shmem_exit) -- defensive
- *          backend-exit cleanup; idempotent overlap with xact cleanup
- *          is expected.
- *        * xclaim_session_reset() -- pooler defense-in-depth.
+ *        * xclaim_shmem_exit_cb (on_shmem_exit, registered per
+ *          backend) -- backend-exit cleanup. It runs after
+ *          ShutdownPostgres has aborted any open transaction, so the
+ *          set is normally empty. It is not empty when a sibling's xact
+ *          callback called ahead of ours failed in that abort: during
+ *          exit the ERROR becomes FATAL, which skips the rest of the
+ *          chain.
+ *        * xclaim_session_reset() -- claims held outside a transaction.
  */
 extern void xclaim_local_cleanup_held(void);
 
@@ -301,8 +309,7 @@ extern void xclaim_local_cleanup_held(void);
  *      Drop the cached owner_token so the next acquisition (or the
  *      caller, immediately) re-runs xclaim_ensure_owner_token() and
  *      issues a FRESH token from XClaimCtl->next_token. Used by
- *      xclaim_session_reset() so a pooler-handed-off backend cannot
- *      impersonate the previous logical client.
+ *      xclaim_session_reset().
  *
  *      Side-effect: zeroes XClaimBackendInfos[procno].current_token so
  *      the stale-owner reaper observes the rotation and treats any
@@ -315,14 +322,14 @@ extern void xclaim_local_clear_owner_token(void);
 /*                                                                      */
 /* Compares the shared entry's owner triple against the CURRENT         */
 /* backend's identity (MyProcNumber / top-level lxid / our own token).  */
-/* Used by the acquisition own-entry-recovery branch to detect the      */
-/* rare case where the local set lost the entry (missed callback,      */
-/* session-reset bug) but the shared row is still ours.                 */
+/* Used by the acquisition own-entry-recovery branch to detect a local  */
+/* set that lost the entry while the shared row is still ours, which    */
+/* only a defect can cause.                                             */
 /*                                                                      */
 /* Distinct from `xclaim_shared_matches_saved_owner` (cleanup path):    */
 /*   * cleanup path uses the SAVED triple from the local entry          */
 /*     (because MyProc state is wiped by the time the xact callback     */
-/*     fires);                                                          */
+/*     fires).                                                          */
 /*   * acquisition path uses the LIVE triple (we are mid-xact, MyProc   */
 /*     state is intact, no local entry exists yet to read from).        */
 /* -------------------------------------------------------------------- */

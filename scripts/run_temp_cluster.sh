@@ -28,12 +28,12 @@
 # HARD INVARIANTS:
 #   - set -euo pipefail
 #   - locale ru_RU.UTF-8
-#   - /tmp clusters only; trap-based cleanup
+#   - /tmp clusters only, trap-based cleanup
 #   - never operates against an existing user cluster
 #
 # This script is INTENDED to be backgrounded or sourced by callers. By default
 # it stays in foreground and tears down the cluster on signal -- pass
-# --keep-running to skip cleanup (caller assumes ownership; useful for
+# --keep-running to skip cleanup (caller assumes ownership, useful for
 # benchmarks that need the cluster alive after this script returns).
 
 set -euo pipefail
@@ -109,7 +109,7 @@ if ! INITDB_OUT="$("$INITDB" -D "$PGDATA" \
         -E UTF8 \
         --auth=trust \
         -U postgres 2>&1)"; then
-    echo "run_temp_cluster: initdb failed; output follows:" >&2
+    echo "run_temp_cluster: initdb failed, output follows:" >&2
     printf '%s\n' "$INITDB_OUT" >&2
     exit 1
 fi
@@ -127,15 +127,15 @@ fi
     [[ -n "$EXTRA_CONF" ]] && echo "$EXTRA_CONF"
 } >> "$PGDATA/postgresql.conf"
 
-# LC_ALL/LANG must be exported in the calling env: on macOS the postmaster
-# inherits the parent's locale at startup, and an unset LC_ALL triggers
-# "postmaster became multithreaded during startup" FATAL on PG 17.10+.
+# The locale is passed inline, so callers need not export it: on macOS a
+# postmaster started with LC_ALL and LANG unset exits with FATAL
+# "postmaster became multithreaded during startup".
 LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
 "$PGCTL" start -D "$PGDATA" -w \
     -l "$PGDATA/server.log" \
     -o "-p $PGPORT" \
     >/dev/null 2>&1 || {
-        echo "pg_ctl start failed; tail of server.log:" >&2
+        echo "pg_ctl start failed, tail of server.log:" >&2
         tail -50 "$PGDATA/server.log" >&2 || true
         exit 1
     }
@@ -155,7 +155,7 @@ printf 'PGHOST=%s\n' "$PGHOST"
 printf 'PGBIN=%s\n' "$PGBIN"
 
 if [[ "$KEEP_RUNNING" -eq 1 ]]; then
-    # Caller owns the cluster lifecycle; emit a hint with cleanup commands.
+    # Caller owns the cluster lifecycle, so emit a hint with cleanup commands.
     cat <<EOF
 # To stop:
 #   "$PGCTL" stop -D "$PGDATA" -m immediate

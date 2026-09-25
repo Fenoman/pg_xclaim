@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test/concurrency/commit_release.sh
-# Commit releases claim; another session can then acquire.
+# Commit releases claim, so another session can then acquire.
 #
 # Scenario:
 #   Session A: BEGIN; xclaim.try(1, 200) -> true; COMMIT
@@ -23,7 +23,7 @@ FAIL=0
 CSV_ROWS=()
 
 # ---------------------------------------------------------------------------
-# Test 1: A acquires and COMMITs; B then succeeds
+# Test 1: A acquires and COMMITs, then B succeeds
 # ---------------------------------------------------------------------------
 echo "--- Test 1: commit releases claim ---"
 
@@ -67,7 +67,7 @@ if [[ "$CONFLICTS" == "0" ]]; then
     PASS=$(( PASS + 1 ))
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "no_spurious_conflicts" "PASS" "conflicts" "0" "sequential sessions")")
 else
-    # If conflicts > 0, it may indicate timing issue; log but don't fail hard
+    # If conflicts > 0, it may indicate timing issue, so log but don't fail hard
     echo "  INFO: conflicts=$CONFLICTS (acceptable if sessions overlapped slightly)"
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "no_spurious_conflicts" "PASS" "conflicts" "$CONFLICTS" "acceptable")")
     PASS=$(( PASS + 1 ))

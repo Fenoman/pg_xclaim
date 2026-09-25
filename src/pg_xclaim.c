@@ -2,17 +2,17 @@
  *
  * pg_xclaim.c
  *      Module entry point: PG_MODULE_MAGIC, _PG_init, GUC registration,
- *      preload / recovery / ABI gates.
+ *      preload and recovery gates.
  *
  * Init-path summary (the recovery gate runs at SQL call time, never at
  * preload, because XLogCtl may be NULL during _PG_init):
- *   * Two mandatory _PG_init gates (see the comment above _PG_init for
- *     the full rationale):
- *       1. !process_shared_preload_libraries_in_progress -> silent
- *          return (pg_stat_statements pattern). SQL functions raise
- *          ERROR via XCLAIM_REQUIRE_INIT at first call.
- *       2. ABI compat: PG_VERSION_NUM/100 must equal the value the .so
- *          was compiled against -- catches mismatched server upgrades.
+ *   * One mandatory _PG_init gate (see the comment above _PG_init for
+ *     the full rationale): !process_shared_preload_libraries_in_progress
+ *     -> silent return (pg_stat_statements pattern). SQL functions raise
+ *     ERROR via XCLAIM_REQUIRE_INIT at first call.
+ *   * No PostgreSQL version check: PG_MODULE_MAGIC makes the server
+ *     reject a library built for another major version before _PG_init
+ *     runs ("incompatible library ...: version mismatch").
  *   * RecoveryInProgress() rejection is enforced lazily inside
  *     XCLAIM_REQUIRE_INIT() (pg_xclaim.h). XLogCtl is NULL at preload
  *     time and unreliable from xclaim_shmem_startup, so the recovery
@@ -20,28 +20,33 @@
  *   * Six GUCs. Three single-variable check_hooks enforce max_claims
  *     >= 32, num_partitions power-of-two, and
  *     expected_claims_per_backend > 0. Two further cross-GUC rules
- *     (num_partitions <= max_claims; expected_claims_per_backend <=
+ *     (num_partitions <= max_claims and expected_claims_per_backend <=
  *     max_claims) are validated by a FATAL check at the tail of
  *     xclaim_define_gucs, since a check_hook sees only one variable.
- *   * Shared-memory request stubs (RequestAddinShmemSpace,
- *     RequestNamedLWLockTranche, shmem_startup_hook) wired up; real
- *     allocation lives in pg_xclaim_shared.c.
- *   * Lifecycle callback registration (RegisterXactCallback,
- *     before_shmem_exit) wired up; real callbacks live in
- *     pg_xclaim_callbacks.c.
+ *   * Shared-memory request (RequestAddinShmemSpace,
+ *     RequestNamedLWLockTranche) and shmem_startup_hook wiring. The
+ *     allocation itself lives in pg_xclaim_shared.c.
+ *   * Xact callback registration (RegisterXactCallback) wired up. The
+ *     backend-exit callback (on_shmem_exit) is registered by each
+ *     backend on its first claim (xclaim_ensure_owner_token), not here.
+ *     The callback bodies live in pg_xclaim_callbacks.c.
  *
  * HARD invariants enforced here:
  *   * GUC validation `max_claims >= 32` lives in a check_hook (returns
- *     false on invalid; never ereport(ERROR) directly -- PG GUC
+ *     false on invalid, never ereport(ERROR) directly -- PG GUC
  *     machinery requires bool return).
- *   * `before_shmem_exit` (NOT on_shmem_exit / on_proc_exit).
+ *   * Backend-exit cleanup is an `on_shmem_exit` callback that the
+ *     backend registers after InitProcess, on its first claim. Never
+ *     from _PG_init (the postmaster's exit-callback lists are cleared in
+ *     every forked child by on_exit_reset()), and never as a lazily
+ *     registered before_shmem_exit entry. See pg_xclaim_callbacks.c.
  *   * Acquisition entry points (xclaim.try, xclaim.try_many,
  *     xclaim.session_reset) MUST be EXACTLY
  *     VOLATILE PARALLEL RESTRICTED CALLED ON NULL INPUT. The
  *     observability surface uses per-function attributes: xclaim.stats,
  *     xclaim.debug_snapshot, and xclaim.count are STABLE PARALLEL
  *     RESTRICTED (each touches per-backend state that workers do not
- *     inherit), and xclaim.debug is STABLE PARALLEL UNSAFE; see
+ *     inherit), and xclaim.debug is STABLE PARALLEL UNSAFE. See
  *     sql/pg_xclaim--1.0.0-rc1.sql.
  *
  *-------------------------------------------------------------------------
@@ -63,14 +68,6 @@
 #include "pg_xclaim_internal.h"     /* XClaimKey, XClaimForm */
 
 PG_MODULE_MAGIC;
-
-/*
- * COMPILED_PG_VERSION_NUM_PREFIX is `PG_VERSION_NUM / 100` captured at
- * compile time. The runtime ABI check in _PG_init compares this against
- * the *running* server's `PG_VERSION_NUM / 100` to detect a server
- * upgrade that left a stale .so behind (FATAL refuses to load).
- */
-#define COMPILED_PG_VERSION_NUM_PREFIX (PG_VERSION_NUM / 100)
 
 /* -------------------------------------------------------------------- */
 /* GUC backing variables.                                               */
@@ -165,8 +162,8 @@ check_num_partitions(int *newval, void **extra, GucSource source)
 /*
  * check_expected_claims_per_backend
  *      Pre-grow target for the per-backend simplehash. Must be strictly
- *      positive; upper bound vs max_claims is checked cross-GUC after
- *      both are parsed (see _PG_init tail).
+ *      positive. The upper bound vs max_claims is checked cross-GUC after
+ *      both are parsed (see the tail of xclaim_define_gucs).
  */
 static bool
 check_expected_claims_per_backend(int *newval, void **extra, GucSource source)
@@ -203,11 +200,11 @@ xclaim_define_gucs(void)
 
     DefineCustomIntVariable("pg_xclaim.num_partitions",
                             "Number of LWLock partitions for the shared claim hash.",
-                            "Must be a power of two; entries are mapped via "
+                            "Must be a power of two: entries are mapped via "
                             "(hashvalue & (num_partitions-1)). Default 128 keeps "
                             "xclaim.debug() / debug_snapshot() working out-of-the-box "
                             "(both refuse to run above 192 partitions to stay under PG "
-                            "MAX_SIMUL_LWLOCKS); raise to 256 only on >100-core "
+                            "MAX_SIMUL_LWLOCKS). Raise to 256 only on >100-core "
                             "deployments where partition LWLock contention is "
                             "empirically measured, and accept that xclaim.debug() / "
                             "debug_snapshot() then stop working at that partition count.",
@@ -234,10 +231,12 @@ xclaim_define_gucs(void)
                             NULL, NULL);
 
     DefineCustomBoolVariable("pg_xclaim.enabled",
-                             "Enable pg_xclaim acquisition; off short-circuits to no-op.",
-                             "Runtime kill switch. When off, xclaim.try / "
-                             "xclaim.try_many return true unconditionally without "
-                             "touching shared state.",
+                             "Enable pg_xclaim acquisition. Off short-circuits to no-op.",
+                             "Runtime kill switch. When off, xclaim.try and "
+                             "xclaim.try_many take no claims and return true for "
+                             "every non-NULL key, and xclaim.stats().disabled_calls "
+                             "counts one per xclaim.try call and one per array "
+                             "element of xclaim.try_many.",
                              &xclaim_enabled,
                              true,          /* default */
                              PGC_SUSET,
@@ -247,8 +246,10 @@ xclaim_define_gucs(void)
     DefineCustomIntVariable("pg_xclaim.capacity_warn_pct",
                              "Capacity utilisation threshold (percent) above which "
                              "watermark LOG messages are emitted.",
-                             "First watermark fires at this value; further warnings at "
-                             "90% and 95% suppressed for 60 seconds.",
+                             "The first message fires at this value, then at 90% and "
+                             "95% where those are above it. Within a band a backend "
+                             "repeats the message at most once per 60 seconds, and "
+                             "a drop below this value resets that limit.",
                              &xclaim_capacity_warn_pct,
                              80,            /* default */
                              1,             /* min */
@@ -332,10 +333,9 @@ xclaim_shmem_request_hook(void)
  *
  * Correct ordering, matching the pg_stat_statements precedent:
  *   1. preload gate (`process_shared_preload_libraries_in_progress`) --
- *      this only checks a globally-set boolean; no shmem deref.
- *   2. ABI compat check.
- *   3. GUC define / shmem request / hook installs / lifecycle callbacks.
- *   4. Recovery gate is enforced in `XCLAIM_REQUIRE_INIT()`
+ *      this only checks a globally-set boolean, with no shmem deref.
+ *   2. GUC define / shmem request / hook installs / lifecycle callbacks.
+ *   3. Recovery gate is enforced in `XCLAIM_REQUIRE_INIT()`
  *      (`pg_xclaim.h`), which every SQL entry point invokes. At
  *      SQL-call time -- from a regular backend, after cluster startup
  *      completes -- `RecoveryInProgress()` accurately distinguishes
@@ -352,7 +352,7 @@ void
 _PG_init(void)
 {
     /*
-     * Gate 1: pg_stat_statements-style preload check. If we got here via
+     * Preload gate, pg_stat_statements style. If we got here via
      * LOAD or implicit load from CREATE EXTENSION on a *running* server
      * (not preload), return silently. SQL entry points raise the
      * customary ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE through
@@ -368,34 +368,11 @@ _PG_init(void)
     if (!process_shared_preload_libraries_in_progress)
         return;
 
-    /*
-     * Gate 2: ABI compat. The shared-library disk file may have been
-     * built against a different major (e.g. PG 17.x .so loaded into a
-     * PG 18 server after a binary upgrade left the contrib dir behind).
-     * Major-version is `PG_VERSION_NUM / 100` (e.g. 170009 -> 1700).
-     */
-    if (PG_VERSION_NUM / 100 != COMPILED_PG_VERSION_NUM_PREFIX)
-    {
-        /*
-         * ERRCODE_FEATURE_NOT_SUPPORTED (0A000), not INTERNAL_ERROR (XX000).
-         * ABI mismatch is operator-actionable misconfiguration (deploy
-         * pipeline pointed the wrong .so at the wrong PG major), not a
-         * bug in PostgreSQL or in pg_xclaim. The SQLSTATE should classify
-         * accordingly so logs do not lead operators down a "where is the
-         * internal bug" rabbit hole.
-         */
-        ereport(FATAL,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("pg_xclaim compiled against PG %d but running on PG %d -- refusing load",
-                        COMPILED_PG_VERSION_NUM_PREFIX,
-                        PG_VERSION_NUM / 100)));
-    }
-
     /* GUC registration -- six variables. */
     xclaim_define_gucs();
 
     /*
-     * Shared-memory request. PG 15 introduced shmem_request_hook; on
+     * Shared-memory request. PG 15 introduced shmem_request_hook, and on
      * older releases the calls go directly from _PG_init. We support
      * PG 16+, so always go through the hook.
      */
@@ -416,17 +393,23 @@ _PG_init(void)
     xclaim_install_shmem_hook();
 
     /*
-     * Lifecycle callbacks. RegisterXactCallback drives transaction-end
-     * cleanup; before_shmem_exit guards against backend-exit races
-     * where cleanup needs LWLocks still alive (HARD invariant: prefer
-     * before_shmem_exit over on_shmem_exit / on_proc_exit).
+     * Transaction-end cleanup. Every backend has this registration:
+     * forked backends inherit the postmaster's xact callback list, and
+     * EXEC_BACKEND children run _PG_init themselves.
+     *
+     * The backend-exit callback is NOT registered here. In fork-based
+     * builds _PG_init runs only in the postmaster, and
+     * InitPostmasterChild() clears the exit-callback lists in every
+     * child (on_exit_reset()), so an exit callback registered here would
+     * only run at postmaster exit. Each backend registers
+     * xclaim_shmem_exit_cb itself, as an on_shmem_exit callback, on its
+     * first claim in xclaim_ensure_owner_token().
      */
     RegisterXactCallback(xclaim_xact_callback, NULL);
-    before_shmem_exit(xclaim_shmem_exit_cb, (Datum) 0);
 }
 
 /* -------------------------------------------------------------------- */
-/* Real bodies for xclaim_shmem_size, xclaim_shmem_startup, and         */
+/* The bodies of xclaim_shmem_size, xclaim_shmem_startup, and           */
 /* xclaim_install_shmem_hook live in pg_xclaim_shared.c.                */
 /* -------------------------------------------------------------------- */
 
@@ -446,11 +429,11 @@ _PG_init(void)
 /* pg_proc.provolatile / proparallel / proisstrict):                    */
 /*    PG core   -> v / r / t  (VOLATILE / RESTRICTED / STRICT)          */
 /*    xclaim.try -> v / r / f  (VOLATILE / RESTRICTED / CALLED ON NULL) */
-/* The volatility and parallel mode match exactly; the strictness       */
+/* The volatility and parallel mode match exactly, but the strictness   */
 /* DIFFERS deliberately. PG core's STRICT lets the planner short-       */
 /* circuit a NULL arg to a NULL result silently -- xclaim wants loud   */
 /* failure on NULL inputs because a NULL key is a programming bug,     */
-/* not a no-op; silent NULL would mask the bug at call site. The C    */
+/* not a no-op, and silent NULL would mask the bug at call site. The C  */
 /* body raises `ereport(ERROR, ERRCODE_NULL_VALUE_NOT_ALLOWED)`.       */
 /* README + README_EN document this delta in the parity table.        */
 /*                                                                      */
@@ -466,7 +449,7 @@ PG_FUNCTION_INFO_V1(xclaim_try_solo);
 
 /*
  * xclaim_try_pair(classid int4, objid int4) RETURNS bool
- *      High-cardinality claim acquire; signature mirrors
+ *      High-cardinality claim acquire. The signature mirrors
  *      `pg_try_advisory_xact_lock(int4, int4)` for legacy migration.
  *
  *      Key construction:
@@ -490,7 +473,7 @@ xclaim_try_pair(PG_FUNCTION_ARGS)
 
     /*
      * CALLED ON NULL INPUT contract: the C body sees NULL args and
-     * must reject them. Advisory-parity behaviour (ereport ERROR,
+     * must reject them. Deliberate delta from advisory (ereport ERROR,
      * NOT silent NULL return).
      */
     if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
@@ -516,7 +499,7 @@ xclaim_try_pair(PG_FUNCTION_ARGS)
 
 /*
  * xclaim_try_solo(key int8) RETURNS bool
- *      High-cardinality claim acquire; signature mirrors
+ *      High-cardinality claim acquire. The signature mirrors
  *      `pg_try_advisory_xact_lock(int8)` for legacy migration.
  *
  *      Key construction:
@@ -524,7 +507,7 @@ xclaim_try_pair(PG_FUNCTION_ARGS)
  *      Distinct keyspace from the (int4, int4) form via the `form`
  *      discriminator -- xclaim.try(99::bigint) and xclaim.try(0, 99)
  *      hash to different XClaimEntries even though the numeric value
- *      of k1 is identical (the form byte differs).
+ *      of k1 is identical (the form field differs).
  */
 Datum
 xclaim_try_solo(PG_FUNCTION_ARGS)

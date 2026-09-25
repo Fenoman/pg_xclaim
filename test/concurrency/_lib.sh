@@ -4,7 +4,7 @@
 #
 # Usage:
 #   source "$(dirname "$0")/_lib.sh"
-#   pg_xclaim_start_temp_cluster   # sets PGDATA, PGPORT, PGSOCKET, PGBIN
+#   pg_xclaim_start_temp_cluster   # sets PGDATA, PGPORT, PGSOCKET, PGHOST
 #   trap pg_xclaim_stop_temp_cluster EXIT INT TERM
 #   pg_xclaim_psql -c "SELECT 1"
 #
@@ -15,7 +15,7 @@
 #   * trap cleanup set by EACH test script individually (for composability)
 #
 # PG version: PG 17 is the primary target.
-# PG_CONFIG env override wins; falls back to candidate paths for macOS arm64.
+# PG_CONFIG env override wins, otherwise the candidate paths below are tried.
 #
 # Port strategy: a Python-based probe binds port 0 and lets the kernel pick a
 # free ephemeral TCP port, avoiding collisions with existing services. Private
@@ -63,6 +63,7 @@ fi
 : "${PG_CONFIG:?ERROR: could not find a usable pg_config. Set PG_CONFIG or PG17_CONFIG.}"
 
 PGBIN="$("$PG_CONFIG" --bindir)"
+XCLAIM_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------------------
 # Free-port probe (no races vs fixed-port assignment in a common range).
@@ -106,12 +107,12 @@ pg_xclaim_start_temp_cluster() {
     export PGDATA PGPORT PGSOCKET PGHOST
 
     # Preflight: ru_RU.UTF-8 must exist on this host. initdb dies with a
-    # cryptic "invalid locale" otherwise, and below we capture its output to
-    # a log -- but failing here gives the operator a directly actionable hint.
+    # cryptic "invalid locale" otherwise, while failing here gives the
+    # operator a directly actionable hint.
     if ! { locale -a 2>/dev/null || true; } | grep -qiE "ru_RU\.(UTF-8|utf8)"; then
         echo "[lib] FATAL: locale ru_RU.UTF-8 not available on this host." >&2
         echo "[lib]   Generate it first, e.g.: sudo locale-gen ru_RU.UTF-8" >&2
-        echo "[lib]   (macOS ships ru_RU.UTF-8 by default; on Linux install/generate it.)" >&2
+        echo "[lib]   (macOS ships ru_RU.UTF-8 by default, on Linux install/generate it.)" >&2
         return 1
     fi
 
@@ -122,7 +123,7 @@ pg_xclaim_start_temp_cluster() {
         -E UTF8 \
         --auth=trust \
         -U postgres 2>&1)"; then
-        echo "[lib] FATAL: initdb failed; output follows:" >&2
+        echo "[lib] FATAL: initdb failed, output follows:" >&2
         printf '%s\n' "$_initdb_out" >&2
         return 1
     fi
@@ -141,15 +142,15 @@ pg_xclaim_start_temp_cluster() {
         echo "wal_level = replica"
         echo "max_wal_senders = 3"
         echo "hot_standby = on"
-        # recovery after crash: leave enabled by default; sigkill_stale.sh
-        # overrides this via XCLAIM_EXTRA_CONF
+        # recovery after crash: leave enabled by default.
+        # exit_callback_actions.sh turns it off via XCLAIM_EXTRA_CONF.
         [[ -n "${XCLAIM_EXTRA_CONF:-}" ]] && echo "${XCLAIM_EXTRA_CONF}"
     } >> "$PGDATA/postgresql.conf"
 
-    # LC_ALL/LANG must be exported in the calling env: on macOS the
-    # postmaster inherits the parent's locale at startup, and an unset
-    # LC_ALL triggers "postmaster became multithreaded during startup"
-    # FATAL on PG 17.10+. Inline-prefix keeps the locale scoped to pg_ctl.
+    # The locale is passed inline, so callers need not export it: on macOS
+    # a postmaster started with LC_ALL and LANG unset exits with FATAL
+    # "postmaster became multithreaded during startup". The prefix keeps
+    # the locale scoped to pg_ctl.
     LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
     "$PGBIN/pg_ctl" start -D "$PGDATA" -w \
         -l "$PGDATA/server.log" \
@@ -178,7 +179,107 @@ pg_xclaim_stop_temp_cluster() {
         rm -rf "$PGDATA"
         unset PGDATA PGPORT PGSOCKET PGHOST
     fi
+    if [[ -n "${XCLAIM_TEST_HOOKS_DIR:-}" ]] && [[ -d "$XCLAIM_TEST_HOOKS_DIR" ]]; then
+        rm -rf "$XCLAIM_TEST_HOOKS_DIR"
+        unset XCLAIM_TEST_HOOKS_DIR
+    fi
     return $_rc
+}
+
+# ---------------------------------------------------------------------------
+# Test-only hooks module (test/modules/xclaim_test_hooks). It is built for the
+# PG_CONFIG under test in its own temp directory and preloaded by absolute
+# path after pg_xclaim, so the PostgreSQL installation is never touched.
+# Call before pg_xclaim_start_temp_cluster: it sets XCLAIM_TEST_HOOKS (the
+# library path without suffix) and appends the shared_preload_libraries line
+# to XCLAIM_EXTRA_CONF, after any line the caller put there, so the last
+# definition always loads the module after pg_xclaim.
+# pg_xclaim_stop_temp_cluster removes the build directory.
+# ---------------------------------------------------------------------------
+xclaim_build_test_hooks() {
+    local src="$XCLAIM_LIB_DIR/../modules/xclaim_test_hooks"
+    XCLAIM_TEST_HOOKS_DIR="$(mktemp -d "/tmp/pg_xclaim_${USER:-nobody}_$$.hooks.XXXXXX")"
+    cp "$src/xclaim_test_hooks.c" "$src/Makefile" "$XCLAIM_TEST_HOOKS_DIR/"
+    if ! make -C "$XCLAIM_TEST_HOOKS_DIR" PG_CONFIG="$PG_CONFIG" \
+            XCLAIM_SRC="$(cd "$XCLAIM_LIB_DIR/../../src" && pwd)" \
+            >"$XCLAIM_TEST_HOOKS_DIR/build.log" 2>&1; then
+        echo "[lib] FATAL: building xclaim_test_hooks failed, output follows:" >&2
+        cat "$XCLAIM_TEST_HOOKS_DIR/build.log" >&2
+        return 1
+    fi
+    XCLAIM_TEST_HOOKS="$XCLAIM_TEST_HOOKS_DIR/xclaim_test_hooks"
+    XCLAIM_EXTRA_CONF="${XCLAIM_EXTRA_CONF:+$XCLAIM_EXTRA_CONF
+}shared_preload_libraries = 'pg_xclaim, $XCLAIM_TEST_HOOKS'"
+}
+
+# Creates the hooks module's SQL functions in the temp cluster. Call after
+# pg_xclaim_start_temp_cluster.
+xclaim_create_test_hooks_functions() {
+    pg_xclaim_psql -X -q -v ON_ERROR_STOP=1 >/dev/null <<SQL
+CREATE FUNCTION xclaim_test_published_token(int4) RETURNS int8
+    AS '$XCLAIM_TEST_HOOKS', 'xclaim_test_published_token' LANGUAGE C STRICT;
+CREATE FUNCTION xclaim_test_set_published_token(int4, int8) RETURNS void
+    AS '$XCLAIM_TEST_HOOKS', 'xclaim_test_set_published_token' LANGUAGE C STRICT;
+SQL
+}
+
+# ---------------------------------------------------------------------------
+# Holder session: a psql the test keeps open and feeds statement by statement,
+# so a claim stays held exactly as long as the test needs it. One holder at a
+# time, on file descriptor 7. Output goes to $PGDATA/holder.out.
+#   xclaim_holder_open             start psql reading from a FIFO
+#   xclaim_holder_sql SQL          send one statement
+#   xclaim_holder_wait REGEX       wait until the output matches REGEX
+#   xclaim_holder_close            close the input, wait up to 10 s for psql
+#                                  to exit, then terminate it
+# ---------------------------------------------------------------------------
+xclaim_holder_open() {
+    XCLAIM_HOLDER_FIFO="$PGDATA/holder.in"
+    XCLAIM_HOLDER_OUT="$PGDATA/holder.out"
+    rm -f "$XCLAIM_HOLDER_FIFO" "$XCLAIM_HOLDER_OUT"
+    mkfifo "$XCLAIM_HOLDER_FIFO"
+    # psql itself is the background job, so $! is its pid.
+    "$PGBIN/psql" -h "${PGHOST:?pg_xclaim temp cluster not running}" \
+        -p "${PGPORT:?pg_xclaim temp cluster not running}" \
+        -U postgres -d postgres -X -A -t -q \
+        < "$XCLAIM_HOLDER_FIFO" > "$XCLAIM_HOLDER_OUT" 2>&1 &
+    XCLAIM_HOLDER_JOB=$!
+    exec 7>"$XCLAIM_HOLDER_FIFO"
+}
+
+xclaim_holder_sql() {
+    printf '%s\n' "$1" >&7
+}
+
+xclaim_holder_wait() {
+    local i
+    for i in $(seq 1 100); do
+        grep -qE "$1" "$XCLAIM_HOLDER_OUT" 2>/dev/null && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+xclaim_holder_close() {
+    local i
+    exec 7>&-
+    for i in $(seq 1 100); do
+        kill -0 "$XCLAIM_HOLDER_JOB" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill "$XCLAIM_HOLDER_JOB" 2>/dev/null || true
+    wait "$XCLAIM_HOLDER_JOB" 2>/dev/null || true
+    rm -f "$XCLAIM_HOLDER_FIFO"
+}
+
+# Waits until a backend process is gone, so every exit callback has run.
+xclaim_wait_backend_gone() {
+    local pid="$1" i
+    for i in $(seq 1 100); do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -195,7 +296,7 @@ pg_xclaim_psql() {
 }
 
 # ---------------------------------------------------------------------------
-# Run a SQL string in the background psql; write output to a tmpfile.
+# Run a SQL string in the background psql and write output to a tmpfile.
 # Returns the tmpfile path.  Caller must manage lifecycle.
 # ---------------------------------------------------------------------------
 pg_xclaim_psql_bg() {
@@ -209,8 +310,8 @@ pg_xclaim_psql_bg() {
 }
 
 # ---------------------------------------------------------------------------
-# Assert helper -- prints PASS/FAIL and exits on failure.
-# Usage: xclaim_assert <condition_description> <actual_value> <expected_value>
+# Assert helper -- prints PASS/FAIL and returns 1 on failure.
+# Usage: xclaim_assert_eq <condition_description> <actual_value> <expected_value>
 # ---------------------------------------------------------------------------
 xclaim_assert_eq() {
     local desc="$1" actual="$2" expected="$3"

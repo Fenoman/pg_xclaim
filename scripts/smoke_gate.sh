@@ -4,7 +4,7 @@
 # Verifies that `_PG_init` does not panic when the freshly-built `.so` is
 # preloaded. Uses `postgres --single` bootstrap mode, which executes
 # preload (and runs init) but accepts no client work. Exit 0 means the
-# server initialized cleanly; non-zero means a FATAL/PANIC was emitted
+# server initialized cleanly. Non-zero means a FATAL/PANIC was emitted
 # during shared_preload_libraries processing.
 #
 # Mandatory before any production postgresql.conf change: without this

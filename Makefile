@@ -20,10 +20,12 @@ OBJS = \
 	src/pg_xclaim_stats.o \
 	src/pg_xclaim_session.o
 
-# Versioned install SQL. Upgrade scripts (e.g. pg_xclaim--1.0.0-rc1--1.0.0.sql)
-# will be added alongside on subsequent releases.
+# Base install script plus the chain of update scripts. CREATE EXTENSION
+# reaches default_version (pg_xclaim.control) by running the base script
+# and then each update script in turn.
 DATA = \
-	sql/pg_xclaim--1.0.0-rc1.sql
+	sql/pg_xclaim--1.0.0-rc1.sql \
+	sql/pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql
 
 # Regression test list. The main suite runs with
 # shared_preload_libraries='pg_xclaim' (test/regress.conf).
@@ -48,7 +50,9 @@ REGRESS = \
 	bulk_array_shape \
 	sql_surface \
 	debug_inject_stale_hardening \
-	enabled_off_contract
+	enabled_off_contract \
+	ensure_scope_first_claim \
+	extension_version
 
 # Suppress default PGXS installcheck -- we define our own below that uses
 # --temp-instance so shared_preload_libraries can be applied.
@@ -82,6 +86,15 @@ BINDIR    := $(shell $(PG_CONFIG) --bindir)
 PGXS_SRCDIR    := $(shell dirname $(shell dirname $(PGXS)))
 REGRESS_BINARY := $(PGXS_SRCDIR)/test/regress/pg_regress
 
+# pg_regress runs initdb and the postmaster of --temp-instance from --bindir.
+# Without it, it uses the bindir compiled into it, which on a relocated
+# installation (a copied Homebrew prefix, for example) is another server with
+# another installed pg_xclaim. pg_regress also drops LC_ALL from its
+# environment and keeps LANG, and on macOS a postmaster started with no
+# locale in its environment exits with "postmaster became multithreaded
+# during startup", so LANG carries the temp-cluster locale.
+REGRESS_RUN := LANG=ru_RU.UTF-8 $(REGRESS_BINARY) --bindir=$(BINDIR)
+
 # Temporary instance directories under /tmp.
 REGRESS_TMPDIR     := /tmp/pg_xclaim_$(USER)_regress
 REGRESS_CAP_TMPDIR := /tmp/pg_xclaim_$(USER)_capacity
@@ -89,24 +102,27 @@ REGRESS_NP_TMPDIR  := /tmp/pg_xclaim_$(USER)_nonpreload
 REGRESS_LW_TMPDIR  := /tmp/pg_xclaim_$(USER)_lwlocks
 
 # -------------------------------------------------------------------------
-# Prerequisite for every installcheck* target below: the pg_xclaim.so and
-# its SQL must already be present in pg_config --pkglibdir / --sharedir.
-# Run `sudo make install` (or have write access to those dirs) beforehand.
-# The targets deliberately do NOT depend on `install`: that PGXS phony
-# target re-copies into root-owned dirs on packaged PGDG builds, which
-# fails for an unprivileged `make installcheck`.
+# Prerequisite for the pg_regress targets below (installcheck,
+# installcheck-capacity, installcheck-nonpreload, installcheck-lwlocks):
+# pg_xclaim.so and its SQL must already be present in pg_config
+# --pkglibdir / --sharedir. Run `sudo make install` (or have write access
+# to those dirs) beforehand. These targets deliberately do NOT depend on
+# `install`: that PGXS phony target re-copies into root-owned dirs on
+# packaged PGDG builds, which fails for an unprivileged `make
+# installcheck`. installcheck-smoke and installcheck-smoke-no-preload do
+# depend on `install`.
 # -------------------------------------------------------------------------
 
 # -------------------------------------------------------------------------
 # installcheck: main regression suite with shared_preload_libraries='pg_xclaim'.
 # Uses --temp-instance so the cluster is started fresh with test/regress.conf.
-# Temp cluster lives under /tmp; pg_regress cleans it up automatically.
+# Temp cluster lives under /tmp, and pg_regress cleans it up automatically.
 # -------------------------------------------------------------------------
 .PHONY: installcheck
 installcheck:
 	mkdir -p test/results
 	mkdir -p test/expected
-	$(REGRESS_BINARY) \
+	$(REGRESS_RUN) \
 		--inputdir=test \
 		--outputdir=test \
 		--expecteddir=test/expected \
@@ -117,14 +133,14 @@ installcheck:
 
 # -------------------------------------------------------------------------
 # installcheck-capacity: isolated temp cluster with max_claims=64
-# (above the dynahash 32-freelist floor; never use a smaller value).
-# SQL files live in test/capacity/sql/; expected in test/capacity/expected/.
+# (above the dynahash 32-freelist floor, and never below it).
+# SQL files live in test/capacity/sql/ and expected output in test/capacity/expected/.
 # -------------------------------------------------------------------------
 .PHONY: installcheck-capacity
 installcheck-capacity:
 	mkdir -p test/capacity/results
 	mkdir -p test/capacity/expected
-	$(REGRESS_BINARY) \
+	$(REGRESS_RUN) \
 		--inputdir=test/capacity \
 		--outputdir=test/capacity \
 		--expecteddir=test/capacity/expected \
@@ -136,13 +152,13 @@ installcheck-capacity:
 # -------------------------------------------------------------------------
 # installcheck-nonpreload: temp cluster WITHOUT pg_xclaim preloaded.
 # XCLAIM_REQUIRE_INIT() must raise ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE.
-# SQL files live in test/nonpreload/sql/; expected in test/nonpreload/expected/.
+# SQL files live in test/nonpreload/sql/ and expected output in test/nonpreload/expected/.
 # -------------------------------------------------------------------------
 .PHONY: installcheck-nonpreload
 installcheck-nonpreload:
 	mkdir -p test/nonpreload/results
 	mkdir -p test/nonpreload/expected
-	$(REGRESS_BINARY) \
+	$(REGRESS_RUN) \
 		--inputdir=test/nonpreload \
 		--outputdir=test/nonpreload \
 		--expecteddir=test/nonpreload/expected \
@@ -155,15 +171,15 @@ installcheck-nonpreload:
 # exceeds the 192-LWLock budget that xclaim.debug() and
 # xclaim.debug_snapshot() require for the all-partition scan. Both
 # helpers must raise a clean ERRCODE_FEATURE_NOT_SUPPORTED with an
-# actionable hint; the acquisition path must remain usable after the
+# actionable hint, and the acquisition path must remain usable after the
 # refusal (no partition LWLock leaked across the ereport unwind).
-# SQL files live in test/lwlocks/sql/; expected in test/lwlocks/expected/.
+# SQL files live in test/lwlocks/sql/ and expected output in test/lwlocks/expected/.
 # -------------------------------------------------------------------------
 .PHONY: installcheck-lwlocks
 installcheck-lwlocks:
 	mkdir -p test/lwlocks/results
 	mkdir -p test/lwlocks/expected
-	$(REGRESS_BINARY) \
+	$(REGRESS_RUN) \
 		--inputdir=test/lwlocks \
 		--outputdir=test/lwlocks \
 		--expecteddir=test/lwlocks/expected \
@@ -175,7 +191,7 @@ installcheck-lwlocks:
 # -------------------------------------------------------------------------
 # installcheck-smoke: pre-deploy smoke gate.
 # Wraps scripts/smoke_gate.sh -- runs `postgres --single` against a temp
-# datadir with shared_preload_libraries='pg_xclaim'; FAILs if FATAL/PANIC
+# datadir with shared_preload_libraries='pg_xclaim' and FAILs if FATAL/PANIC
 # is emitted during _PG_init. The paired no-preload variant covers the
 # LOAD-without-preload path.
 # -------------------------------------------------------------------------

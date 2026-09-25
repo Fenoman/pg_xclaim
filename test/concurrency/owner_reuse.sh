@@ -3,19 +3,23 @@
 # Owner identity / backend reuse test.
 #
 # Scenario:
-#   Backend A acquires (1, 800), then exits cleanly (before_shmem_exit cleans up).
+#   Backend A acquires (1, 800), commits (the xact callback releases the claim)
+#   and exits cleanly (its exit callback invalidates its owner token).
 #   New backend B tries (1, 800) -> true (clean exit means no stale entry).
 #
-#   Backend reuse variant (owner_token mismatch):
-#   Use xclaim.debug_inject_stale to simulate a stale entry with procno matching
-#   the current backend's procno but a different token -> reaper detects mismatch.
+#   Out-of-range owner:
+#   xclaim.debug_inject_stale writes a row with owner_procno = INT32_MAX and
+#   owner_token 0. The reaper takes it over at the procno bounds check,
+#   before it compares pids or tokens.
 #
-# NOTE on procno reuse:
-#   Genuine procno reuse (same slot, different backend) is non-deterministic and
-#   cannot be reliably orchestrated in a test. We use debug injection to
-#   simulate the token-mismatch scenario. This directly exercises the
-#   reaper code path that checks:
+#   Token mismatch:
+#   Backend A holds (1, 810) in an open transaction. The hooks module
+#   (test/modules/xclaim_test_hooks) overwrites the owner_token published in
+#   A's slot, as a new backend in the same slot would. A stays alive, so the
+#   procno and pid checks pass and the reaper takes the row over on the
+#   token check:
 #     entry.owner_token != XClaimBackendInfos[procno].current_token
+#   Genuine slot reuse by another backend cannot be orchestrated reliably.
 #
 # HARD INVARIANTS: set -euo pipefail, /tmp cluster, ru_RU.UTF-8, trap cleanup
 set -euo pipefail
@@ -24,8 +28,10 @@ SCRIPT="owner_reuse"
 LIB_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$LIB_DIR/_lib.sh"
 
-pg_xclaim_start_temp_cluster "owner_reuse"
 trap pg_xclaim_stop_temp_cluster EXIT INT TERM
+xclaim_build_test_hooks
+pg_xclaim_start_temp_cluster "owner_reuse"
+xclaim_create_test_hooks_functions
 
 xclaim_banner "$SCRIPT"
 
@@ -44,7 +50,8 @@ BEGIN;
 SELECT xclaim.try(1, 800);
 COMMIT;
 SQLA
-# psql exits, before_shmem_exit fires, cleanup runs
+# COMMIT released the claim. psql exits and the exit callback invalidates
+# the owner token.
 
 # New backend B: should succeed
 B_RESULT="$(pg_xclaim_psql -X -A -t 2>/dev/null <<'SQLB'
@@ -67,15 +74,15 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 2: token mismatch triggers reaper (simulated procno reuse via inject)
+# Test 2: out-of-range owner triggers the reaper (debug injection)
 # ---------------------------------------------------------------------------
-echo "--- Test 2: token mismatch triggers reaper (simulated via inject) ---"
+echo "--- Test 2: out-of-range owner triggers the reaper (debug injection) ---"
 
 REAPED_BEFORE="$(pg_xclaim_psql -X -A -t \
     -c "SELECT reaped_stale FROM xclaim.stats();" \
     2>/dev/null | tr -d ' ' || echo "0")"
 
-# Inject a stale entry (procno=99999, token=0 -- guaranteed stale)
+# Inject a stale entry (owner_procno = INT32_MAX, owner_token 0)
 pg_xclaim_psql -X -A -t \
     -c "SELECT xclaim.debug_inject_stale(1, 801);" \
     >/dev/null 2>&1
@@ -106,13 +113,13 @@ TRY_VAL="$(echo "$TRY_STALE_RESULT" | grep -E '^(t|f)$' | head -1 || echo "unkno
 echo "  xclaim.try(1,801) on stale entry: $TRY_VAL"
 
 if [[ "$TRY_VAL" == "t" ]]; then
-    echo "  PASS: token mismatch -> reaper fired -> acquisition succeeded"
+    echo "  PASS: out-of-range owner -> reaper fired -> acquisition succeeded"
     PASS=$(( PASS + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "token_mismatch_reaper" "PASS" "result" "true" "reaper fired")")
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "out_of_range_owner_reaper" "PASS" "result" "true" "reaper fired")")
 else
     echo "  FAIL: expected true (reaper should fire), got '$TRY_VAL'" >&2
     FAIL=$(( FAIL + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "token_mismatch_reaper" "FAIL" "result" "$TRY_VAL" "reaper did not fire")")
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "out_of_range_owner_reaper" "FAIL" "result" "$TRY_VAL" "reaper did not fire")")
 fi
 
 REAPED_AFTER="$(pg_xclaim_psql -X -A -t \
@@ -128,6 +135,69 @@ else
     echo "  FAIL: reaped_stale not incremented" >&2
     FAIL=$(( FAIL + 1 ))
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "reaper_counter" "FAIL" "reaped_stale" "$REAPED_AFTER" "not incremented")")
+fi
+
+# ---------------------------------------------------------------------------
+# Test 3: token mismatch with a live owner triggers the reaper
+# ---------------------------------------------------------------------------
+echo "--- Test 3: token mismatch with a live owner triggers the reaper ---"
+
+xclaim_holder_open
+xclaim_holder_sql "BEGIN;"
+xclaim_holder_sql "SELECT xclaim.try(1, 810);"
+xclaim_holder_sql "SELECT 'pid=' || pg_backend_pid();"
+A_ROW=""
+if xclaim_holder_wait '^pid='; then
+    A_ROW="$(pg_xclaim_psql -X -A -t -q \
+        -c "SELECT owner_procno || ' ' || owner_token || ' ' || owner_pid FROM xclaim.debug() WHERE key = 810;")"
+fi
+read -r A_PROCNO A_TOKEN A_PID <<<"${A_ROW:-x x x}"
+
+if [[ -z "$A_ROW" ]]; then
+    xclaim_holder_close
+    echo "  FAIL: backend A must hold (1, 810)" >&2
+    FAIL=$(( FAIL + 1 ))
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "token_mismatch_reaper" "FAIL" "setup" "no row" "backend A must hold (1, 810)")")
+else
+    REAPED_BEFORE="$(pg_xclaim_psql -X -A -t -q -c "SELECT reaped_stale FROM xclaim.stats();")"
+    MISSES_BEFORE="$(pg_xclaim_psql -X -A -t -q -c "SELECT cleanup_misses FROM xclaim.stats();")"
+    # The slot now publishes a token other than the row's, while A's pid
+    # still owns the slot.
+    pg_xclaim_psql -X -A -t -q \
+        -c "SELECT xclaim_test_set_published_token($A_PROCNO, $A_TOKEN + 1);" >/dev/null
+    PUB="$(pg_xclaim_psql -X -A -t -q -c "SELECT xclaim_test_published_token($A_PROCNO);")"
+    A_ALIVE="$(pg_xclaim_psql -X -A -t -q -c "SELECT count(*) FROM pg_stat_activity WHERE pid = $A_PID;")"
+    TRY3="$(pg_xclaim_psql -X -A -t -q -c "SELECT xclaim.try(1, 810);")"
+    REAPED_AFTER="$(pg_xclaim_psql -X -A -t -q -c "SELECT reaped_stale FROM xclaim.stats();")"
+    echo "  A: procno = $A_PROCNO, pid = $A_PID (alive: $A_ALIVE), row token = $A_TOKEN, published now = $PUB"
+    echo "  other backend: try(1, 810) = $TRY3, reaped_stale $REAPED_BEFORE -> $REAPED_AFTER"
+
+    if [[ "$A_ALIVE" == "1" ]] && [[ "$PUB" == "$(( A_TOKEN + 1 ))" ]] \
+        && [[ "$TRY3" == "t" ]] && (( REAPED_AFTER == REAPED_BEFORE + 1 )); then
+        echo "  PASS: token mismatch with a live owner -> reaper fired -> acquisition succeeded"
+        PASS=$(( PASS + 1 ))
+        CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "token_mismatch_reaper" "PASS" "result" "true" "reaper fired on the token check")")
+    else
+        echo "  FAIL: expected a live owner, the new published token, try = t and one reap" >&2
+        FAIL=$(( FAIL + 1 ))
+        CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "token_mismatch_reaper" "FAIL" "result" "$TRY3" "reaper did not fire on the token check")")
+    fi
+
+    # A's cleanup at COMMIT no longer finds its row, which the reaper handed
+    # to the other backend: exactly one cleanup miss.
+    xclaim_holder_sql "COMMIT;"
+    xclaim_holder_close
+    MISSES_AFTER="$(pg_xclaim_psql -X -A -t -q -c "SELECT cleanup_misses FROM xclaim.stats();")"
+    echo "  cleanup_misses after A committed: $MISSES_BEFORE -> $MISSES_AFTER"
+    if (( MISSES_AFTER == MISSES_BEFORE + 1 )); then
+        echo "  PASS: A's cleanup counted its taken-over row as a miss"
+        PASS=$(( PASS + 1 ))
+        CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "owner_cleanup_miss" "PASS" "cleanup_misses" "$MISSES_AFTER" "one miss")")
+    else
+        echo "  FAIL: expected cleanup_misses $MISSES_BEFORE + 1" >&2
+        FAIL=$(( FAIL + 1 ))
+        CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "owner_cleanup_miss" "FAIL" "cleanup_misses" "$MISSES_AFTER" "expected one miss")")
+    fi
 fi
 
 xclaim_check_server_log "$SCRIPT" || FAIL=$(( FAIL + 1 ))

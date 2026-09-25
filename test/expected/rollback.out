@@ -1,7 +1,7 @@
 -- test/sql/rollback.sql
 -- Rollback Release
 -- BEGIN; acquire; ROLLBACK; verify key is reusable and count is 0.
--- Constraint: ROLLBACK releases entry; xclaim.count() = 0 after rollback.
+-- Constraint: ROLLBACK releases the entry, so xclaim.count() = 0 after rollback.
 \set VERBOSITY terse
 \set ON_ERROR_STOP on
 CREATE EXTENSION IF NOT EXISTS pg_xclaim;

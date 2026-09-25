@@ -17,7 +17,7 @@ SELECT capacity_warnings AS warns_before FROM xclaim.stats() \gset
 -- Bulk try_many of 100 keys at max_claims=64: 64 should win, 36 should
 -- fail in WARN mode. The bulk path collapses per-slot WARNINGs into
 -- exactly TWO WARNING lines (one detail, one summary) regardless of
--- how many slots fail; the `capacity_warnings` counter still reflects
+-- how many slots fail, while the `capacity_warnings` counter still reflects
 -- the true per-slot count. A capacity-watermark WARNING may also
 -- fire at the 95%/100% bands -- that is a separate, deliberate signal.
 BEGIN;

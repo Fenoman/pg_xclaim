@@ -8,22 +8,22 @@
  * Layout summary:
  *   * XClaimKey: sizeof == 16 -- HASH_BLOBS hashes raw bytes.
  *   * XClaimEntry: key + saved-acquisition-time owner identity.
- *   * Memory layout: TopMemoryContext for local; HASH_FIXED_SIZE for
+ *   * Memory layout: TopMemoryContext for local, HASH_FIXED_SIZE for
  *     shared. FORBIDDEN to use simplehash.h in shmem.
  *   * ShmemInitHash flag set: HASH_ELEM | HASH_BLOBS | HASH_PARTITION |
- *     HASH_FIXED_SIZE; init_size == max_size == max_claims.
+ *     HASH_FIXED_SIZE, with init_size == max_size == max_claims.
  *   * Saved-acquisition-time identity (procno + lxid + token).
  *   * Stale-owner reaper consults XClaimBackendInfo[procno] for the
- *     current owner_token; readers do unlocked atomic loads.
+ *     current owner_token, and readers do unlocked atomic loads.
  *
  * HARD invariants:
  *   * `memset(&key, 0, sizeof(key))` MANDATORY before any field assignment
  *     (HASH_BLOBS hashes raw bytes including padding bytes).
  *   * `simplehash.h` MUST NOT be used for shared memory -- linear probing
  *     plus grow-on-collision is incompatible with fixed-size shared.
- *   * Never store raw `PGPROC *`; use procno + saved lxid + saved token.
- *   * `next_token` starts at 1; 0 is the reserved-invalid sentinel for
- *     XClaimBackendInfo.current_token.
+ *   * Never store raw `PGPROC *`. Use procno + saved lxid + saved token.
+ *   * `next_token` starts at 1, because 0 is the reserved-invalid
+ *     sentinel for XClaimBackendInfo.current_token.
  *
  *-------------------------------------------------------------------------
  */
@@ -64,13 +64,13 @@ typedef enum XClaimForm
  * XClaimKey
  *      Exactly 16 bytes, no padding. HASH_BLOBS hashes raw bytes -- if any
  *      ABI change introduces a hole we get silent false-negatives in
- *      lookups. The compile-time asserts at the bottom of this header are
+ *      lookups. The compile-time asserts right after this struct are
  *      our defense.
  *
- *      Field layout (verified for aarch64 + amd64; also asserted below):
+ *      Field layout (verified for aarch64 + amd64 and asserted below):
  *        offset 0   uint32 dbid
  *        offset 4   int32  form (XClaimForm)
- *        offset 8   int64  k1   (solo: full int8 key; pair: (classid<<32)|objid)
+ *        offset 8   int64  k1   (solo: full int8 key, pair: (classid<<32)|objid)
  *
  *      Construction MUST always be:
  *          XClaimKey lk;
@@ -92,7 +92,7 @@ typedef struct XClaimKey
  * compile rather than silently breaking HASH_BLOBS lookups.
  */
 StaticAssertDecl(sizeof(XClaimKey) == 16,
-                 "XClaimKey size changed; check HASH_BLOBS compat");
+                 "XClaimKey size changed, check HASH_BLOBS compat");
 StaticAssertDecl(offsetof(XClaimKey, dbid) == 0,
                  "XClaimKey dbid offset changed");
 StaticAssertDecl(offsetof(XClaimKey, form) == 4,
@@ -103,7 +103,7 @@ StaticAssertDecl(offsetof(XClaimKey, k1)   == 8,
 /*
  * XClaimEntry
  *      The shared dynahash element (HASH_BLOBS, HASH_FIXED_SIZE, partitioned).
- *      First member is the XClaimKey; dynahash treats the leading
+ *      First member is the XClaimKey: dynahash treats the leading
  *      sizeof(XClaimKey) bytes as the lookup key.
  *
  *      `owner_pid` is debug/display only. Correctness identity is the triple
@@ -115,7 +115,7 @@ StaticAssertDecl(offsetof(XClaimKey, k1)   == 8,
 typedef struct XClaimEntry
 {
     XClaimKey           key;            /* 16 bytes -- leading hash key     */
-    int32               owner_pid;      /* debug/display ONLY; never identity */
+    int32               owner_pid;      /* debug/display ONLY, never identity */
     int32               owner_procno;   /* PG-version-abstracted */
     LocalTransactionId  owner_lxid;     /* saved at acquisition */
     uint64              owner_token;    /* extension-owned backend generation */
@@ -135,14 +135,14 @@ typedef struct XClaimEntry
  *      unlocked atomic load of `current_token` and compares against the
  *      saved owner_token in a conflicting XClaimEntry. False negatives
  *      are tolerated -- a missed reap simply causes the conflict path
- *      to return false; the next attempt will retry.
+ *      to return false, and the next attempt retries.
  *
  *      `pid` is debug/display only (mirrors PGPROC->pid).
  */
 typedef struct XClaimBackendInfo
 {
     pg_atomic_uint64    current_token;  /* 0 == inactive (sentinel)         */
-    pid_t               pid;            /* debug only; PGPROC.pid mirror    */
+    pid_t               pid;            /* debug only, PGPROC.pid mirror    */
 
     /*
      * Per-backend hot-path counters. Bumped from the acquisition path
@@ -185,8 +185,8 @@ pg_attribute_aligned(PG_CACHE_LINE_SIZE) XClaimBackendInfo;
  * XClaimControl
  *      Single ShmemInitStruct-allocated singleton holding:
  *        * GUC snapshots taken under AddinShmemInitLock (so the cluster's
- *          view stays self-consistent for any PGC_SIGHUP reload path;
- *          today these are PGC_POSTMASTER and never change).
+ *          view stays self-consistent for any PGC_SIGHUP reload path,
+ *          although both GUCs are PGC_POSTMASTER and never change).
  *        * Atomic owner_token issuer (`next_token`).
  *        * Stats counters (atomic, lock-free).
  *        * Pointer to the named LWLock tranche obtained via
@@ -198,10 +198,10 @@ pg_attribute_aligned(PG_CACHE_LINE_SIZE) XClaimBackendInfo;
 typedef struct XClaimControl
 {
     /* GUC snapshots (consistency under AddinShmemInitLock). */
-    int                 num_partitions;     /* power-of-two; mask = N - 1   */
+    int                 num_partitions;     /* power-of-two, mask = N - 1   */
     int                 max_claims;         /* >= 32 (HARD invariant)       */
 
-    /* Owner-token issuer -- atomic counter; 0 reserved invalid. */
+    /* Owner-token issuer -- atomic counter, 0 reserved invalid. */
     pg_atomic_uint64    next_token;
 
     /*
@@ -212,7 +212,7 @@ typedef struct XClaimControl
      *      acquisition path bumps per-backend slot counters
      *      (XClaimBackendInfo.total_acquires_local / reentrant_hits_local /
      *      conflicts_local) instead of these globals to avoid
-     *      cache-line ping-pong; xclaim.stats() sums the per-backend
+     *      cache-line ping-pong, and xclaim.stats() sums the per-backend
      *      slots for the SQL surface. The shared fields are kept in the
      *      control block as stable layout reserves, initialised to zero
      *      at shmem startup and never mutated thereafter.
@@ -224,9 +224,9 @@ typedef struct XClaimControl
      *   live counters (debug/admin):
      *      debug_scans, peak_per_backend, live_capacity
      */
-    pg_atomic_uint64    total_acquires;             /* ABI/layout reserve; always zero */
-    pg_atomic_uint64    reentrant_hits;             /* ABI/layout reserve; always zero */
-    pg_atomic_uint64    conflicts;                  /* ABI/layout reserve; always zero */
+    pg_atomic_uint64    total_acquires;             /* ABI/layout reserve, always zero */
+    pg_atomic_uint64    reentrant_hits;             /* ABI/layout reserve, always zero */
+    pg_atomic_uint64    conflicts;                  /* ABI/layout reserve, always zero */
     pg_atomic_uint64    capacity_errors;
     pg_atomic_uint64    capacity_warnings;
     pg_atomic_uint64    reaped_stale;
@@ -235,7 +235,7 @@ typedef struct XClaimControl
     pg_atomic_uint64    debug_scans;
     pg_atomic_uint64    session_resets;
     pg_atomic_uint64    peak_per_backend;       /* high-water-mark */
-    pg_atomic_uint64    live_capacity;          /* current entries in shared dynahash; single-load alternative to walking all partitions */
+    pg_atomic_uint64    live_capacity;          /* current entries in shared dynahash, a single-load alternative to walking all partitions */
 
     /*
      * Named LWLock tranche pointer obtained from

@@ -1,4 +1,4 @@
--- test/sql_nonpreload/nonpreload_smoke.sql
+-- test/nonpreload/sql/nonpreload_smoke.sql
 -- Non-preloaded Call Failure
 -- Server started WITHOUT pg_xclaim in shared_preload_libraries.
 -- LOAD 'pg_xclaim' succeeds silently (no FATAL).
@@ -9,7 +9,7 @@
 \set VERBOSITY terse
 \set ON_ERROR_STOP on
 
--- Create the extension (control file installs SQL objects; .so loaded lazily)
+-- Create the extension (control file installs SQL objects, and the .so is loaded lazily)
 CREATE EXTENSION IF NOT EXISTS pg_xclaim;
 
 -- LOAD succeeds silently -- _PG_init returns without side effects

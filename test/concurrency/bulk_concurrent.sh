@@ -7,8 +7,8 @@
 #      tries keys 1..10000. Each key has exactly one winner. Verify no duplicate
 #      wins (total true results across all sessions = 10000 unique keys).
 #
-#   2. Catastrophic rollback: a cluster with max_claims=64 is started separately;
-#      try_many 100 keys -> ERROR; after rollback, debug() shows 0 entries.
+#   2. Catastrophic rollback: a cluster with max_claims=64 is started separately.
+#      try_many 100 keys -> ERROR. After rollback, debug() shows 0 entries.
 #
 #   3. Reentrant bulk: same session try_many with already-held keys -> all true,
 #      no double entries in debug().
@@ -93,7 +93,7 @@ for _i in $(seq 1 $N_SESSIONS); do
     BGPIDS+=($!)
 done
 
-# Let workers establish psql connections, then release the barrier.
+# Let the workers start and reach the barrier loop, then release it.
 sleep 0.3
 : > "$START_FLAG"
 
@@ -156,6 +156,9 @@ log_min_messages = warning
 logging_collector = off
 EOF
 
+# Inline locale, as in _lib.sh: on macOS a postmaster started without one
+# exits with FATAL "postmaster became multithreaded during startup".
+LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
 "$PGBIN/pg_ctl" start -D "$CAP_DATA" -w \
     -l "$CAP_DATA/server.log" \
     -o "-p $CAP_PORT" >/dev/null 2>&1

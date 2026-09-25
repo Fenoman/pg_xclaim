@@ -13,7 +13,7 @@
 #   6. `bash scripts/smoke_gate.sh`
 #   7. (optional) `bash test/concurrency/run_concurrency_suite.sh --skip-slow`
 #
-# Aggregates pass/fail across versions; exits non-zero if ANY slot fails.
+# Aggregates pass/fail across versions and exits non-zero if ANY slot fails.
 #
 # Usage:
 #   scripts/run_regress_matrix.sh                 # auto-discover all majors
@@ -64,7 +64,7 @@ if [[ ${#EXPLICIT_VERSIONS[@]} -eq 0 ]]; then
         # shellcheck disable=SC2206
         EXPLICIT_VERSIONS=($listing)
     else
-        echo "no PG installations discovered; set PG{16,17,18}_CONFIG or pass major" >&2
+        echo "no PG installations discovered, set PG{16,17,18}_CONFIG or pass major" >&2
         exit 1
     fi
 fi

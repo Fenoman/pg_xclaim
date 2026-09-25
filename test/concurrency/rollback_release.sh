@@ -23,7 +23,7 @@ FAIL=0
 CSV_ROWS=()
 
 # ---------------------------------------------------------------------------
-# Test 1: A acquires + ROLLBACK; B then succeeds
+# Test 1: A acquires + ROLLBACK, then B succeeds
 # ---------------------------------------------------------------------------
 echo "--- Test 1: rollback releases claim ---"
 

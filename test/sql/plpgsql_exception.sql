@@ -9,7 +9,7 @@
 
 CREATE EXTENSION IF NOT EXISTS pg_xclaim;
 
--- Test 1: acquire inside plpgsql EXCEPTION block; claim survives subtxn rollback
+-- Test 1: claim acquired inside plpgsql EXCEPTION block survives subtxn rollback
 BEGIN;
 DO $$
 DECLARE
@@ -24,7 +24,7 @@ BEGIN
         RAISE EXCEPTION 'inner_error';
     EXCEPTION
         WHEN others THEN
-            -- Exception caught; subtxn rolled back but claim should still be held
+            -- Exception caught, subtxn rolled back, but claim should still be held
             NULL;
     END;
 END;
@@ -39,7 +39,7 @@ COMMIT;
 -- After commit: released
 SELECT xclaim.count() AS count_after_commit;
 
--- Test 2: acquire THEN trigger EXCEPTION; verify count in handler
+-- Test 2: acquire THEN trigger EXCEPTION and verify count in handler
 BEGIN;
 DO $$
 DECLARE

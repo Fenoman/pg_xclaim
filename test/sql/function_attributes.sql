@@ -1,7 +1,8 @@
 -- test/sql/function_attributes.sql
 -- Function Attribute Parity
--- Verifies xclaim.try overloads EXACTLY match pg_try_advisory_xact_lock:
+-- Verifies xclaim.try overloads are EXACTLY
 --   VOLATILE PARALLEL RESTRICTED CALLED ON NULL INPUT
+-- pg_try_advisory_xact_lock matches on volatility and parallel mode, but is STRICT.
 -- Also verifies exactly two overloads exist (pronargs=1 int8, pronargs=2 int4+int4)
 
 \set VERBOSITY terse
@@ -15,7 +16,7 @@ FROM pg_proc
 WHERE proname = 'try' AND pronamespace = 'xclaim'::regnamespace
 ORDER BY pronargs;
 
--- Verify function attributes match pg_try_advisory_xact_lock:
+-- Verify function attributes (strictness differs from pg_try_advisory_xact_lock):
 -- provolatile='v' (VOLATILE), proparallel='r' (RESTRICTED), proisstrict='f' (CALLED ON NULL INPUT)
 SELECT
     proname,
@@ -69,7 +70,7 @@ ROLLBACK;
 
 -- Test 6b: xclaim.try_many raises ERROR on NULL inputs, symmetric with
 -- the scalar try() overloads. NULL is a programming bug -- silent NULL
--- return would mask it; loud ERROR surfaces it at call site.
+-- return would mask it, while a loud ERROR surfaces it at call site.
 BEGIN;
 SELECT xclaim.try_many(NULL::int8[]);
 ROLLBACK;
@@ -83,7 +84,6 @@ SELECT xclaim.try_many(1::int4, NULL::int4[]);
 ROLLBACK;
 
 -- Test 6c: NULL ELEMENT inside an otherwise-valid array also raises.
--- This is the symmetry that the silent-skip behavior used to break.
 -- Without the rejection, README's recommended `bool_and(unnest)` idiom
 -- silently passes a partially-NULL result (bool_and ignores NULL by
 -- SQL semantics), fail-opening the whole bulk call on a caller bug.
@@ -95,9 +95,8 @@ BEGIN;
 SELECT xclaim.try_many(99::int4, ARRAY[1, NULL, 3]::int4[]);
 ROLLBACK;
 
--- Test 6d: bool_and(unnest) idiom from README -- given the new contract,
--- a NULL element raises BEFORE the idiom even sees a row. Demonstrates
--- the fail-open path is closed.
+-- Test 6d: bool_and(unnest) idiom from README -- a NULL element raises
+-- BEFORE the idiom even sees a row, so the idiom cannot fail open.
 BEGIN;
 SELECT bool_and(ok)
 FROM unnest(xclaim.try_many(ARRAY[10, NULL, 20]::int8[])) AS ok;

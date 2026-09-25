@@ -54,7 +54,7 @@ SELECT count(*) AS debug_count FROM xclaim.debug();
 SELECT count(*) AS snapshot_count FROM xclaim.debug_snapshot();
 COMMIT;
 
--- NULL handling: CALLED ON NULL INPUT parity with pg_try_advisory_xact_lock.
+-- NULL handling: CALLED ON NULL INPUT, unlike STRICT pg_try_advisory_xact_lock.
 -- All NULL inputs should raise ERROR (not return NULL silently).
 \set ON_ERROR_STOP off
 

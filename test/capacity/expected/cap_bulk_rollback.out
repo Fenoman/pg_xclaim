@@ -41,18 +41,18 @@ SELECT capacity_used AS pre_test_capacity_used FROM xclaim.stats();
 (1 row)
 
 -- Run a bulk-acquire that exceeds capacity. ERROR mode raises
--- ERRCODE_CONFIGURATION_LIMIT_EXCEEDED mid-batch; the bulk PG_CATCH path
+-- ERRCODE_CONFIGURATION_LIMIT_EXCEEDED mid-batch, and the bulk PG_CATCH path
 -- rolls back every shared row inserted before the failure.
 \set ON_ERROR_STOP off
 BEGIN;
 SELECT count(*) FILTER (WHERE r) AS try_many_acquired
   FROM unnest(xclaim.try_many(1, ARRAY(SELECT generate_series(1, 100)::int4))) AS r;
 ERROR:  pg_xclaim: max_claims (64) exhausted
--- Expected: ERROR before result returns; transaction is now aborted.
+-- Expected: ERROR before result returns, and the transaction is now aborted.
 ROLLBACK;
 \set ON_ERROR_STOP on
 -- Post-test: xclaim.debug() reports the real number of rows in the shared
--- dynahash; xclaim.stats().capacity_used reads from live_capacity. They MUST
+-- dynahash, while xclaim.stats().capacity_used reads from live_capacity. They MUST
 -- agree. After the catastrophic rollback both should be 0.
 SELECT count(*) AS post_rollback_debug_rows FROM xclaim.debug();
  post_rollback_debug_rows 

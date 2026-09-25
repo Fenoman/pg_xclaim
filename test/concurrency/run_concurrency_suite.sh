@@ -49,12 +49,18 @@ ALL_SCRIPTS=(
     "disconnect_release"
     # pg_terminate_backend release
     "terminate_backend_release"
+    # backend-exit callback registered once per claiming backend
+    "exit_callback_registration"
+    # backend-exit callback releases leftover claims, publishes token 0
+    "exit_callback_actions"
     # stale-owner reaper (debug injection path)
     "sigkill_stale"
     # owner reuse / token mismatch
     "owner_reuse"
     # per-backend peak watermark LOG hint
     "peak_warn"
+    # out of memory while the local set grows (Linux only)
+    "local_grow_oom"
     # debug scan stress
     "debug_scan_stress"
     # bulk concurrent
@@ -118,16 +124,18 @@ for script in "${SCRIPTS_TO_RUN[@]}"; do
     echo "================================================================"
 
     T_START="$(python3 -c "import time; print(int(time.time() * 1000))")"
-    if bash "$SCRIPT_PATH"; then
-        T_END="$(python3 -c "import time; print(int(time.time() * 1000))")"
-        ELAPSED=$(( T_END - T_START ))
-        echo ""
+    # Exit code 77 means the script does not run on this platform.
+    if bash "$SCRIPT_PATH"; then rc=0; else rc=$?; fi
+    T_END="$(python3 -c "import time; print(int(time.time() * 1000))")"
+    ELAPSED=$(( T_END - T_START ))
+    echo ""
+    if (( rc == 0 )); then
         echo "[suite] PASS: $script  (${ELAPSED}ms)"
         PASS_SCRIPTS+=("$script:${ELAPSED}ms")
+    elif (( rc == 77 )); then
+        echo "[suite] SKIP (not supported here): $script"
+        SKIP_SCRIPTS+=("$script")
     else
-        T_END="$(python3 -c "import time; print(int(time.time() * 1000))")"
-        ELAPSED=$(( T_END - T_START ))
-        echo ""
         echo "[suite] FAIL: $script  (${ELAPSED}ms)" >&2
         FAIL_SCRIPTS+=("$script:${ELAPSED}ms")
     fi

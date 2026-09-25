@@ -45,7 +45,7 @@ SELECT capacity_used AS pre_test_capacity_used FROM xclaim.stats();
 BEGIN;
 
 -- Inside a plpgsql block with EXCEPTION the DO body is a subtxn.
--- The capacity error fires mid-batch; PG_CATCH in
+-- The capacity error fires mid-batch, and PG_CATCH in
 -- xclaim_try_many_internal HASH_REMOVEs already-inserted shared rows
 -- AND drops the paired local-set entries -- both sides MUST be cleared
 -- atomically with respect to the rollback.
@@ -56,7 +56,7 @@ BEGIN
         RAISE EXCEPTION 'try_many returned without ERROR (unexpected)';
     EXCEPTION WHEN others THEN
         -- Caught the ERRCODE_CONFIGURATION_LIMIT_EXCEEDED. Outer xact
-        -- continues; the catastrophic rollback already cleaned up.
+        -- continues, and the catastrophic rollback already cleaned up.
         NULL;
     END;
 END $$;
@@ -73,7 +73,7 @@ SELECT (xclaim.count() = (SELECT count(*) FROM xclaim.debug()))
 
 ROLLBACK;
 
--- Post-rollback: shared dynahash empty; capacity_used in lock-step.
+-- Post-rollback: shared dynahash empty and capacity_used in lock-step.
 SELECT count(*) AS post_rollback_debug_rows FROM xclaim.debug();
 SELECT capacity_used AS post_rollback_capacity_used FROM xclaim.stats();
 

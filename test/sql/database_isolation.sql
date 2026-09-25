@@ -4,7 +4,6 @@
 -- This single-session test verifies:
 --   1. The database_oid field in debug_snapshot() matches current db OID
 --   2. Claims acquired in this db cannot be observed as cross-db entries
--- Cross-database multi-session conflict testing lives in the concurrency suite.
 
 \set VERBOSITY terse
 \set ON_ERROR_STOP on

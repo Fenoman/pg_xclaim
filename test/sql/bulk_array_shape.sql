@@ -2,7 +2,7 @@
 -- xclaim.try_many output array preserves input dimensions and lower
 -- bounds. A flat 1-D 1-indexed result for multi-dimensional or
 -- custom-lbound input would silently drop shape metadata that
--- downstream queries rely on; pg_regress pins the invariant here.
+-- downstream queries rely on. pg_regress pins the invariant here.
 --
 -- Also covers the synthetic-large-array guard: passing an array larger
 -- than MaxAllocSize / sizeof(XClaimBulkSlot) elements must produce a

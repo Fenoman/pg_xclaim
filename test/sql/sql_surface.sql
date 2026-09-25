@@ -8,7 +8,7 @@
 -- test before it reaches a release branch.
 --
 -- function_attributes.sql already covers the xclaim.try overload
--- matrix and NULL handling in depth; this file adds the missing 8
+-- matrix and NULL handling in depth. This file adds the missing 8
 -- functions plus the privilege model.
 
 \set VERBOSITY terse

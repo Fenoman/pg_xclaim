@@ -5,7 +5,7 @@
 # `docs/perf/hot-path-analysis.md` discusses:
 #   1. scalar-acquire        -- single-backend scalar `xclaim.try`
 #   2. bulk-try-many         -- single-backend bulk `xclaim.try_many`
-#   3. cleanup-commit        -- 50 transactions x 50k commit cleanup
+#   3. cleanup-commit        -- one COMMIT cleanup of 50 x 50k claims (2.5M)
 #   4. concurrent-contention -- 10 backends x 100k overlapping keys
 #
 # Output: docs/perf/flamegraphs/<scenario>.svg + top-15 leaf summary on stdout.
@@ -15,7 +15,7 @@
 #   sudo scripts/record_flamegraphs.sh /path/to/pg_config
 #
 # Requirements:
-#   - Linux (perf record); the script aborts on non-Linux.
+#   - Linux (perf record). The script aborts on non-Linux.
 #   - Run as root (initdb/pg_ctl/psql delegated to a non-privileged user via
 #     `runuser`). perf record needs CAP_PERFMON, and kernel symbol resolution
 #     needs root visibility into /proc/kallsyms.
@@ -27,13 +27,13 @@
 #     (created by the PGDG postgresql-17 package). Override via RUN_USER=...
 #
 # Exit:
-#   0  all four scenarios captured; SVGs written.
+#   0  all four scenarios captured, SVGs written.
 #   1  infrastructure failure (cluster, perf, FlameGraph not found, ...).
 #   2  bad arguments.
 #
 # HARD INVARIANTS:
 #   - set -euo pipefail
-#   - /tmp temp cluster only; trap cleanup
+#   - /tmp temp cluster only, trap cleanup
 #   - locale ru_RU.UTF-8
 
 set -euo pipefail
@@ -80,7 +80,7 @@ if [[ -z "$PG_CONFIG_BIN" ]]; then
     fi
 fi
 if [[ -z "$PG_CONFIG_BIN" || ! -x "$PG_CONFIG_BIN" ]]; then
-    echo "record_flamegraphs: no usable pg_config; pass as argument or set PG_CONFIG" >&2
+    echo "record_flamegraphs: no usable pg_config, pass as argument or set PG_CONFIG" >&2
     exit 2
 fi
 
@@ -97,7 +97,7 @@ PG_MAJOR="$("$PG_CONFIG_BIN" --version 2>/dev/null | awk '{print $2}' | awk -F. 
 PGDATA="$(mktemp -d "/tmp/pg_xclaim_flame_${USER:-root}_$$.XXXXXX")"
 
 # Free-port probe -- python3 is available on Linux CI/dev hosts. A blind
-# 55780+RANDOM%200 pick can collide with an in-use port and fail boot.
+# random port pick can collide with an in-use port and fail boot.
 PGPORT="$(python3 -c '
 import socket
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -148,7 +148,7 @@ echo -1 > /proc/sys/kernel/perf_event_paranoid
 # otherwise die silently with no diagnostic.
 if ! INITDB_OUT="$(runuser -u "$RUN_USER" -- "$PGBIN/initdb" -D "$PGDATA" --locale=ru_RU.UTF-8 \
         -E UTF8 --auth=trust -U postgres 2>&1)"; then
-    echo "record_flamegraphs: initdb failed; output follows:" >&2
+    echo "record_flamegraphs: initdb failed, output follows:" >&2
     printf '%s\n' "$INITDB_OUT" >&2
     exit 1
 fi
@@ -265,7 +265,7 @@ DO \$\$ DECLARE i int; BEGIN
 END \$\$;
 " 12 0
 
-# --- Scenario 3: cleanup (50 transactions x 50k acquire+COMMIT) ----------
+# --- Scenario 3: cleanup (one COMMIT after 50 x 50k acquire) -------------
 run_scenario "cleanup-commit" "
 DO \$\$ DECLARE i int; BEGIN
   FOR i IN 1..50 LOOP

@@ -1,7 +1,7 @@
--- test/sql_capacity/cap_warn.sql
+-- test/capacity/sql/cap_warn.sql
 -- Capacity Exhaustion Mode: warn
 -- Cluster started with test/capacity.conf: max_claims=64
--- Set on_capacity_exhaustion=warn; 65th+ acquisition returns false + WARNING log
+-- With on_capacity_exhaustion=warn, the 65th+ acquisition returns false + WARNING log
 -- xclaim.stats().capacity_warnings > 0
 
 \set VERBOSITY terse
@@ -13,7 +13,7 @@ CREATE EXTENSION IF NOT EXISTS pg_xclaim;
 SET pg_xclaim.on_capacity_exhaustion = 'warn';
 SHOW pg_xclaim.on_capacity_exhaustion;
 
--- Acquire keys; after capacity fills, further tries return false (not error)
+-- Acquire keys. After capacity fills, further tries return false (not error)
 -- We count how many returned true vs false
 BEGIN;
 WITH results AS (

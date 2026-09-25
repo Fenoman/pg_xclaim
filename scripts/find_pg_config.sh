@@ -11,7 +11,7 @@
 # Discovery order:
 #   1. Explicit env var override:
 #        PG16_CONFIG / PG17_CONFIG / PG18_CONFIG
-#      (only the per-major variables are read; a generic PG_CONFIG env is NOT
+#      (only the per-major variables are read: a generic PG_CONFIG env is NOT
 #       consulted here -- callers that want it pass it as the first argument.)
 #   2. macOS Homebrew opt symlink:
 #        /opt/homebrew/opt/postgresql@<v>/bin/pg_config        (Apple Silicon)
@@ -30,7 +30,7 @@
 #
 # HARD INVARIANTS:
 #   - set -euo pipefail
-#   - Never invokes any user cluster; pure filesystem + binary probe.
+#   - Never invokes any user cluster: pure filesystem + binary probe.
 
 set -euo pipefail
 
@@ -62,7 +62,7 @@ _xclaim_probe_pg_config_major() {
 }
 
 # Probe a single major version against env override + candidate paths.
-# Echo first match and return 0; return 1 if none.
+# Echo first match and return 0, or return 1 if none.
 _xclaim_find_for_major() {
     local v="$1"
     local env_var="PG${v}_CONFIG"
@@ -79,7 +79,7 @@ _xclaim_find_for_major() {
         # one slot without breaking siblings.
     fi
 
-    # 2-3. macOS candidates (Apple Silicon + Intel; opt symlink + Cellar).
+    # 2-3. macOS candidates (Apple Silicon + Intel, opt symlink + Cellar).
     candidates=(
         "/opt/homebrew/opt/postgresql@${v}/bin/pg_config"
         "/usr/local/opt/postgresql@${v}/bin/pg_config"

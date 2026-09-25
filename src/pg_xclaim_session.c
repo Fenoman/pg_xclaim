@@ -6,35 +6,39 @@
  *
  * Purpose:
  *   `xclaim.session_reset()` is an OPTIONAL reactive triage tool. It
- *   is NOT required for normal operation: claims are released
- *   automatically by the xact callback on every COMMIT/ABORT, and that
- *   callback fires on PostgreSQL-controlled transaction endings (commit,
+ *   is NOT required for normal operation: the xact callback releases
+ *   claims at every PostgreSQL-controlled transaction ending (commit,
  *   rollback, client disconnect, idle-in-tx timeout, FATAL backend
- *   exit). Hard process death is handled by postmaster crash restart,
- *   not by callbacks in the dead backend. Tx-mode poolers (`pg_doorman`,
- *   `odyssey`, `PgBouncer`) all
- *   issue ROLLBACK before reusing a backend on unhealthy disconnect,
- *   which triggers the same xact-callback cleanup path.
+ *   exit), and the backend-exit callback releases whatever is left
+ *   when the backend exits. Hard process death is handled by
+ *   postmaster crash restart, not by callbacks in the dead backend.
+ *   Tx-mode poolers (`pg_doorman`, `odyssey`, `PgBouncer`) all issue
+ *   ROLLBACK before reusing a backend on unhealthy disconnect, which
+ *   triggers the same xact-callback cleanup path.
  *
  *   DO NOT wire this function into pooler `server_reset_query` /
  *   `server_reset_query_always`. Doing so adds an RTT per backend
- *   handoff (potentially thousands per second on hot clusters) just to
- *   defend against a hypothetical xact-callback skip with no
- *   observable symptom in production. The authoritative guidance lives
- *   in sql/pg_xclaim--1.0.0-rc1.sql (the COMMENT ON FUNCTION text) and
- *   docs/runbook.md section 6 ("Pooler integration").
+ *   handoff (potentially thousands per second on hot clusters) and
+ *   protects against nothing: by the time the pooler resets the
+ *   connection, the transaction has ended and its claims are released.
+ *   The operator guidance lives in the COMMENT ON FUNCTION set by
+ *   sql/pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql and in docs/runbook.md
+ *   section 6.
  *
- *   Use this function ONLY reactively: when
- *   `xclaim.stats().cleanup_misses > 0` is observed in production,
- *   indicating that some xact-callback path was bypassed and reactive
- *   cleanup may be warranted.
+ *   The state it addresses is a session that holds claims outside a
+ *   transaction (`xclaim.count() > 0` in autocommit). Normal operation
+ *   never produces it: when a sibling extension's xact callback raises
+ *   ERROR, PostgreSQL aborts the transaction and calls every xact
+ *   callback again with XACT_EVENT_ABORT, ours included. The end of
+ *   the session's next transaction releases such claims as well.
  *
  *   Idempotent and cheap when no claims are held (the common case).
  *
  * Behaviour:
- *   1. Sentinel check: if the local set is non-empty after xact end,
- *      that is a callback-skip bug -- log at DEBUG1 and proceed to
- *      defensive force-clear. The cleanup runs regardless.
+ *   1. Sentinel check: a non-empty local set holds claims that outlived
+ *      the transaction that took them, or claims taken earlier in the
+ *      same statement -- log at DEBUG1 and proceed. The cleanup runs
+ *      regardless.
  *   2. Force-cleanup of any shared rows owned by THIS backend, using
  *      the same group-by-partition path as the xact callback. This
  *      avoids a full-shmem-scan (O(max_claims) per session_reset is
@@ -44,10 +48,10 @@
  *      drain.
  *   4. Rotate the owner_token: drop our cached token AND zero our
  *      published-slot token. The next acquisition issues a fresh
- *      token from XClaimCtl->next_token; any leftover shared row
- *      (the "callback skip" case this function defends against)
- *      becomes visible to the stale-owner reaper as a token mismatch
- *      on the next conflict.
+ *      token from XClaimCtl->next_token. A shared row with the old
+ *      token that the local set does not track (only a defect can
+ *      leave one) becomes visible to the stale-owner reaper as a token
+ *      mismatch on the next conflict.
  *   5. Increment XClaimCtl->session_resets stat.
  *
  * The function is declared `LANGUAGE c VOLATILE PARALLEL RESTRICTED`
@@ -119,24 +123,25 @@ xclaim_session_reset(PG_FUNCTION_ARGS)
                  errhint("Call it from an autocommit statement, or COMMIT/ROLLBACK first.")));
 
     /*
-     * Sentinel: the local set SHOULD be empty after the previous xact
-     * ended (xact callback ran). Non-empty here means a missed
-     * callback -- the most likely cause is a sibling extension whose
-     * own callback raised ERROR earlier in the CallXactCallbacks
-     * chain, longjmp'ing past us. Log at DEBUG1 -- not WARNING,
+     * Sentinel: the xact callback empties the local set at every
+     * transaction end, so entries from an earlier transaction mean its
+     * callback did not release them. A sibling extension's failing
+     * xact callback does not cause this: PostgreSQL then aborts the
+     * transaction and calls every xact callback again with
+     * XACT_EVENT_ABORT, ours included. Log at DEBUG1 -- not WARNING,
      * because this function is supposed to silently clean up exactly
      * this case.
      */
     held_at_entry = xclaim_local_count();
     if (held_at_entry != 0)
         ereport(DEBUG1,
-                (errmsg("pg_xclaim: session_reset found %llu local entries after xact end (possible callback skip)",
+                (errmsg("pg_xclaim: session_reset releases %llu held claims",
                         (unsigned long long) held_at_entry)));
 
     /*
      * Force-cleanup. Reuses the group-by-partition cleanup path (same
      * code as the xact callback) -- bounded LWLock cycles even if 4M
-     * claims somehow leaked. Full-shmem-scan is REJECTED here as
+     * claims somehow leaked. A full scan of shared memory would cost
      * O(max_claims) per session_reset.
      *
      * If the local set is empty (the common case) this is a single
@@ -148,20 +153,20 @@ xclaim_session_reset(PG_FUNCTION_ARGS)
      * Rotate the owner_token. After this returns, XClaimMyOwnerToken == 0
      * and XClaimBackendInfos[procno].current_token has been atomically
      * written to 0. The next acquisition's xclaim_ensure_owner_token()
-     * issues a FRESH token from XClaimCtl->next_token. Any shared row
-     * that survived the cleanup above (because the saved triple did
-     * not match -- e.g. cleanup_misses scenarios) becomes visible to
-     * the stale-owner reaper as a token mismatch on the next conflict
-     * acquired by another backend.
+     * issues a FRESH token from XClaimCtl->next_token. A shared row
+     * with our old token that the cleanup above did not release,
+     * because the local set does not track it (only a defect leaves
+     * such a row), fails the reaper's token check from now on and goes
+     * to the next conflicting acquisition by another backend.
      */
     xclaim_local_clear_owner_token();
 
     /*
      * Clear the per-session one-shot peak-warning flag. A long-running
-     * backend that already logged "peak crossed 75% of
-     * expected_claims_per_backend" and then issues session_reset()
-     * should be allowed to emit a fresh hint if it grows past the
-     * threshold again on the next workload cycle.
+     * backend that already logged "crossed 75% of
+     * pg_xclaim.expected_claims_per_backend" and then issues
+     * session_reset() should be allowed to emit a fresh hint if it grows
+     * past the threshold again on the next workload cycle.
      */
     xclaim_local_reset_peak_warning();
 

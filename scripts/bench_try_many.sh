@@ -26,7 +26,7 @@
 #
 # HARD INVARIANTS:
 #   - set -euo pipefail
-#   - /tmp temp cluster only; trap cleanup
+#   - /tmp temp cluster only, trap cleanup
 #   - locale ru_RU.UTF-8
 
 set -euo pipefail
@@ -108,12 +108,12 @@ trap cleanup EXIT INT TERM
 # Capture initdb output: a swallowed failure (e.g. missing locale) would
 # otherwise die silently with no diagnostic.
 if ! INITDB_OUT="$("$INITDB" -D "$PGDATA" --locale=ru_RU.UTF-8 -E UTF8 --auth=trust -U postgres 2>&1)"; then
-    echo "bench: initdb failed; output follows:" >&2
+    echo "bench: initdb failed, output follows:" >&2
     printf '%s\n' "$INITDB_OUT" >&2
     exit 2
 fi
 
-# Sized for 750k acquisitions in a single backend; bump above default.
+# Sized for 750k acquisitions in a single backend: bump above default.
 {
     echo "shared_preload_libraries = 'pg_xclaim'"
     echo "port = $PGPORT"
@@ -125,9 +125,9 @@ fi
     echo "logging_collector = off"
 } >> "$PGDATA/postgresql.conf"
 
-# LC_ALL/LANG must be exported in the calling env: on macOS the postmaster
-# inherits the parent's locale at startup, and an unset LC_ALL triggers
-# "postmaster became multithreaded during startup" FATAL on PG 17.10+.
+# The locale is passed inline, so callers need not export it: on macOS a
+# postmaster started with LC_ALL and LANG unset exits with FATAL
+# "postmaster became multithreaded during startup".
 LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
 "$PGCTL" start -D "$PGDATA" -w -l "$PGDATA/server.log" -o "-p $PGPORT" >/dev/null 2>&1 || {
     echo "bench: pg_ctl start failed" >&2
@@ -141,7 +141,7 @@ LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
 
 # ---------------------------------------------------------------------------
 # Single timed run wrapper -- emits ms (integer) on stdout.
-# Uses python3 monotonic clock around a single psql invocation; we also
+# Uses python3 monotonic clock around a single psql invocation. We also
 # check the count to ensure no false-positive (e.g. function returning NULL).
 # ---------------------------------------------------------------------------
 run_query_ms() {
@@ -206,7 +206,7 @@ echo "  -> ${BULK_MS}ms  array_length=$BULK_COUNT"
 
 # ---------------------------------------------------------------------------
 # Bench 3: BASELINE -- pg_try_advisory_xact_lock(1, g) over generate_series
-# Reference for delta reporting; NOT budget-gated.
+# Reference for delta reporting, NOT budget-gated.
 #
 # Allow-fail rationale: 750k advisory locks blow `max_locks_per_transaction`
 # on default settings -- this is exactly the LockManager failure mode that

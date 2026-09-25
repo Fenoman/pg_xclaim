@@ -8,8 +8,11 @@
 #
 # Workload:
 #   - Pool of 1M synthetic accounts.
-#   - For each scenario: each backend runs ITERS transactions, each acquiring
-#     K random non-overlapping keys, then ROLLBACK to release.
+#   - For each scenario: each backend runs ITERS iterations in one
+#     transaction. Each iteration acquires K random keys and rolls back its
+#     subtransaction, which drops the claim-table rows and row locks it took,
+#     while pg_xclaim claims stay held until the transaction ends (see the
+#     worker driver).
 #   - Six implementations per scenario:
 #       A) pg_xclaim:        SELECT xclaim.try_many(1, $1::int4[])
 #       B) claim-table:      INSERT INTO claims_t(account_id) SELECT unnest($1)
@@ -26,13 +29,15 @@
 #   - Single-backend characterization (N=1) and concurrent (N=8) variants.
 #
 # Metrics per (impl, N, K):
-#   - throughput: total transactions / wall-clock seconds across all backends
+#   - throughput: total iterations / wall-clock seconds across all backends
 #   - latency: p50 / p95 over per-iteration wall-clock samples
 #   - wal_bytes: pg_current_wal_lsn delta across the whole scenario
-#   - capacity_observed (impl=A only): xclaim.stats().capacity_used peak
+#   - capacity_observed (impl=A only): xclaim.stats().capacity_used read after
+#     the workers finish. Their claims are already released by then, so this
+#     is a post-run value, not a peak.
 #
 # Output:
-#   docs/perf/bench-alternatives-YYYYMMDD-pg<major>.csv
+#   docs/perf/bench-alternatives-YYYYMMDD-<mode>-pg<major>.csv
 #
 # Usage:
 #   scripts/bench_alternatives.sh                       # auto pg_config 17
@@ -40,12 +45,12 @@
 #   ITERS=10 K_VALUES="1000,10000" N_VALUES="1,8" scripts/bench_alternatives.sh
 #
 # Exit:
-#   0   benchmark completed; CSV written
+#   0   benchmark completed, CSV written
 #   1   bench infrastructure failure
 #
 # HARD INVARIANTS:
 #   - set -euo pipefail; trap cleanup
-#   - /tmp temp cluster only; never touch user clusters
+#   - /tmp temp cluster only, never touch user clusters
 #   - locale ru_RU.UTF-8
 
 set -euo pipefail
@@ -118,7 +123,7 @@ trap cleanup EXIT INT TERM
 # Capture initdb output: a swallowed failure (e.g. missing locale) would
 # otherwise die silently with no diagnostic.
 if ! INITDB_OUT="$("$INITDB" -D "$PGDATA" --locale=ru_RU.UTF-8 -E UTF8 --auth=trust -U postgres 2>&1)"; then
-    echo "bench_alternatives: initdb failed; output follows:" >&2
+    echo "bench_alternatives: initdb failed, output follows:" >&2
     printf '%s\n' "$INITDB_OUT" >&2
     exit 1
 fi
@@ -142,11 +147,11 @@ fi
     echo "deadlock_timeout = 1s"
 } >> "$PGDATA/postgresql.conf"
 
-# LC_ALL/LANG must be exported in the calling env: on macOS the postmaster
-# inherits the parent's locale at startup, and an unset LC_ALL triggers
-# "postmaster became multithreaded during startup" FATAL on PG 17.10+.
-# Inline-prefix keeps the locale scoped to pg_ctl (does not leak into the
-# rest of the script, which expects en_US for parsing some psql output).
+# The locale is passed inline, so callers need not export it: on macOS a
+# postmaster started with LC_ALL and LANG unset exits with FATAL
+# "postmaster became multithreaded during startup".
+# The prefix keeps the locale scoped to pg_ctl: the rest of the script
+# parses psql output and must not get translated messages.
 LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
 "$PGCTL" start -D "$PGDATA" -w -l "$PGDATA/server.log" -o "-p $PGPORT" >/dev/null 2>&1 || {
     echo "bench: pg_ctl start failed" >&2
@@ -163,7 +168,7 @@ PSQL_BASE=("$PSQL" -h "$PGSOCKET" -p "$PGPORT" -U postgres -d postgres -X -At -v
 CREATE EXTENSION pg_xclaim;
 
 -- Pool of synthetic accounts. Used by impl C (FOR UPDATE) and as the
--- key universe for all three implementations.
+-- key universe for all six implementations.
 CREATE TABLE accounts_synth (
     account_id int4 PRIMARY KEY,
     payload    bigint NOT NULL DEFAULT 0
@@ -183,9 +188,10 @@ SELECT g FROM generate_series(1, $ACCOUNT_POOL) g;
 -- comparing E vs F answers "what does WAL add on top of sorting?".
 --
 -- UNIQUE on account_id is the enforcement mechanism for ON CONFLICT
--- DO NOTHING; rows are removed at end of xact (we ROLLBACK every
--- iteration via subtxn RAISE, so each table stays empty between
--- iterations and is never bloated on the hot path).
+-- DO NOTHING. Every iteration rolls back its subtransaction via RAISE,
+-- so no inserted row ever commits and the tables stay logically empty.
+-- The rolled-back inserts still leave dead heap tuples and index
+-- entries until pruning or vacuum removes them.
 --
 -- E/F use separate physical tables only to keep B/D/E/F independent
 -- under truncation between scenarios -- the SORT happens in the SQL
@@ -218,7 +224,7 @@ LANGUAGE sql VOLATILE PARALLEL RESTRICTED AS \$\$
 -- Each backend gets a unique slice of the keyspace via a worker_id
 -- offset, so two concurrent backends never request the same key. This
 -- isolates the raw cost of the implementations from the cost of
--- conflict-handling. Slice width = ACCOUNT_POOL / max_backends.
+-- conflict-handling. Slice width = ACCOUNT_POOL / n_workers.
 CREATE OR REPLACE FUNCTION rand_keys_disjoint(k int, worker_id int, n_workers int)
 RETURNS int4[]
 LANGUAGE sql VOLATILE PARALLEL RESTRICTED AS \$\$
@@ -233,17 +239,20 @@ LANGUAGE sql VOLATILE PARALLEL RESTRICTED AS \$\$
 SQL
 
 # ---------------------------------------------------------------------------
-# Worker driver. Runs ITERS transactions; each tx does:
-#   1. BEGIN;
-#   2. compute random K-element key array;
-#   3. invoke the implementation's acquire SQL;
-#   4. ROLLBACK;
-# Wall-clock sample per iteration goes to $1 (latency file).
-# Counts how many keys were actually claimed (some may collide on B/C).
+# Worker driver. Runs one DO block: a single transaction of ITERS
+# iterations. Each iteration does:
+#   1. compute random K-element key array
+#   2. enter a BEGIN/EXCEPTION subtransaction
+#   3. invoke the implementation's acquire SQL
+#   4. RAISE, which rolls the subtransaction back
+# Wall-clock sample per iteration goes to the latency file
+# $WORK_DIR/lat_<impl>_<wid>.txt.
+# The claim-table variants (B, D, E, F) count their inserted keys into _acq,
+# but nothing reports that count.
 #
 # Args:
 #   $1  worker id (used for output filename)
-#   $2  impl tag: A | B | C
+#   $2  impl tag: A | B | C | D | E | F
 #   $3  K (keys per tx)
 # ---------------------------------------------------------------------------
 worker() {
@@ -261,7 +270,7 @@ worker() {
         *) echo "unknown impl: $impl" >&2; return 1 ;;
     esac
 
-    # MODE switch: overlap -> rand_keys; disjoint -> rand_keys_disjoint(wid, n_workers).
+    # MODE switch: overlap -> rand_keys, disjoint -> rand_keys_disjoint(wid, n_workers).
     # Substitute K already at bash level so the Python f-string sees a
     # plain SQL expression (no nested {k} placeholder to confuse it).
     local key_call
@@ -280,24 +289,25 @@ k        = int(sys.argv[3])
 acquire  = sys.argv[4]
 key_call = sys.argv[5]
 
-# Iteration loop scripted in plpgsql. Each iteration runs the acquire
-# inside a BEGIN/EXCEPTION/END subtransaction and forces a RAISE to
-# roll back the subtxn between iterations -- otherwise state would
-# accumulate across iterations and exceed max_claims by orders of
-# magnitude (K=100k * ITERS=200 = 20M state entries).
+# Iteration loop scripted in plpgsql. The DO block is one transaction
+# per worker. Each iteration runs the acquire inside a
+# BEGIN/EXCEPTION/END subtransaction and forces a RAISE to roll it back,
+# so the claim-table rows (B, D, E, F) of an iteration turn into dead
+# tuples and its row locks (C) are released before the next iteration.
 #
-# Known methodology limitation: the subtxn rollback path is
-# implementation-dependent (xclaim's subxact_callback vs claim-table
-# heap+index UNDO vs row-lock release). This adds an
-# implementation-specific component to each iteration's measured
-# wall time -- the comparison numbers are NOT a pure measure of
-# acquire cost. The flamegraph contention scenario shows
-# MemoryContextReset (subtxn teardown) at ~21% of CPU; expect a
-# similar fraction here. Treat the absolute numbers as
-# order-of-magnitude; trust the *direction* of effects between
-# implementations more than the precise ratios. A pgbench-style
-# outer-rollback harness would isolate acquisition cost more cleanly,
-# at the cost of one psql roundtrip per iteration.
+# Known methodology limitation: pg_xclaim has no subtransaction
+# callback. Its claims survive the subtransaction rollback and stay
+# held until the worker's transaction ends, so implementation A
+# measures a different lifecycle: with every iteration a growing share
+# of its acquisitions re-enters keys the worker already holds or, in
+# MODE=overlap, conflicts with the claims other workers keep. The
+# rollback itself also costs each implementation something different,
+# so the comparison numbers are NOT a pure measure of acquire cost.
+# Treat the absolute numbers as order-of-magnitude and trust the
+# *direction* of effects between implementations more than the precise
+# ratios. A pgbench-style outer-rollback harness would isolate
+# acquisition cost more cleanly, at the cost of one psql roundtrip per
+# iteration.
 pl = f"""
 DO \$\$
 DECLARE
@@ -316,7 +326,7 @@ BEGIN
             RAISE EXCEPTION USING ERRCODE = 'XBENC';
         EXCEPTION
             WHEN sqlstate 'XBENC' THEN
-                -- expected: subtxn rolls back, releasing acquired state
+                -- expected: subtxn rolls back, releasing rows and row locks, not xclaim claims
                 NULL;
             WHEN lock_not_available THEN
                 -- impl C contention: subtxn already rolled back, latency still valid
@@ -358,7 +368,16 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Aggregator: read all lat_<impl>_*.txt for a scenario; emit summary line.
+# Aggregator: read all lat_<impl>_*.txt for a scenario and emit a summary line.
+#
+# Limitation: throughput is n * ITERS divided by the longest wall time among
+# the workers that finished, so it assumes that every worker completed all
+# its iterations. The plpgsql loop catches only XBENC and lock_not_available.
+# A deadlock or any other error aborts the worker's DO block, and the worker
+# exits without writing samples. `wait` in the main loop does not check
+# worker exit statuses. As long as one worker finishes, the scenario still
+# gets a row: the lost workers' iterations count as done, and p50/p95/p99
+# come from the survivors only.
 # ---------------------------------------------------------------------------
 aggregate() {
     local impl="$1" n="$2" k="$3" wal_bytes="$4" cap_used="$5" deadlocks="$6"
@@ -424,6 +443,8 @@ wal_diff_bytes() {
     "${PSQL_BASE[@]}" -c "SELECT pg_wal_lsn_diff('$lsn1','$lsn0')::int8;"
 }
 
+# Reads capacity_used at call time. The main loop calls it after `wait`, when
+# the workers' transactions have ended, so the value is post-run, not a peak.
 cap_peak() {
     "${PSQL_BASE[@]}" -c "SELECT capacity_used FROM xclaim.stats();"
 }
@@ -491,18 +512,18 @@ echo "================================================================"
 echo " CSV written: $CSV_OUT"
 echo "================================================================"
 echo "Reading the CSV:"
-echo "  - throughput_tx_per_sec is total across all backends; higher = better"
-echo "  - p95_ms is per-transaction tail latency; lower = better"
-echo "  - wal_bytes shows write amplification; lower = less vacuum/replication pressure"
+echo "  - throughput_tx_per_sec is total across all backends, higher = better"
+echo "  - p95_ms is per-iteration tail latency, lower = better"
+echo "  - wal_bytes shows write amplification, lower = less vacuum/replication pressure"
 echo "  - xclaim_capacity_observed is xclaim.stats().capacity_used after impl=A scenarios"
 echo
 echo "Two key-space modes are supported (MODE=overlap|disjoint):"
 echo
-echo "MODE=overlap  -- backends share a key pool; ~52% pairwise overlap"
+echo "MODE=overlap  -- backends share a key pool, ~52% pairwise overlap"
 echo "                at N=8 K=100k. Models real production scenarios"
 echo "                where operations naturally compete for the same"
 echo "                accounts."
-echo "MODE=disjoint -- worker-disjoint key slices; no two backends ever"
+echo "MODE=disjoint -- worker-disjoint key slices: no two backends ever"
 echo "                request the same key. Isolates raw implementation"
 echo "                cost from conflict-resolution cost."
 echo
@@ -510,16 +531,16 @@ echo "What the workload tends to show (verify in your own CSV):"
 echo "  - claim-table (B/D) hits deadlocks on the UNIQUE index under N=8"
 echo "    overlap -- p95 spikes, throughput collapses to ~10-30 tx/sec."
 echo "  - sorted INSERT (E) eliminates deadlocks but introduces wait-on-"
-echo "    lock serialization on overlap; deadlocks become serialization,"
-echo "    they do not disappear."
+echo "    lock serialization on overlap. Deadlocks become serialization"
+echo "    rather than disappear."
 echo "  - row locks (C) at high overlap can show inflated throughput"
 echo "    because FOR UPDATE NOWAIT bails out on the first conflict in"
 echo "    microseconds, acquiring 0 keys per tx -- a fail-fast artefact,"
 echo "    NOT a fair comparison. On disjoint, where NOWAIT cannot 'cheat',"
-echo "    C drops sharply (~4x slower vs overlap)."
+echo "    C drops sharply (~12x slower than overlap at N=8 K=100k)."
 echo "  - claim-table B/D even on disjoint suffer from PostgreSQL's"
-echo "    relation extension lock (~13-14 tx/sec at N=8 K=100k)."
-echo "  - pg_xclaim (A) keeps p95 stable and writes 0 WAL; on disjoint"
+echo "    relation extension lock (B ~14, D ~4 tx/sec at N=8 K=100k)."
+echo "  - pg_xclaim (A) keeps p95 stable and writes 0 WAL. On disjoint"
 echo "    it pulls clearly ahead at K>=10k+N>=8."
 echo
 echo "Decision rule: at low K + low concurrency, prefer B or C (no extension"

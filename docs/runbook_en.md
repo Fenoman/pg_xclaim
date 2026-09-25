@@ -6,7 +6,7 @@ Audience. DBAs and SREs operating PostgreSQL clusters (upstream PG or
 any ABI-compatible fork) where `pg_xclaim` is deployed.
 
 Use this runbook to deploy pg_xclaim, monitor it, respond to incidents,
-and roll back. It is built as a sequence of steps — every command can
+and roll back. It is built as a sequence of steps - every command can
 be copy-pasted into a script and run.
 
 Cross-references in this document:
@@ -46,8 +46,9 @@ table below has passed. This protects against partial rollout.
 > All shell snippets in this runbook assume `set -euo pipefail`. When you
 > copy-paste into a script, prepend that line.
 
-> Locale: every `initdb` invocation in this document uses
-> `--locale=ru_RU.UTF-8` -- consistent with the cluster locale.
+> Locale: the scripts of gates 1-4 create temporary clusters with the
+> `ru_RU.UTF-8` locale, so that locale must be installed on the host
+> that runs them.
 
 ---
 
@@ -58,14 +59,14 @@ the planned maintenance window.
 
 | Stage | Action | Owner | Gate to next stage                                                                                                                                                                                                                         |
 |-------|--------|-------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 0 | Build `pg_xclaim.so` against the target PG major (16/17/18) on the build host: `make PG_CONFIG=... && sudo make PG_CONFIG=... install`. | Build | `smoke_gate.sh` exit 0 in CI (`.github/workflows/ci-pg-matrix.yml`); the `pg_xclaim.so`, `pg_xclaim.control` and `pg_xclaim--<version>.sql` files are installed under `$(pg_config --pkglibdir)` and `$(pg_config --sharedir)/extension/`. |
-| 1 | Add `pg_xclaim` as the **last** entry in `shared_preload_libraries` (PostgreSQL invokes xact callbacks in LIFO order — the last one registered runs first) and the `pg_xclaim.*` GUCs in `postgresql.conf`. Restart the cluster. | DBA | server starts; log line `pg_xclaim: shared memory initialized (...)` is present; no `FATAL` during `_PG_init`.                                                                                                                             |
-| 2 | Run `CREATE EXTENSION pg_xclaim;` in every database that needs the new SQL surface. | DBA | `SELECT * FROM xclaim.stats();` returns a valid row in each database; `\dx pg_xclaim` shows the installed version.                                                                                                                         |
+| 0 | Build `pg_xclaim.so` against the target PG major (16/17/18) on the build host: `make PG_CONFIG=... && sudo make PG_CONFIG=... install`. | Build | `smoke_gate.sh` exit 0 in CI (`.github/workflows/ci-pg-matrix.yml`). The `pg_xclaim.so`, `pg_xclaim.control`, `pg_xclaim--1.0.0-rc1.sql` and `pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql` files are installed under `$(pg_config --pkglibdir)` and `$(pg_config --sharedir)/extension/`. |
+| 1 | Add `pg_xclaim` as the **last** entry in `shared_preload_libraries` (PostgreSQL invokes xact callbacks in LIFO order - the last one registered runs first) and the `pg_xclaim.*` GUCs in `postgresql.conf`. Restart the cluster. | DBA | server starts, log line `pg_xclaim: shared memory initialized (...)` is present, no `FATAL` during `_PG_init`.                                                                                                                             |
+| 2 | Run `CREATE EXTENSION pg_xclaim;` in every database that needs the new SQL surface. | DBA | `SELECT * FROM xclaim.stats();` returns a valid row in each database, `\dx pg_xclaim` shows the installed version.                                                                                                                         |
 | 3 | On the **dev cluster**: apply the per-site rewrite DDL (replace `pg_try_advisory_xact_lock(...)` with `xclaim.try(...)` in target functions). | DBA | The post-check finds zero remaining `pg_try_advisory_xact_lock` references on migrated paths, functional smoke tests pass.                                                                                                                 |
-| 4 | Soak on dev: leave the extension running on the dev cluster for 1–3 days under normal load (developer testing, integration tests) so slow-burning issues show up — memory leaks, accumulating stale entries, performance drift. | Dev | no regressions reported.                                                                                                                                                                                                                   |
-| 5 | Repeat stages 0-2 on the **prod cluster** during the planned maintenance window: install the binaries, edit `postgresql.conf`, restart, run `CREATE EXTENSION pg_xclaim;`. | DBA | server starts; `xclaim.stats()` clean in every database.                                                                                                                                                                                   |
-| 6 | Apply per-site rewrite DDL to prod cluster. | DBA | `_failed=0` and post-check clean; `xclaim.stats()` clean.                                                                                                                                                                                  |
-| 7 | Monitor prod 24-48h. | Oncall | no incidents; `capacity_errors=0`, `cleanup_misses=0`.                                                                                                                                                                                     |
+| 4 | Soak on dev: leave the extension running on the dev cluster for 1-3 days under normal load (developer testing, integration tests) so slow-burning issues show up - memory leaks, accumulating stale entries, performance drift. | Dev | no regressions reported.                                                                                                                                                                                                                   |
+| 5 | Repeat stages 0-2 on the **prod cluster** during the planned maintenance window: install the binaries, edit `postgresql.conf`, restart, run `CREATE EXTENSION pg_xclaim;`. | DBA | server starts, `xclaim.stats()` clean in every database.                                                                                                                                                                                   |
+| 6 | Apply per-site rewrite DDL to prod cluster. | DBA | post-check clean, `xclaim.stats()` shows `capacity_errors = 0` and `cleanup_misses = 0`.                                                                                                                                                   |
+| 7 | Monitor prod 24-48h. | Oncall | no incidents, `capacity_errors=0`, `cleanup_misses=0`.                                                                                                                                                                                     |
 
 > **Why last specifically?** PostgreSQL stores registered xact
 > callbacks in a stack: each new one is inserted at the head of the
@@ -77,12 +78,22 @@ the planned maintenance window.
 > order in which `_PG_init` fires matches the order in
 > `shared_preload_libraries` (`process_shared_preload_libraries()` ->
 > `load_libraries()` in `miscinit.c` iterates the library list in GUC
-> order). Putting pg_xclaim last means its
-> cleanup runs first at commit — before any
-> third-party callback has a chance to raise ERROR. That reduces the
-> risk of `cleanup_misses` climbing because of an interrupted
-> callback chain. See `docs/incident-decision-tree_en.md`, section
-> P2 for more detail.
+> order). Putting pg_xclaim last means its callback releases the
+> claims first, before the callbacks of other extensions.
+>
+> In a running backend the order changes nothing. When another
+> extension's callback raises ERROR at commit or rollback, PostgreSQL
+> runs the transaction abort again and calls every callback with the
+> ABORT event, pg_xclaim's included (`REL_18_STABLE:xact.c:2876,2965`).
+> When the transaction already has an xid, the same error at commit
+> ends in PANIC and a server restart (`REL_18_STABLE:xact.c:1793`).
+>
+> The order matters only when a backend exits with an open
+> transaction. `ShutdownPostgres` aborts it, and an ERROR in another
+> extension's callback at that point becomes FATAL
+> (`REL_18_STABLE:elog.c:379`) and ends the chain. With pg_xclaim
+> last, its callback has already run by then. Otherwise the pg_xclaim
+> backend-exit callback releases the claims.
 
 ### 2.0 Build & install the extension files
 
@@ -97,10 +108,17 @@ sudo make PG_CONFIG="$PG_CONFIG" install
 test -f "$($PG_CONFIG --pkglibdir)/pg_xclaim.so"
 test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim.control"
 test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc1.sql"
+test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql"
 ```
 
 For a multi-major matrix (16/17/18), repeat the `make` + `make install`
 sequence with each target's `pg_config` path.
+
+To update an installed extension: install the new build with the same
+`make install`, restart the server (the library is loaded through
+`shared_preload_libraries`), and run `ALTER EXTENSION pg_xclaim UPDATE;`
+in every database that has the extension. Per-version changes are listed
+in `CHANGELOG.md`.
 
 ### 2.1 Apply per-site rewrite DDL
 
@@ -126,16 +144,16 @@ should follow:
 > passed" -- a partially migrated keyspace is worse than an
 > unmigrated one.
 
-- **One `CREATE OR REPLACE FUNCTION` per call site** — do not bundle
+- **One `CREATE OR REPLACE FUNCTION` per call site** - do not bundle
   multiple function rewrites in a single transaction, an error in
   one would roll back the rest.
-- **Each block wrapped in `BEGIN ... EXCEPTION WHEN OTHERS ... END`**
-  — log the failure and continue; do not let one bad identifier kill
+- **Each block wrapped in `BEGIN ... EXCEPTION WHEN OTHERS ... END`** -
+  log the failure and continue, so one bad identifier does not kill
   the whole migration.
 - **Post-check**: after the run, scan `pg_proc.prosrc` for any
   remaining `pg_try_advisory_xact_lock\s*\(` on paths that should
   already be migrated.
-- **Logs to file** + `set -e` in bash — so you can quickly show the
+- **Logs to file** + `set -e` in bash - so you can quickly show the
   DBA "these 3 functions failed, the rest are OK".
 
 Run it across every database in the cluster that uses the extension
@@ -151,14 +169,14 @@ Recommended scrape interval: **15s** for Prometheus / Zabbix / pgwatch.
 
 | Metric | Type | Warn | Page | Action |
 |--------|------|------|------|--------|
-| `capacity_pct` | gauge | 80% | 90% | Raise `pg_xclaim.max_claims`; restart required. |
-| `capacity_errors` rate | counter | -- | any non-zero/min | P1: capacity exhaustion in error mode -- size up or switch to `enabled=off`. |
+| `capacity_pct` | gauge | 80% | 90% | Raise `pg_xclaim.max_claims`. Restart required. |
+| `capacity_errors` rate | counter | -- | any non-zero/min | P1: capacity exhaustion in error mode -- switch to `warn` mode, then size up (§10.1). |
 | `capacity_warnings` rate | counter | any | -- | Capacity exhaustion in warn mode -- callers seeing spurious `false` returns. |
-| `cleanup_misses` rate | counter | any | -- | P2: xact callback skip; investigate. |
-| `reaped_stale` rate | counter | -- | > 1/min | P3: many stale-owner reaps; check `session_reset`, `cleanup_misses`, backend churn. |
-| `conflicts` rate | counter | -- | -- | Informational; workload-dependent. |
+| `cleanup_misses` rate | counter | any | -- | P2: cleanup found its entry gone. Investigate. |
+| `reaped_stale` rate | counter | -- | > 1/min | P3: entries outlived their owner. Check the log for errors at transaction end and backend exit, and `cleanup_misses`. |
+| `conflicts` rate | counter | -- | -- | Informational, workload-dependent. |
 | `disabled_calls` rate | counter | -- | -- | Should be 0 in steady state. Non-zero only when `enabled=off`. |
-| `total_acquires` rate | counter | -- | -- | Throughput; baseline + alert on 50% drop. |
+| `total_acquires` rate | counter | -- | -- | Throughput: baseline + alert on 50% drop. |
 
 Beyond `xclaim.stats()` there is also a server-log signal. The
 extension emits a single `LOG` line per session when a backend's
@@ -199,7 +217,7 @@ ORDER BY 2 DESC;
 ```
 
 After migration, `LWLock: xclaim_partition` will show up in wait
-events but stay short — this is normal. Once the main hot-path call
+events but stay short - this is normal. Once the main hot-path call
 sites are migrated, `LWLock: LockManager` p99 should drop by at
 least 50%.
 
@@ -207,9 +225,9 @@ least 50%.
 
 The extension emits a message when `capacity_pct` first crosses one of
 three bands: 80%, 90%, 95% (the lowest band is controlled by the
-`pg_xclaim.capacity_warn_pct` GUC; default 80; further warnings
-suppressed for 60s). The 80% and 90% bands are logged at `LOG` level;
-the 95% band escalates to `WARNING`.
+`pg_xclaim.capacity_warn_pct` GUC, default 80). Further warnings are
+suppressed for 60s. The 80% and 90% bands are logged at `LOG` level,
+and the 95% band escalates to `WARNING`.
 
 Hardcoded bands below the configured `capacity_warn_pct` are skipped:
 the ladder respects `capacity_warn_pct`, and bands strictly below the
@@ -238,11 +256,12 @@ SELECT pg_reload_conf();
 
 Effects:
 
-- New `xclaim.try` calls always return `true` — no acquisition
+- New `xclaim.try` calls always return `true` - no acquisition
   happens.
 - Existing held entries continue to release through the xact callback
-  and `before_shmem_exit` as transactions end.
-- `xclaim.stats().disabled_calls` increments per call — monitoring
+  as transactions end and through the backend-exit callback
+  (`on_shmem_exit`).
+- `xclaim.stats().disabled_calls` increments per call - monitoring
   will show the kill switch is engaged.
 
 > **CRITICAL.** While disabled, **locks do not work**: 
@@ -274,8 +293,11 @@ SELECT pg_reload_conf();
 ### 5.1 Level 1 -- Soft rollback (no restart, immediate)
 
 This is the kill-switch `pg_xclaim.enabled = off` from §4. The
-extension becomes a no-op for new acquisitions; held claims keep
-releasing as their transactions finish. Reversible at any time.
+extension becomes a no-op for new acquisitions, and held claims keep
+releasing as their transactions finish. Reversible at any time. The
+kill switch removes mutual exclusion for every key, so use it only in
+the cases §4 lists: user traffic stopped, or emergency diagnosis where
+correctness is not the priority.
 
 ### 5.2 Level 2 -- Code rollback (no restart)
 
@@ -285,7 +307,9 @@ PGHOST=...; PGPORT=...; PGUSER=postgres
 DBS=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -At -c \
     "SELECT datname FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres');")
 
-# Step 1: engage soft rollback first
+# Step 1: stop user traffic (in the application or the pooler), and
+# only then engage soft rollback: with live traffic the kill switch
+# removes mutual exclusion for every key (§4)
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
      -c "ALTER SYSTEM SET pg_xclaim.enabled = off; SELECT pg_reload_conf();"
 
@@ -299,8 +323,10 @@ for db in $DBS; do
 done
 ```
 
-After completion: callers use advisory locks again. `pg_xclaim.enabled=off`
-ensures no parallel claim acquisition until the next deploy.
+After completion: callers use advisory locks again. Resume user traffic
+once the script has finished without errors: the rollback DDL has gone
+through in every database. `pg_xclaim.enabled=off` ensures no parallel
+claim acquisition until the next deploy.
 
 ### 5.3 Level 3 -- Full rollback (restart required)
 
@@ -348,45 +374,83 @@ not a routine hook for returning connections to the pool. Adding it to
 
 1. **Unnecessary network queries on every handoff**. On a busy cluster, 
    this generates thousands of wasted queries per second.
-2. **Constant owner token rotation**. `session_reset()` clears the 
-   current token. Because of this, the garbage collector will treat any 
-   remaining locks as "orphaned". Forcing a reset on every handoff 
-   creates a constant stream of garbage entries, which puts pressure on 
-   `max_claims` and slows down the database.
+2. **No added protection**. Claims are released at every transaction
+   end and at backend exit. By the time `server_reset_query` runs, the
+   transaction has ended, so `session_reset()` has nothing to release
+   and only resets the backend's owner_token (the next claim gets a new
+   one).
 3. **Polluted `session_resets` metric**. The counter in `xclaim.stats()` 
    will become useless, since it is meant to track rare failures, not 
    routine pool events.
 
-Use `session_reset()` only when a session is stuck in a bad state and 
-needs to be rescued or restarted. It is not needed during normal 
-operation.
+`session_reset()` is only for a session that holds claims outside a
+transaction (see below). Normal operation never produces that state.
 
-### When `session_reset()` is useful
+### Claims held outside a transaction and `session_reset()`
 
-Only when `xclaim.stats().cleanup_misses > 0` is observed in
-production. That signals the xact callback was somehow bypassed and
-local/shared state may be inconsistent. In that scenario:
+Claims live until the end of the transaction that took them. The xact
+callback releases them at commit or rollback, and the backend-exit
+callback when the backend exits. A backend that holds claims outside a
+transaction means this did not work. Normal operation never produces
+that state, and other extensions' callbacks do not lead to it either:
+when another extension's callback raises ERROR, PostgreSQL still calls
+the pg_xclaim callback (see section 2). `cleanup_misses` does not count
+such claims, so you have to look for the claims themselves.
 
-1. Engage the kill-switch: `ALTER SYSTEM SET pg_xclaim.enabled = off; SELECT pg_reload_conf();`
-2. Investigate the server log for the time window of the increment.
-3. Force-clear state in suspect backends. The `xclaim.session_reset()`
-   SQL call only affects the session **it is called from** — you
-   cannot make it run inside someone else's backend. The real options:
-   - **`SELECT pg_terminate_backend(pid)`** for a specific pid from
-     `pg_stat_activity` — the backend dies, `before_shmem_exit`
-     runs cleanup, and the local state goes with the process.
-   - **Pool rotation** (`pgbouncer -R`, `pg_doorman` reload, `odyssey`
-     SIGHUP) — all physical backends are recycled, clearing state
-     globally when you don't know which pid is at fault.
-   - `xclaim.session_reset()` in your own admin session — clears
-     only that session's state. Useful when an admin session itself
-     accumulated state; not a way to reach foreign backends.
-4. File an incident; this is not normal.
+Find backends that hold claims outside a transaction, and claims of
+backends that have exited (needs the `pg_monitor` role):
+
+```sql
+SELECT d.owner_pid, d.owner_lxid, coalesce(a.state, '(gone)') AS state,
+       count(*) AS claims
+FROM xclaim.debug_snapshot() d
+LEFT JOIN pg_stat_activity a ON a.pid = d.owner_pid
+WHERE a.pid IS NULL OR a.state = 'idle'
+GROUP BY 1, 2, 3 ORDER BY claims DESC;
+```
+
+- Run the query in autocommit (the psql default), not inside `BEGIN`:
+  `pg_stat_activity` is read once per transaction, so inside an open
+  transaction a repeat shows the backend's earlier state.
+- Run the query twice, a few seconds apart. The claim snapshot and
+  `pg_stat_activity` are not read at the same instant, so a backend
+  that has just ended its transaction can show up once. Rows that
+  repeat with the same `owner_pid` and `owner_lxid` are the signal.
+- `debug_snapshot()` holds shared locks on all partitions for the scan
+  and refuses to run when `pg_xclaim.num_partitions > 192`. Do not put
+  this query into routine monitoring, `xclaim.stats()` is for that.
+- The query does not show backends inside a transaction (`active`,
+  `idle in transaction`): their claims are legitimate, and the end of
+  that transaction releases any extra ones.
+
+What to do with the result:
+
+1. An `idle` backend: terminate it with the state checked again in the
+   same statement:
+   `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid = <owner_pid> AND state = 'idle';`.
+   The backend-exit callback releases its claims. The check and the
+   signal are not atomic: a transaction the client starts at that very
+   moment ends with the session. If that is not acceptable, first stop
+   giving that session work (in the application or the pooler). Left
+   alone, the end of the backend's next transaction releases the claims.
+2. `(gone)`: the owner has exited and its claims stayed. The
+   backend-exit callback releases claims at exit, so such rows mean the
+   cleanup at exit did not finish (step 4). No action is needed: the
+   stale-owner reaper takes such an entry over on the first conflicting
+   claim of the key (`reaped_stale` grows). On PG 16, when the exit
+   callback did not get to publish owner_token 0, that happens only
+   after the backend's PGPROC slot is reused.
+3. `xclaim.session_reset()` only acts in the session that calls it and
+   cannot clear another backend. In your own session, the end of any
+   transaction does the same.
+4. Save the query output, `xclaim.stats()` and the server log for that
+   time, and file an issue: this is a pg_xclaim defect, like
+   `cleanup_misses` (section 10.5).
 
 ### Required pooler configuration
 
 None. Just confirm the pooler issues `ROLLBACK` (not raw RESET) when
-returning a backend to the pool after an unhealthy disconnect — this
+returning a backend to the pool after an unhealthy disconnect - this
 is the default in `pg_doorman`, `odyssey`, and `PgBouncer`.
 
 ---
@@ -395,12 +459,12 @@ is the default in `pg_doorman`, `odyssey`, and `PgBouncer`.
 
 | GUC | Default | Where to set | When to change |
 |-----|---------|--------------|----------------|
-| `shared_preload_libraries` | -- | `postgresql.conf` (postmaster) | `pg_xclaim` must be last in the list; restart required. |
-| `pg_xclaim.max_claims` | 4194304 (4M) | `postgresql.conf` (postmaster) | Bump if `capacity_pct > 80%` observed under load. Each doubling adds ~360MB shmem (see Capacity planning). Restart required. |
+| `shared_preload_libraries` | -- | `postgresql.conf` (postmaster) | `pg_xclaim` must be last in the list. Restart required. |
+| `pg_xclaim.max_claims` | 4194304 (4M) | `postgresql.conf` (postmaster) | Bump if `capacity_pct > 80%` observed under load. Doubling `max_claims` roughly doubles pg_xclaim's shmem (4M ~360 MB, 24M ~2.2 GB, 32M ~2.8 GB, see Capacity planning). Restart required. |
 | `pg_xclaim.num_partitions` | 128 | `postgresql.conf` (postmaster) | Rarely changed. Increase only if `LWLock: xclaim_partition` p99 dominates wait events. Restart required. |
-| `pg_xclaim.expected_claims_per_backend` | 16384 | `postgresql.conf` (postmaster) | Pre-grows the per-backend local `simplehash` to this size so the 750k single-backend burst does not rehash on the hot path. The extension emits a server log line `crossed 75% of pg_xclaim.expected_claims_per_backend` the first time a backend's live-claim count crosses 75% of the GUC — that's the signal to raise the GUC to your observed peak. **Must be ≤ `pg_xclaim.max_claims`**, otherwise the cluster fails to start (see §10.6). Restart required. |
+| `pg_xclaim.expected_claims_per_backend` | 16384 | `postgresql.conf` (postmaster) | Pre-grows the per-backend local `simplehash` to this size so the 750k single-backend burst does not rehash on the hot path. The extension emits a server log line `crossed 75% of pg_xclaim.expected_claims_per_backend` the first time a backend's live-claim count crosses 75% of the GUC - that's the signal to raise the GUC to your observed peak. **Must be <= `pg_xclaim.max_claims`**, otherwise the cluster fails to start (see §10.6). Restart required. |
 | `pg_xclaim.enabled` | on | `ALTER SYSTEM` (PGC_SUSET) | Set `off` to disable acquisition without restart -- the kill switch. |
-| `pg_xclaim.capacity_warn_pct` | 80 | `ALTER SYSTEM` | Lower to receive earlier warning logs; raise to silence noise. |
+| `pg_xclaim.capacity_warn_pct` | 80 | `ALTER SYSTEM` | Lower to receive earlier warning logs, or raise to silence noise. |
 | `pg_xclaim.on_capacity_exhaustion` | error | `ALTER SYSTEM` (PGC_SUSET) | Switch to `warn` to treat exhaustion as logical conflict (callers' retry path triggers). `error` is otherwise correct -- forces sizing discipline. |
 
 ### 7.1 `on_capacity_exhaustion` mode selection
@@ -410,15 +474,16 @@ is the default in `pg_doorman`, `odyssey`, and `PgBouncer`.
 | Normal operation | `error` (default) -- forces sizing discipline. |
 | Spike behavior unknown, retries cheap | `warn` -- callers see `false`, retry path trips. |
 
-WARN mode + bulk API (`xclaim.try_many`) emits **exactly one detail
-WARNING for the first failed slot and one tail summary WARNING** at
-the end of the call (`N additional slot(s) hit max_claims ... per-slot
-WARNINGs suppressed`). A 1000-key bulk past capacity produces 2 log
-lines, not 1000. The `xclaim.stats().capacity_warnings` counter
-remains **exact** -- it ticks once per failed slot regardless of the
-ereport-level suppression: read it (not WARNING line counts) for
-sizing observation. Single-call `xclaim.try` is unaffected -- each
-call is its own statement and emits its own WARNING.
+WARN mode + bulk API (`xclaim.try_many`) emits **one detail WARNING
+for the first refused slot and, when more than one slot of the call is
+refused, one tail summary WARNING** at the end of the call:
+`N additional slot(s) hit max_claims ... per-slot WARNINGs suppressed`.
+A 1000-key bulk past capacity produces 2 log lines, not 1000. The
+`xclaim.stats().capacity_warnings` counter remains **exact** -- it
+ticks once per refused slot regardless of the ereport-level
+suppression: read it (not WARNING line counts) for sizing observation.
+Scalar `xclaim.try` writes one WARNING line per refused call, even when
+one statement makes many calls.
 
 There is no fallback-to-advisory mode. Delegating to
 `LockAcquire(LOCKTAG_ADVISORY)` on capacity exhaustion is unsafe:
@@ -427,14 +492,19 @@ subsequently re-acquired through xclaim shmem and breaking mutual
 exclusion (a split-brain namespace between xclaim shmem and the PG
 LockManager).
 
-If you anticipate a spike, the kill-switch chain is the safe path:
+If you anticipate a spike, the kill-switch chain is the safe path, run
+with user traffic stopped. The kill switch removes mutual exclusion for
+every key, and with live traffic the application starts processing
+duplicates (section 4).
 
-1. `ALTER SYSTEM SET pg_xclaim.enabled = off; SELECT pg_reload_conf();`
-   -- callers see `true` unconditionally; no acquisition runs.
+1. Stop user traffic, then run
+   `ALTER SYSTEM SET pg_xclaim.enabled = off; SELECT pg_reload_conf();`
+   -- callers see `true` unconditionally, no acquisition runs.
 2. Apply the per-site rollback DDL (re-introduces
-   `pg_try_advisory_xact_lock` at known-safe call sites; this is the
+   `pg_try_advisory_xact_lock` at known-safe call sites). This is the
    pre-pg_xclaim code path that you migrated FROM, so it is by
-   definition something the cluster handled before).
+   definition something the cluster handled before. Resume traffic
+   once the rollback has gone through at every call site.
 3. Bump `max_claims` in the next maintenance window.
 
 ---
@@ -445,7 +515,7 @@ After the per-site rewrite forward script has been applied (stage 3
 in §2), run the validation bundle on each cluster:
 
 ```sql
--- Pre-migration baseline (run BEFORE the migration; archive the result):
+-- Pre-migration baseline (run BEFORE the migration and archive the result):
 SELECT locktype, mode, granted, count(*), count(DISTINCT pid)
 FROM pg_locks
 GROUP BY 1, 2, 3
@@ -507,45 +577,45 @@ The pre-migration baseline reference lives in
 
 ## 9. Capacity planning
 
-The shared-memory footprint of `pg_xclaim` scales linearly with
-`max_claims`.
+The shared-memory footprint of `pg_xclaim` scales almost linearly with
+`max_claims`: the dynahash bucket array is rounded up to a power of
+two, so 24M takes 2241 MB against 2160 MB for strictly linear growth.
 
 | `max_claims` | Approx shmem |
 |--------------|--------------|
 | 1M           | ~90 MB       |
 | 4M (default) | ~360 MB      |
 | 8M           | ~720 MB      |
-| 16M          | ~1.5 GB      |
+| 16M          | ~1.4 GB      |
+| 24M          | ~2.2 GB      |
+| 32M          | ~2.8 GB      |
 
-Plus per-partition LWLock overhead (`num_partitions=128` default; ~few KB).
+Plus per-partition LWLock overhead (`num_partitions=128` default, ~few KB).
 
 The default 4M comfortably covers a 750k single-backend hot-path workload
-with 5.3x headroom plus 10-20 concurrent backends, each holding up to 100k
+with 5.6x headroom plus 10-20 concurrent backends, each holding up to 100k
 claims. Bump to 8M-16M only if `capacity_errors > 0` or
 `capacity_pct > 80` is observed in production.
 
-> **Add a safety margin for uneven hash distribution.** 
-> The total memory (`max_claims`) is divided equally among all partitions. 
-> Because keys are routed to partitions based on their hash, an uneven 
-> workload can completely fill one partition even if the total used 
-> memory (`capacity_used`) is far from 100%. 
-> Symptom: `capacity_errors > 0` (SQLSTATE 53400) occurs while 
-> `capacity_pct` shows low overall usage.
+> **Add a safety margin for workload peaks.** The shared table is one
+> dynahash of `max_claims` entries, and a claim hits the capacity limit
+> only when all `max_claims` entries are in use: when the free list the
+> key maps to is empty, dynahash takes an entry from another free list.
 >
-> Sizing recommendation: **set `max_claims` to at least 20% more than 
-> your expected peak (1.2x)**. This margin absorbs the natural variance 
-> in hash distribution during normal workloads. If you have severe 
-> hotspots (for example, a single large tenant generating 80% of all 
-> locks), you should increase this margin to 1.5x or 2x.
+> Sizing recommendation: **set `max_claims` so that the expected peak
+> stays below `pg_xclaim.capacity_warn_pct` (80% by default), that is
+> at least 1.25x the peak**. The margin absorbs peaks above the expected
+> ones, and the watermark log line (section 3.1) appears before
+> capacity runs out.
 
 Local backend memory. Held claims live in a backend-local
 `simplehash` (memory context `xclaim local set`, child of
-TopMemoryContext). Empirically measured on PG 16 and PG 18 (identical
-— it's backend-local code):
+TopMemoryContext). Empirically measured on PG 16 and PG 18 (identical -
+it's backend-local code):
 
 | Claims held in one tx | `xclaim local set` |
 |-----------------------|--------------------|
-| 0–10 000 | ~1.58 MB (pre-grown floor under default `expected_claims_per_backend=16384`) |
+| 0-10 000 | ~1.58 MB (pre-grown floor under default `expected_claims_per_backend=16384`) |
 | 100 000 | **~6.3 MB** |
 | 750 000 | **~50.3 MB** |
 
@@ -554,34 +624,71 @@ overhead at ~75% load factor). The local-set entry
 (`XClaimLocalEntry`) is 48 bytes after alignment (see
 `src/pg_xclaim_local.h`).
 
+Per-backend limit: at most 134217727 held claims (2^27 - 1). The
+cleanup at transaction end collects pointers to all of the backend's
+claims in one array, 8 bytes per claim, and PostgreSQL refuses single
+allocations above 1 GB (`MaxAllocSize`). At 134217728 claims and more
+the cleanup fails with ERROR: at transaction end that is a PANIC and a
+cluster restart, at backend exit the backend's keys stay taken (on
+PG 16 until its PGPROC slot is reused). Getting there needs
+`max_claims >= 134217728` (about 12 GB of shared memory) and about
+13 GB of local memory in one backend. With the default 4M the limit
+cannot be reached.
+
 ### 9.1 Comparison vs pre-migration (high-cardinality use case)
 
 Realistic scenario: **100k claims in one transaction, 200 concurrent
-backends** — the workload pg_xclaim was built for.
+backends** - the workload pg_xclaim was built for. Together that is 20M
+keys held at once.
 
-PG 16 production scenario (advisory locks with `max_locks_per_transaction`
-bumped to 4096 to survive):
+Shared memory is measured on PG 16 with `postgres -C shared_memory_size`
+at `max_connections = 200` (MaxBackends = 222). A server without
+pg_xclaim and with `max_locks_per_transaction = 64` needs 148 MB, and
+the shared-memory rows in the table below are the increase over that
+base.
 
-| Component | Before (advisory, `max_locks=4096`) | After (pg_xclaim, `max_locks=64` default, `max_claims=4M`) | Δ |
-|-----------|-------------------------------------|------------------------------------------------------------|---|
-| Shared LockManager | ~100 KB | ~16 KB | −84 KB |
-| Shared `pg_xclaim` dynahash | 0 | ~360 MB | +360 MB |
-| Local LockManager × 200 backends (LOCALLOCK hash holding 100k locks) | 16.8 MB × 200 = **3.36 GB** | minimal (`max_locks=64` cap) | **−3.35 GB** |
-| Local `pg_xclaim` × 200 backends | 0 | 6.3 MB × 200 = **1.26 GB** | +1.26 GB |
-| **Total** | **~3.36 GB** | **~1.62 GB** | **−1.74 GB** |
+The PostgreSQL lock tables hold `max_locks_per_transaction` x
+(MaxBackends + `max_prepared_transactions`) locks for the whole server.
+With `max_locks_per_transaction = 4096` the server needs 482 MB: the
+lock tables add ~334 MB and hold 4096 x 222 = ~909k locks, not 20M.
+20M advisory locks need `max_locks_per_transaction` of about 91000,
+7942 MB in total. pg_xclaim needs `max_claims` of at least 20M for 20M
+claims, for example 24M, 2389 MB in total.
 
-On PG 18 the overall picture is the same, but "before" Shared
-LockManager would be ~5 MB (not 100 KB) because of Fast-Path Array.
+| Component | Before (advisory, `max_locks_per_transaction` ~91000) | After (pg_xclaim, `max_locks_per_transaction = 64`, `max_claims` = 24M) | Δ |
+|-----------|-------------------------------------------------------|---------------------------------------------------------------------------|---|
+| Shared LockManager (lock tables) | ~7.6 GB | 0 (part of the base) | -7.6 GB |
+| Shared `pg_xclaim` dynahash | 0 | ~2.2 GB | +2.2 GB |
+| Local LockManager x 200 backends (holding 100k locks: LOCALLOCK hash 16.8 MB + `lockOwners` arrays in TopMemoryContext 16.8 MB) | 33.6 MB x 200 = **6.72 GB** | minimal (no advisory locks taken) | **-6.71 GB** |
+| Local `pg_xclaim` x 200 backends | 0 | 6.3 MB x 200 = **1.26 GB** | +1.26 GB |
+| **Total** | **~14.3 GB** | **~3.5 GB** | **~-10.8 GB** |
+
+Local memory is measured with `pg_backend_memory_contexts` in one
+backend, with the same numbers on PG 16, 17 and 18: 100k
+`pg_try_advisory_xact_lock` calls in one transaction add 16.8 MB to the
+`LOCALLOCK hash` context and 16.8 MB to TopMemoryContext (the
+`lockOwners` arrays), while 100k pg_xclaim claims take 6.3 MB in
+`xclaim local set`. Shared-memory rows are in PostgreSQL units as
+`shared_memory_size` prints them (1 MB = 2^20 bytes), local-memory rows
+are decimal (1 MB = 10^6 bytes). The totals add the table's numbers as
+shown and are accurate to within ~5%.
+
+PG 17 and PG 18 size the lock tables with the same formula: on PG 17
+the same measurement with `max_locks_per_transaction = 4096` gives
+484 MB. PG 18 also allocates a fast-path array that grows with
+`max_locks_per_transaction`, but to no more than 72 KB per process.
 The effect on the total is small.
 
-**Bottom line.** The economy does not come from shared memory —
-pg_xclaim **adds** ~360 MB shmem — it comes from **per-backend
-LOCALLOCK hash**, which under high-cardinality advisory workload grows
-to ~17 MB/backend and eats several GB cluster-wide. pg_xclaim moves
-that state into its own compact simplehash (~6 MB at 100k claims).
+**Bottom line.** The saving comes from both shared memory and
+backend-local memory. The lock tables for 20M advisory locks take
+~7.6 GB, while the pg_xclaim dynahash for 24M claims takes ~2.2 GB.
+The backend's local lock state (**LOCALLOCK hash** and `lockOwners`
+arrays) grows to ~34 MB/backend under a high-cardinality advisory
+workload and eats several GB cluster-wide, while pg_xclaim moves that
+state into its own compact simplehash (~6 MB at 100k claims).
 
-Under a light workload (10–100 locks per transaction), switching to
-pg_xclaim **only adds** ~360 MB of shmem with no visible saving — that
+Under a light workload (10-100 locks per transaction), switching to
+pg_xclaim **only adds** ~360 MB of shmem with no visible saving - that
 kind of workload does not need pg_xclaim in the first place.
 
 ---
@@ -601,14 +708,19 @@ Cause: `on_capacity_exhaustion=error` (default) and shared dynahash hit
 `max_claims`. Caller transaction aborts.
 
 Remediation, in priority order:
-1. Immediate: `ALTER SYSTEM SET pg_xclaim.enabled = off; SELECT pg_reload_conf();`
-   (kill-switch, see section 4 above) -- callers get `true` unconditionally,
-   acquisition skipped.
-2. OR switch to emergency `warn` mode:
+1. Immediate: switch to emergency `warn` mode:
    `ALTER SYSTEM SET pg_xclaim.on_capacity_exhaustion = warn; SELECT pg_reload_conf();`
-   (returns false on exhaustion, caller's retry path triggers; one
-   WARNING line per event).
-3. Schedule maintenance window to bump `max_claims` (requires restart).
+   A refused claim returns false, the caller's retry path triggers, and
+   mutual exclusion holds. Scalar `xclaim.try` writes one WARNING line
+   per refused call. `xclaim.try_many` writes a WARNING for the first
+   refused slot and, when more than one slot of the call is refused,
+   one summary WARNING per call (see 7.1):
+   `N additional slot(s) hit max_claims ... per-slot WARNINGs suppressed`.
+2. Schedule maintenance window to bump `max_claims` (requires restart).
+3. Use the kill switch `pg_xclaim.enabled = off` (section 4) only when
+   user traffic is completely stopped, or during emergency diagnosis
+   where application correctness is not the priority: callers get
+   `true` unconditionally, and mutual exclusion is gone for every key.
 
 See `docs/incident-decision-tree_en.md` (P1).
 
@@ -622,7 +734,7 @@ SQLSTATE: 55000
 Cause: `shared_preload_libraries` does not include `pg_xclaim`, but
 the application called `xclaim.try` / another extension function.
 `CREATE EXTENSION pg_xclaim` itself **does not fail** without
-preload — it only installs the SQL wrappers. The error appears on
+preload - it only installs the SQL wrappers. The error appears on
 the first SQL call into the extension (the `XCLAIM_REQUIRE_INIT`
 gate fires there).
 
@@ -631,47 +743,33 @@ Remediation:
    `SHOW shared_preload_libraries;` and confirm `pg_xclaim` is in the
    list.
 2. If it is missing, add it **as the last entry** (e.g.
-   `citus,timescaledb,pg_xclaim`) and restart the cluster. Ordering
-   matters: pg_xclaim must be last so its xact cleanup runs first in
-   the LIFO callback chain. See §2 "Deploy stages".
+   `citus,timescaledb,pg_xclaim`) and restart the cluster. pg_xclaim
+   goes last so its xact cleanup runs first in the LIFO callback
+   chain. See §2 "Deploy stages".
 3. Before the restart, fall back to `pg_try_advisory_xact_lock`
    directly. If the cluster has already gone through the per-site
    rewrite step (stage 3 in §2), apply your rollback rewrite script
    first.
 
-### 10.3 FATAL on `_PG_init` -- cluster down
+### 10.3 Hot standby: calls fail until promotion
 
 ```
-FATAL:  pg_xclaim compiled against PG 1700 but running on PG 1600 -- refusing load
+ERROR:  pg_xclaim does not support hot-standby/recovery mode
+HINT:  Calls succeed once the server is promoted, so keep pg_xclaim in shared_preload_libraries on standbys.
 ```
 
-Cause: `pg_xclaim.so` compiled against a different PG ABI than the
-runtime server. Should not happen after the CI matrix gate; if it does,
-the build host and the runtime host disagree on the PG major version
-(e.g. a binary built against PG 17 deployed onto a PG 16 cluster).
+The extension loads through `shared_preload_libraries` on a standby (and
+on a primary still in WAL replay) without errors. SQL calls to
+`xclaim.*` return `ERRCODE_FEATURE_NOT_SUPPORTED` while the node is in
+recovery: the check fires at call time, not at load. After promotion
+(`pg_is_in_recovery() = false`) the calls succeed without a restart or a
+config change.
 
-Critical -- cluster down. See `docs/incident-decision-tree_en.md` (P0).
-
-Recovery:
-1. Edit `postgresql.conf` on the affected node -- remove `pg_xclaim`
-   from `shared_preload_libraries`.
-2. Restart -- the cluster comes up without `pg_xclaim`.
-3. Investigate the root cause (image build mismatch? unintended
-   standby promotion? ABI drift in a downstream PG fork?).
-
-> **Hot-standby is NOT a problem.** The extension preloads cleanly on a
-> standby (and on a primary still in WAL replay). SQL calls return
-> `ERRCODE_FEATURE_NOT_SUPPORTED` -- `pg_xclaim does not support
-> hot-standby/recovery mode` (with the hint
-> `Remove from shared_preload_libraries on standby clusters`) -- while
-> the node is in recovery; the check fires at call time, not at
-> preload. After promotion (`pg_is_in_recovery() = false`) the calls
-> succeed without any restart or config change.
->
-> The server-side HINT suggests removing the extension from
-> `shared_preload_libraries` on standbys; this is optional -- preload
-> on a standby is safe, the calls simply error out cleanly until
-> promotion.
+Keep `pg_xclaim` in `shared_preload_libraries` on replicas. A replica
+without it answers calls after promotion with the §10.2 error until the
+extension is added to `shared_preload_libraries` and the server is
+restarted. A replica reserves as much shared memory for pg_xclaim as a
+primary with the same settings.
 
 ### 10.4 2PC: `PRE_PREPARE` rejection
 
@@ -705,51 +803,33 @@ an error.
 Remediation: refactor the application to NOT use `PREPARE TRANSACTION`
 for transactions that hold xclaim claims. There is no DBA-side fix.
 
-**Edge case.** `PREPARE TRANSACTION` after `cleanup_misses`.
-
-The PRE_PREPARE rejection only fires when the backend actually holds
-claims locally (`xclaim_local_count() > 0`).
-
-There is a rare case where the backend's local set is **empty** but
-the shared memory still holds **orphaned rows** from one of its
-earlier transactions. This happens when an xact callback was skipped
-(see 10.5) — for example, another extension's callback raised ERROR
-before ours had a chance to run. The local state gets cleared, but
-the shared rows survive.
-
-If the backend then runs `PREPARE TRANSACTION`, the PRE_PREPARE
-check passes (local claims = 0) and the operator does not see the
-orphaned rows as an error. This is **not data corruption**: the
-tokens in those orphaned rows do not match the backend's current
-token, so the stale-owner reaper picks them up on the first
-conflicting acquisition (by any backend).
-
-What to do: if in the same session you observe `cleanup_misses > 0`
-and are about to run `PREPARE TRANSACTION` — call
-`SELECT xclaim.session_reset()` first. It rotates the owner_token
-and forces the reaper to pick up the orphaned rows on the next
-acquisition.
+**Edge case.** The `PRE_PREPARE` rejection checks every claim the
+backend holds, not only the claims of the transaction being prepared.
+If the backend holds claims outside a transaction (normal operation
+never does this, see section 6), `PREPARE TRANSACTION` in its next
+transaction is rejected too, even when that transaction took no
+claims. The rejection aborts the transaction, the abort releases those
+claims, and a retry succeeds.
 
 
 ### 10.5 `cleanup_misses` non-zero
 
-Cause: the xact callback was skipped on some path. For example,
-another extension's callback raised ERROR in xact-end before ours
-ran (see section 2 on the load order of `shared_preload_libraries`).
-This is the symptom that makes `xclaim.session_reset()` useful as a
-reactive triage tool (see section 6).
+Cause: a backend's cleanup found its shared entry gone or owned by
+someone else. Normal operation never does this: the reaper only takes
+over entries whose owner exited or rotated its owner_token, and
+`session_reset()` releases the held claims before it rotates the
+token. So the entry left its live owner: the reaper was wrong or
+shared memory is corrupted. Mutual exclusion on those keys may have
+been violated.
 
-Remediation:
-1. Inspect server log for related errors around the time of the increment.
-2. Force-clear stale state, targeted or pool-wide.
-   `xclaim.session_reset()` is backend-local — it runs only in the
-   calling session, not "across" suspect backends. To actually clear
-   a foreign backend, use either `SELECT pg_terminate_backend(pid)`
-   (targeted, pid from `pg_stat_activity`) or rotate the connection
-   pool (`pgbouncer -R` / `pg_doorman` reload / `odyssey` SIGHUP) —
-   all physical backends die and are recreated.
-3. If sustained, switch to `pg_xclaim.enabled = off`, apply the per-site
-   rollback DDL, and open an issue.
+Remediation (details: `docs/incident-decision-tree_en.md`, section 5):
+1. Save `xclaim.stats()`, `xclaim.debug_snapshot()`, `pg_stat_activity`
+   and the server log for the time of the increase, and file an issue.
+2. Check the application data for keys processed in that window.
+3. Do not set `pg_xclaim.enabled = off`: `xclaim.try` would return true
+   without claiming, which removes exclusion for every key.
+4. If the counter keeps growing, restart the server in a planned
+   window.
 
 ### 10.6 FATAL: `expected_claims_per_backend` > `max_claims`
 
@@ -769,26 +849,33 @@ rebalancing the cluster, forgetting to lower
 
 Recovery:
 
-1. Lower `pg_xclaim.expected_claims_per_backend` to a value ≤
+1. Lower `pg_xclaim.expected_claims_per_backend` to a value <=
    `pg_xclaim.max_claims` in `postgresql.conf`.
 2. Start the cluster again.
 
 ### 10.7 `reaped_stale` rate climbing
 
-Cause: shared rows outlived their owner or owner_token -- for example
-after `session_reset`, a missed cleanup callback, or fast PGPROC slot
-recycling. Ordinary hard backend death (`SIGKILL`, segfault, OOM kill)
-is handled by PostgreSQL as a child crash: the postmaster terminates
-other processes and recreates shared memory
-(`REL_18_STABLE:postmaster.c:2768-2792,3180-3202`), so those events should not leave xclaim rows for the lazy
-reaper.
+Cause: shared memory holds entries that outlived their owner or its
+owner_token, and the reaper takes them over on a conflicting claim.
+Normal operation leaves no such entries: claims are released at
+transaction end and at backend exit, `session_reset()` releases them
+before it rotates the token, and PostgreSQL handles hard backend death
+(`SIGKILL`, segfault, OOM kill) as a child crash: the postmaster
+terminates other processes and recreates shared memory
+(`REL_18_STABLE:postmaster.c:2768-2792,3180-3202`). So some cleanup
+path did not finish.
 
 Remediation:
-1. Check who calls `xclaim.session_reset()` and whether
-   `cleanup_misses` is growing at the same time.
-2. Check backend / pooler churn; fast PGPROC slot recycling increases
-   stale-owner reap odds after a callback skip.
-3. If the rate is < 1/min, this is benign self-heal -- no action needed.
+1. Check the server log for ERROR, FATAL and PANIC at transaction end
+   and backend exit, including those from other extensions' callbacks,
+   and whether `cleanup_misses` grows at the same time (10.5).
+2. Check that nothing calls `xclaim.debug_inject_stale()`: it is a test
+   function that creates such entries on purpose.
+3. Save `xclaim.stats()`, `xclaim.debug_snapshot()` and the log, and
+   file an issue.
+4. If the rate is < 1/min, nothing is urgent: the reaper frees a key on
+   the first conflict, and the application does not notice. The growth
+   is still worth investigating.
 
 ---
 

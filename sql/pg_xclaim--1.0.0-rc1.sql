@@ -32,14 +32,14 @@
 COMMENT ON SCHEMA xclaim IS
     'pg_xclaim - experimental high-cardinality transaction-level claims; see README for use cases and alternatives.';
 
--- Lock down the schema; individual functions add explicit GRANTs below
+-- Lock down the schema. Individual functions add explicit GRANTs below
 -- (xclaim.stats / xclaim.debug_snapshot are granted to pg_monitor).
 REVOKE ALL ON SCHEMA xclaim FROM PUBLIC;
 GRANT USAGE ON SCHEMA xclaim TO PUBLIC;
 
 -- ----------------------------------------------------------------------
 -- xclaim.try overloads (API compatible with pg_try_advisory_xact_lock for
--- ergonomic legacy migration; semantics are not interchangeable -- see README).
+-- ergonomic legacy migration, but semantics are not interchangeable -- see README).
 --
 -- Function attributes:
 --     LANGUAGE c
@@ -50,13 +50,13 @@ GRANT USAGE ON SCHEMA xclaim TO PUBLIC;
 -- Comparison vs pg_try_advisory_xact_lock (verified on PG 17):
 --     PG core    : v / r / t  (VOLATILE / RESTRICTED / STRICT)
 --     xclaim.try : v / r / f  (VOLATILE / RESTRICTED / CALLED ON NULL)
--- volatility + parallel mode match; strictness DIFFERS deliberately:
+-- Volatility + parallel mode match, but strictness DIFFERS deliberately:
 -- PG core silently maps NULL args to NULL result, while xclaim.try's
 -- C body raises ERROR with ERRCODE_NULL_VALUE_NOT_ALLOWED so programming
 -- bugs surface loudly instead of slipping through as no-op nulls.
 --
 -- Two distinct C entry points (no INT32_MIN sentinel). The XClaimForm
--- enum (SOLO=1, PAIR=2) is the out-of-band discriminator; SQL surface
+-- enum (SOLO=1, PAIR=2) is the out-of-band discriminator. SQL surface
 -- cannot influence it.
 -- ----------------------------------------------------------------------
 
@@ -99,9 +99,11 @@ GRANT EXECUTE ON FUNCTION xclaim.try(int8)       TO PUBLIC;
 -- second on hot clusters) just to defend against a hypothetical bug
 -- with no observable symptom in production.
 --
--- Use this function only when xclaim.stats().cleanup_misses > 0 in
--- production -- that is the signal that some xact callback path was
--- bypassed and reactive cleanup may be warranted.
+-- Use this function when a session holds claims outside a transaction
+-- (xclaim.count() > 0 in autocommit): the xact callback did not release
+-- them, which normal operation never does. The catalog comment below is
+-- the 1.0.0-rc1 text, and sql/pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql
+-- replaces it with this guidance.
 --
 -- Behaviour:
 --   1. Force-clear any leftover local-set entries (idempotent no-op
@@ -109,7 +111,7 @@ GRANT EXECUTE ON FUNCTION xclaim.try(int8)       TO PUBLIC;
 --   2. Force-release any shared dynahash rows owned by this backend
 --      via the group-by-partition cleanup path (at most num_partitions
 --      LWLock cycles -- 128 at the default -- for the 4M-claim worst
---      case; O(max_claims) full-scan explicitly REJECTED).
+--      case, never an O(max_claims) full scan).
 --   3. Rotate the per-backend owner_token so any survivor row becomes
 --      reapable by the stale-owner reaper on the next conflict.
 --   4. Increment xclaim.stats().session_resets.
@@ -119,7 +121,7 @@ GRANT EXECUTE ON FUNCTION xclaim.try(int8)       TO PUBLIC;
 --   VOLATILE                  -> mutates per-backend + shared state
 --   PARALLEL RESTRICTED       -> leader-only (defense-in-depth runtime
 --                                guard via IsParallelWorker check)
---   CALLED ON NULL INPUT      -> zero arguments; attribute kept for
+--   CALLED ON NULL INPUT      -> zero arguments, declared only for
 --                                consistency with xclaim.try.
 -- ----------------------------------------------------------------------
 
@@ -141,7 +143,7 @@ COMMENT ON FUNCTION xclaim.session_reset() IS
 -- is GRANTed to PUBLIC by default. We follow the same default.
 --
 -- One observation, not a security boundary: pg_monitor is an
--- observational role; granting EXECUTE on a state-mutating function
+-- observational role, so granting EXECUTE on a state-mutating function
 -- to it would conflate observation with control. PUBLIC has no such
 -- semantic -- every regular user already calls mutating xclaim.try*.
 -- So: PUBLIC EXECUTE is the default, and pg_monitor should not get
@@ -202,7 +204,7 @@ CREATE FUNCTION xclaim.count() RETURNS int8
     AS '$libdir/pg_xclaim', 'xclaim_count';
 
 -- PARALLEL RESTRICTED. Parallel workers do NOT inherit the leader's
--- per-backend local set; a worker invocation would return 0 even when
+-- per-backend local set, so a worker invocation would return 0 even when
 -- the leader holds claims, producing a wrong-but-plausible result
 -- (silent correctness bug). RESTRICTED forces the planner to keep
 -- this call in the leader.

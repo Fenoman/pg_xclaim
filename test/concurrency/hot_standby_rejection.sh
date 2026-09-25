@@ -6,17 +6,20 @@
 #   1. Start primary cluster with pg_xclaim preloaded
 #   2. pg_basebackup to create standby
 #   3. Configure standby with shared_preload_libraries='pg_xclaim'
-#   4. Start standby; first xclaim.try call MUST raise ERROR about
+#   4. Start standby. The first xclaim.try call MUST raise ERROR about
 #      hot-standby being unsupported.
 #   5. Remove pg_xclaim from standby's preload_libraries
 #   6. Start standby -> MUST start cleanly
+#   7. Put pg_xclaim back into the standby's preload, start it and promote
+#      it. Without a restart a claim MUST succeed, and COMMIT MUST release
+#      it.
 #
 # How the rejection fires:
 #   pg_xclaim's XCLAIM_REQUIRE_INIT() macro checks RecoveryInProgress() at
 #   SQL call time. RecoveryInProgress() is unsafe in _PG_init because
 #   XLogCtl is NULL at preload time. The hot-standby check therefore runs
-#   at SQL call time, not in
-#   _PG_init. We test the documented SQL-call behaviour.
+#   at SQL call time, not in _PG_init. We test the documented SQL-call
+#   behaviour.
 #
 # HARD INVARIANTS: set -euo pipefail, /tmp cluster, ru_RU.UTF-8, trap cleanup
 set -euo pipefail
@@ -56,6 +59,16 @@ cleanup_both() {
 }
 trap cleanup_both EXIT INT TERM
 
+# A hot standby refuses to recover unless these settings are at least the
+# primary's values. Both configs pin the same values: initdb may tune them
+# (Postgres Pro's pgpro_tune raises max_connections), and the standby config
+# below is written from scratch.
+HOT_STANDBY_LIMITS="max_connections = 100
+max_worker_processes = 8
+max_wal_senders = 3
+max_prepared_transactions = 0
+max_locks_per_transaction = 64"
+
 # initdb primary
 "$PGBIN/initdb" -D "$PRIMARY_DATA" \
     --locale=ru_RU.UTF-8 \
@@ -71,7 +84,7 @@ unix_socket_directories = '$PRIMARY_SOCKET'
 pg_xclaim.max_claims = 65536
 pg_xclaim.num_partitions = 128
 wal_level = replica
-max_wal_senders = 3
+$HOT_STANDBY_LIMITS
 hot_standby = on
 archive_mode = off
 log_min_messages = warning
@@ -82,6 +95,7 @@ EOF
 echo "local replication postgres trust" >> "$PRIMARY_DATA/pg_hba.conf"
 echo "host replication postgres 127.0.0.1/32 trust" >> "$PRIMARY_DATA/pg_hba.conf"
 
+LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
 "$PGBIN/pg_ctl" start -D "$PRIMARY_DATA" -w \
     -l "$PRIMARY_DATA/server.log" \
     -o "-p $PRIMARY_PORT" \
@@ -120,6 +134,7 @@ port = $STANDBY_PORT
 unix_socket_directories = '$STANDBY_SOCKET'
 pg_xclaim.max_claims = 65536
 pg_xclaim.num_partitions = 128
+$HOT_STANDBY_LIMITS
 hot_standby = on
 primary_conninfo = 'host=$PRIMARY_SOCKET port=$PRIMARY_PORT user=postgres'
 log_min_messages = warning
@@ -130,11 +145,13 @@ EOF
 touch "$STANDBY_DATA/standby.signal"
 
 # ---------------------------------------------------------------------------
-# Test 1: standby WITH preload -- expect FATAL or hot-standby ERROR on SQL call
+# Test 1: standby WITH preload -- must start, the SQL call must raise the
+#         hot-standby ERROR
 # ---------------------------------------------------------------------------
 echo "--- Test 1: standby with pg_xclaim preload ---"
 
 # Start standby and capture log
+LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
 "$PGBIN/pg_ctl" start -D "$STANDBY_DATA" -w \
     -l "$STANDBY_LOG" \
     -o "-p $STANDBY_PORT" \
@@ -171,24 +188,16 @@ if "$PGBIN/pg_isready" -h "$STANDBY_SOCKET" -p "$STANDBY_PORT" -U postgres -q 2>
         CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "standby_rejects_xclaim" "FAIL" "result" "no_error" "expected hot-standby rejection")")
     fi
 else
-    echo "  Standby did not start (expected behavior if _PG_init FATALs)"
-    # Check standby log for FATAL
-    HOT_STANDBY_MSG=""
-    if [[ -f "$STANDBY_LOG" ]]; then
-        HOT_STANDBY_MSG="$(grep -iE "FATAL|does not support|hot.standby" "$STANDBY_LOG" | head -3)"
-        echo "  Standby log (FATAL lines):"
-        echo "$HOT_STANDBY_MSG" | sed 's/^/    /'
-    fi
-    if [[ -n "$HOT_STANDBY_MSG" ]]; then
-        echo "  PASS: standby FATAL'd during startup with preload"
-        PASS=$(( PASS + 1 ))
-        CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "standby_fatal_startup" "PASS" "result" "FATAL" "FATAL on startup")")
-    else
-        echo "  WARN: standby did not start but no clear FATAL message; may be port issue"
-        CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "standby_fatal_startup" "PASS" "result" "no_start" "standby did not start")")
-        HOT_STANDBY_MSG="standby did not start"
-        PASS=$(( PASS + 1 ))
-    fi
+    # pg_xclaim checks for recovery at SQL call time, so a standby with the
+    # library preloaded must start. Severity tags are localized in the
+    # ru_RU.UTF-8 cluster ("ВАЖНО" for FATAL, "ПАНИКА" for PANIC).
+    echo "  FAIL: standby did not start with pg_xclaim preloaded" >&2
+    HOT_STANDBY_MSG="$(grep -E 'FATAL|PANIC|ВАЖНО|ПАНИКА' "$STANDBY_LOG" 2>/dev/null | head -3 || true)"
+    [[ -n "$HOT_STANDBY_MSG" ]] || HOT_STANDBY_MSG="standby did not start"
+    echo "  Standby log tail:" >&2
+    tail -n 20 "$STANDBY_LOG" 2>/dev/null | sed 's/^/    /' >&2 || true
+    FAIL=$(( FAIL + 1 ))
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "standby_starts_with_preload" "FAIL" "result" "no_start" "standby must start with pg_xclaim preloaded")")
 fi
 
 # Stop standby if running
@@ -208,6 +217,7 @@ sed -i.bak "s/^shared_preload_libraries.*=.*'pg_xclaim'/# shared_preload_librari
 # Reset log
 : > "$STANDBY_LOG"
 
+LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
 "$PGBIN/pg_ctl" start -D "$STANDBY_DATA" -w \
     -l "$STANDBY_LOG" \
     -o "-p $STANDBY_PORT" \
@@ -221,13 +231,54 @@ if "$PGBIN/pg_isready" -h "$STANDBY_SOCKET" -p "$STANDBY_PORT" -U postgres -q 2>
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "standby_no_preload_starts" "PASS" "result" "started" "clean start")")
     "$PGBIN/pg_ctl" stop -D "$STANDBY_DATA" -m immediate >/dev/null 2>&1 || true
 else
-    NO_PRELOAD_LOG=""
-    [[ -f "$STANDBY_LOG" ]] && NO_PRELOAD_LOG="$(grep -iE "FATAL|PANIC" "$STANDBY_LOG" | head -3)"
     echo "  FAIL: standby failed to start without pg_xclaim preload" >&2
-    [[ -n "$NO_PRELOAD_LOG" ]] && echo "  Log: $NO_PRELOAD_LOG" >&2
+    echo "  Standby log tail:" >&2
+    tail -n 20 "$STANDBY_LOG" 2>/dev/null | sed 's/^/    /' >&2 || true
     FAIL=$(( FAIL + 1 ))
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "standby_no_preload_starts" "FAIL" "result" "failed" "should start without preload")")
 fi
+
+# ---------------------------------------------------------------------------
+# Test 3: promotion -- a standby with pg_xclaim preloaded serves claims after
+#         promotion without a restart
+# ---------------------------------------------------------------------------
+echo "--- Test 3: promotion of a standby with pg_xclaim preload ---"
+
+# Test 2 left the original configuration in postgresql.conf.bak.
+mv "$STANDBY_DATA/postgresql.conf.bak" "$STANDBY_DATA/postgresql.conf"
+: > "$STANDBY_LOG"
+
+LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
+"$PGBIN/pg_ctl" start -D "$STANDBY_DATA" -w \
+    -l "$STANDBY_LOG" \
+    -o "-p $STANDBY_PORT" \
+    >/dev/null 2>&1 || true
+
+standby_sql() {
+    { "$PGBIN/psql" -h "$STANDBY_SOCKET" -p "$STANDBY_PORT" -U postgres -d postgres \
+        -X -A -t -q -c "$1" 2>&1 || true; } | tr '\n' ' ' | sed 's/ *$//'
+}
+
+IN_RECOVERY="$(standby_sql "SELECT pg_is_in_recovery();")"
+"$PGBIN/pg_ctl" promote -D "$STANDBY_DATA" -w >/dev/null 2>&1 || true
+PROMOTED="$(standby_sql "SELECT NOT pg_is_in_recovery();")"
+CLAIMED="$(standby_sql "BEGIN; SELECT xclaim.try(1, 1); SELECT xclaim.count(); COMMIT;")"
+HELD_AFTER="$(standby_sql "SELECT xclaim.count();")"
+echo "  in recovery before promote: $IN_RECOVERY, promoted: $PROMOTED"
+echo "  try(1, 1) and count() in one transaction: $CLAIMED, count() after COMMIT: $HELD_AFTER"
+
+if [[ "$IN_RECOVERY" == "t" && "$PROMOTED" == "t" && "$CLAIMED" == "t 1" && "$HELD_AFTER" == "0" ]]; then
+    echo "  PASS: the promoted standby serves claims without a restart"
+    PASS=$(( PASS + 1 ))
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "promoted_standby_claims" "PASS" "result" "claimed" "claims work after promotion without a restart")")
+else
+    echo "  FAIL: the promoted standby did not serve a claim" >&2
+    echo "  Standby log tail:" >&2
+    tail -n 20 "$STANDBY_LOG" 2>/dev/null | sed 's/^/    /' >&2 || true
+    FAIL=$(( FAIL + 1 ))
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "promoted_standby_claims" "FAIL" "result" "not_claimed" "claims must work after promotion without a restart")")
+fi
+"$PGBIN/pg_ctl" stop -D "$STANDBY_DATA" -m immediate >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # Report

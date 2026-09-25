@@ -37,7 +37,7 @@ BEGIN;
 SELECT xclaim.try(1, 400);
 DO $$ BEGIN RAISE EXCEPTION 'test error to abort txn'; END $$;
 SQLA
-# The above errors; psql returns non-zero but we captured with || true.
+# The above errors, and || true keeps a psql failure from stopping the script.
 # The transaction is now aborted. The ABORT xact callback should have fired.
 
 # Session B: should now succeed

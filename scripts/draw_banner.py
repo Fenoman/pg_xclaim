@@ -32,7 +32,7 @@ DPI = 150
 FIG_W, FIG_H = 2244 / DPI, 701 / DPI
 AR = 2244 / 701                      # axis is 0..AR wide, 0..1 tall
 
-# Wordmark font. macOS ships these; on a host without them matplotlib falls
+# Wordmark font. macOS ships these. On a host without them matplotlib falls
 # back to DejaVu Sans (the committed PNG is the artifact, so the fallback only
 # affects a from-scratch regeneration, which is rare for a static banner).
 WORD_FONT = "Helvetica Neue"
@@ -116,7 +116,7 @@ def main():
     ax.set_ylim(0, 1)
     ax.axis("off")
 
-    # Left text block occupies x in [x0, x0 + block_w]; the padlock sits to its
+    # Left text block occupies x in [x0, x0 + block_w], and the padlock sits to its
     # right with a comfortable gap. Both lines are width-fitted to block_w so
     # the wordmark and subtitle share a left edge and a right edge.
     x0 = 0.32

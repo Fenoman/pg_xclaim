@@ -39,10 +39,10 @@ LOG_FILE="$PGDATA/server.log"
 PEAK_PATTERN='crossed 75%.*expected_claims_per_backend'
 
 count_log_hits() {
-    # grep -c returns 1 when no matches; tolerate via `|| true`. -E for ERE.
+    # grep -c returns 1 when nothing matches, hence `|| true`. -E for ERE.
     local n
     n="$(grep -cE "$PEAK_PATTERN" "$LOG_FILE" 2>/dev/null || true)"
-    # Normalise whitespace / empty (grep prints "0" but be defensive).
+    # Normalise empty output to 0 (grep prints "0" but be defensive).
     echo "${n:-0}"
 }
 
@@ -73,7 +73,7 @@ echo "--- Test 2: 50 claims (78%) -- must log once ---"
 
 HITS_BEFORE="$(count_log_hits)"
 
-# Single backend session: 50 claims, then 50 more after session_reset.
+# Single backend session: 50 claims, then 50 more without session_reset.
 # We use a here-doc with two transactions in the same psql session.
 pg_xclaim_psql -X -q <<'SQL' >/dev/null
 BEGIN;

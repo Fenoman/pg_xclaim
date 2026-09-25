@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # test/concurrency/disconnect_release.sh
-# Backend disconnect releases claim (before_shmem_exit fires).
+# Backend disconnect releases claim (the exit path aborts the open transaction).
 #
 # Scenario:
 #   Session A: BEGIN; xclaim.try(1, 500) -> true; client disconnects (psql exits)
-#   Session B: xclaim.try(1, 500) -> true (before_shmem_exit fired on A's exit)
+#   Session B: xclaim.try(1, 500) -> true (A's exit released the claim)
 #
-# The before_shmem_exit callback runs when a backend exits normally, releasing
-# all held claims. This is the normal graceful disconnect path.
+# When a backend exits with an open transaction, the core before_shmem_exit
+# callback ShutdownPostgres aborts it and the xact callback releases all held
+# claims. This is the normal graceful disconnect path.
 #
 # HARD INVARIANTS: set -euo pipefail, /tmp cluster, ru_RU.UTF-8, trap cleanup
 set -euo pipefail
@@ -26,22 +27,23 @@ FAIL=0
 CSV_ROWS=()
 
 # ---------------------------------------------------------------------------
-# Test 1: disconnect triggers before_shmem_exit cleanup
+# Test 1: disconnect triggers exit-path cleanup
 # ---------------------------------------------------------------------------
 echo "--- Test 1: disconnect releases claim ---"
 
 # Session A: BEGIN + try, then the psql process exits normally.
-# When psql disconnects gracefully, the backend calls before_shmem_exit which
-# runs our shmem_exit callback.  The transaction abort path also fires first.
+# When psql disconnects gracefully, ShutdownPostgres aborts the open
+# transaction and the xact callback releases the claim. pg_xclaim's own exit
+# callback (on_shmem_exit) runs after that and finds nothing left.
 pg_xclaim_psql -X -A -t 2>/dev/null <<'SQLA'
 BEGIN;
 SELECT xclaim.try(1, 500);
 SQLA
 # psql exited here -- transaction was open (implicit ROLLBACK by disconnect)
-# before_shmem_exit fires, our callback cleans up the entry.
+# and its abort releases the entry.
 
-# Brief pause to let backend finish cleanup (before_shmem_exit is synchronous
-# within the same process but we need to ensure the shared state is updated)
+# Brief pause to let the backend finish its exit path (cleanup is synchronous
+# within that process, but the client can see the connection close first)
 sleep 0.1
 
 # Session B: should now succeed

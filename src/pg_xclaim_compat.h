@@ -12,7 +12,7 @@
  *
  * IMPORTANT: do NOT use `MyProc->vxid.procNumber` as the compat surface
  * even in PG 17+. PG 17+ exposes process identity as the extern
- * `MyProcNumber`; `vxid.procNumber` is an implementation detail embedded
+ * `MyProcNumber`. `vxid.procNumber` is an implementation detail embedded
  * in the VXID struct. The cleanup path needs process identity captured at
  * acquisition time. Use `MyProcNumber` (or `MyProc->pgprocno` on PG 16)
  * only.
@@ -50,7 +50,7 @@ xclaim_get_current_top_lxid(void)
      * clears it back to InvalidLocalTransactionId in
      * ProcArrayEndTransaction() BEFORE the xact callback fires:
      * CommitTransaction() calls ProcArrayEndTransaction() and only then
-     * CallXactCallbacks(); AbortTransaction() follows the same order.
+     * CallXactCallbacks(). AbortTransaction() follows the same order.
      * That ordering is what makes the saved-acquisition-time identity
      * pattern necessary -- by the time our cleanup callback runs, the
      * live lxid is already gone.
@@ -108,8 +108,8 @@ xclaim_get_pgproc_by_procno(int procno)
         return NULL;
     if (ProcGlobal == NULL)
         return NULL;
-    /* allProcCount is uint32 in PG 16/17/18 -- cast both sides for the
-     * compare so -Wsign-compare stays clean under -Werror. */
+    /* allProcCount is uint32 in PG 16/17/18 -- procno is cast to uint32
+     * for the compare so -Wsign-compare stays clean under -Werror. */
     if ((uint32) procno >= ProcGlobal->allProcCount)
         return NULL;
     return GetPGProcByNumber(procno);

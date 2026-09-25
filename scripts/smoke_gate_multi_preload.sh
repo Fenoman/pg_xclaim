@@ -21,7 +21,7 @@
 #   2. Setting shared_preload_libraries='pg_stat_statements,pg_xclaim'
 #      AND vice versa to verify both chain orders.
 #   3. Booting `postgres --single` (preload runs, hooks fire).
-#   4. Detecting hang via timeout; FATAL/PANIC via log grep.
+#   4. Detecting hang via timeout and FATAL/PANIC via log grep.
 #
 # Exit:
 #   0  PASS  -- both orders boot cleanly
@@ -48,7 +48,7 @@ POSTGRES="$BIN/postgres"
 
 # Track the data directory of the run currently in flight so a signal
 # (Ctrl-C / SIGTERM) still removes it. The per-function RETURN trap below
-# handles the normal sequential path; this global trap is the safety net
+# handles the normal sequential path, and this global trap is the safety net
 # for an interrupt mid-run.
 CURRENT_DATADIR=""
 smoke_cleanup() {
@@ -61,7 +61,7 @@ smoke_cleanup() {
 }
 trap smoke_cleanup EXIT INT TERM
 
-# pg_stat_statements ships with PG core in the same lib dir; sanity-
+# pg_stat_statements ships with PG core in the same lib dir. Sanity-
 # check it is present in this install.
 PKGLIB="$("$PG_CONFIG_BIN" --pkglibdir)"
 if [[ ! -e "$PKGLIB/pg_stat_statements.dylib" && ! -e "$PKGLIB/pg_stat_statements.so" ]]; then
@@ -96,9 +96,9 @@ run_one() {
 
     # `postgres --single` runs preload + _PG_init + shmem_startup + hooks
     # then idles on stdin. \q exits cleanly. If the chain self-deadlocks,
-    # the outer `gtimeout 30s` (or built-in timeout via background +
-    # wait) kills the process and reports failure. macOS lacks GNU
-    # timeout(1); use the perl fallback `perl -e 'alarm 30; exec @ARGV'`.
+    # a 30s alarm kills the process and the gate reports failure. The
+    # alarm comes from perl (`perl -e 'alarm 30; exec @ARGV'`) because
+    # macOS lacks GNU timeout(1).
     set +e
     perl -e 'alarm 30; exec @ARGV or die "exec failed: $!"' \
         "$POSTGRES" --single -D "$datadir" postgres <<<'\q' >"$smoke_log" 2>&1
@@ -125,7 +125,7 @@ run_one() {
 }
 
 # Test both orderings. The xact-callback ordering rationale (documented
-# in README.md) prefers pg_xclaim FIRST in the preload list, but the
+# in README.md) prefers pg_xclaim LAST in the preload list, but the
 # shmem_startup chain MUST be correct regardless of order -- this gate
 # catches regressions where one direction silently deadlocks while the
 # other still boots.

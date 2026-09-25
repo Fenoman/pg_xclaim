@@ -15,18 +15,18 @@
 #   to observe the reaper code path.
 #
 #   With restart_after_crash=off, the postmaster marks the cluster "degraded"
-#   and subsequent backend connections may see inconsistent state; this is too
+#   and subsequent backend connections may see inconsistent state, which is too
 #   fragile for CI.
 #
 #   Killing the psql client (not the backend) avoids the postmaster crash
-#   path but only if the connection is broken before the backend commits;
-#   in that case the txn rolls back normally via before_shmem_exit -- that
+#   path but only if the connection is broken before the backend commits.
+#   In that case the txn rolls back normally via before_shmem_exit -- that
 #   exercises the disconnect-release path, NOT the stale-reaper code path.
 #
 #   CONCLUSION: debug-injection is the correct approach for the stale-reaper.
 #   xclaim.debug_inject_stale(scope, key) creates an XClaimEntry with
-#   owner_procno=99999 (invalid) and owner_token=0 (invalid sentinel) which is
-#   guaranteed stale via the token-mismatch detection branch. This directly
+#   owner_procno=INT32_MAX (out of range) and owner_token=0 (invalid sentinel),
+#   guaranteed stale via the reaper's procno bounds check. This directly
 #   exercises the reaper code path without cluster-stability concerns.
 # ============================================================================
 #

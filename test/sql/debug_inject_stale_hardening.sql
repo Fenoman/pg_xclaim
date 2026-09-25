@@ -52,8 +52,8 @@ FROM xclaim.debug() WHERE scope = 101 AND key = 7;
 
 -- 3. Injection over a live entry is REFUSED.
 --    Acquire (102, 7) for real, then attempt to inject over it. The
---    helper must raise ERRCODE_OBJECT_IN_USE; the owner triple must
---    survive intact; a concurrent try() in this same backend must
+--    helper must raise ERRCODE_OBJECT_IN_USE, the owner triple must
+--    survive intact, and a concurrent try() in this same backend must
 --    still see the row as held (reentrant hit).
 --
 --    A SAVEPOINT isolates the expected ERROR from the surrounding
@@ -90,7 +90,7 @@ ROLLBACK;
 --    be refused with `requires superuser` because the function body
 --    checks superuser() before doing any work. Granting EXECUTE
 --    simulates an operator who explicitly tried to expose the
---    helper to a non-superuser; the C-side guard is the safety net.
+--    helper to a non-superuser. The C-side guard is the safety net.
 CREATE ROLE xclaim_hardening_nosuper NOSUPERUSER NOLOGIN;
 GRANT EXECUTE ON FUNCTION xclaim.debug_inject_stale(int4, int4)
     TO xclaim_hardening_nosuper;

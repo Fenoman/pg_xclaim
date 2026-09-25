@@ -3,13 +3,15 @@
 # Stress test: 10 backends x 100k claims concurrent.
 #
 # Scenario:
-#   10 backends in parallel, each: BEGIN; xclaim.try_many(1..100000); COMMIT or ROLLBACK
+#   10 backends in parallel, each: BEGIN; xclaim.try_many(1, <its own 100k keys>); COMMIT
 #   Verify: no crash, no advisory lock bleed-through, no leaked entries.
 #   Additionally: per-partition occupancy histogram for hash distribution sanity.
 #
-# Performance budgets:
+# Pass criterion and output:
 #   * 10 concurrent backends x 100k claims MUST sustain without errors.
-#   * CSV output is appended for downstream perf-trend tracking.
+#   * Metrics go to baseline-<UTC date>.csv in $XCLAIM_BASELINE_DIR (default
+#     $TMPDIR or /tmp) for perf-trend tracking. A later run on the same date
+#     overwrites the file.
 #
 # NOTE: This is an accept/reject test. The actual latency numbers depend heavily
 # on hardware. We record metrics but only fail on correctness violations.
@@ -99,7 +101,7 @@ ALL_OK=true
 for i in $(seq 1 $N_BACKENDS); do
     OUT="$WORK_DIR/backend_${i}.out"
     if [[ -f "$OUT" ]]; then
-        # Extract the numeric count (psql -A -t outputs raw values; "BEGIN",
+        # Extract the numeric count (psql -A -t outputs raw values, and "BEGIN",
         # "COMMIT" are not numeric). Take the first numeric line as-is: a 0 win
         # count is a legitimate result that must not be silently discarded.
         WIN_COUNT="$(grep -E '^[0-9]+$' "$OUT" | head -1 | tr -d ' ' 2>/dev/null || true)"

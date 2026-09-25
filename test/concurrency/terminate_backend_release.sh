@@ -3,14 +3,14 @@
 # pg_terminate_backend releases claim (before_shmem_exit fires).
 #
 # Scenario:
-#   Session A: BEGIN; xclaim.try(1, 600) -> true; idle in transaction (via pg_sleep)
+#   Session A: BEGIN; xclaim.try(1, 600) -> true; pg_sleep(10) with the transaction open
 #   Session C: SELECT pg_terminate_backend(<A's pid>)
 #   Session B: xclaim.try(1, 600) -> true (before_shmem_exit fired on terminate)
 #
 # pg_terminate_backend sends SIGTERM which causes the backend to call
 # before_shmem_exit handlers, releasing all claims.
 #
-# Synchronization: Session A acquires and then sleeps for 5 seconds.
+# Synchronization: Session A acquires and then sleeps for 10 seconds.
 # We read A's pid from pg_stat_activity, then terminate it mid-sleep.
 #
 # HARD INVARIANTS: set -euo pipefail, /tmp cluster, ru_RU.UTF-8, trap cleanup
@@ -54,7 +54,7 @@ SESSION_A_PID=$!
 # Wait for Session A to acquire and enter sleep
 sleep 1
 
-# Read A's PID from pg_stat_activity (it should be in pg_sleep or idle-in-transaction)
+# Read A's PID from pg_stat_activity (it should be active in pg_sleep)
 A_BACKEND_PID="$(pg_xclaim_psql -X -A -t 2>/dev/null \
     -c "SELECT pid FROM pg_stat_activity WHERE state = 'active' AND query LIKE '%pg_sleep%' AND pid != pg_backend_pid() LIMIT 1;" \
     | tr -d ' ' || echo "")"
@@ -132,7 +132,7 @@ if [[ "$DEBUG_COUNT" == "0" ]]; then
     PASS=$(( PASS + 1 ))
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "no_leak_after_terminate" "PASS" "debug_count" "0" "clean")")
 else
-    echo "  WARN: $DEBUG_COUNT entries remain (stale from terminated backend; reaper will clean)"
+    echo "  WARN: $DEBUG_COUNT entries remain (stale from terminated backend, reaper will clean)"
     # Non-fatal: stale reaper handles this on next conflict
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "no_leak_after_terminate" "PASS" "debug_count" "$DEBUG_COUNT" "reaper will clean")")
     PASS=$(( PASS + 1 ))

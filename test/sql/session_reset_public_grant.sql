@@ -45,13 +45,17 @@ SELECT xclaim.session_reset() AS reset_in_autocommit;
 SELECT xclaim.count() AS held_after_autocommit_reset;
 
 -- Test 2: session_reset MUST refuse inside an explicit transaction
--- block. Acquire two claims, attempt session_reset inside the same
--- BEGIN/COMMIT; the helper must raise; the claims survive.
+-- block. Acquire two claims and attempt session_reset inside the same
+-- BEGIN/COMMIT, in a savepoint. The helper must raise without releasing
+-- the claims: they survive ROLLBACK TO SAVEPOINT, so the count stays 2.
 \set ON_ERROR_STOP off
 BEGIN;
 SELECT xclaim.try(21::bigint), xclaim.try(22::bigint);
 SELECT xclaim.count() AS held_before_inside_xact_attempt;
+SAVEPOINT before_reset;
 SELECT xclaim.session_reset() AS reset_inside_xact;
+ROLLBACK TO SAVEPOINT before_reset;
+SELECT xclaim.count() AS held_after_refused_reset;
 ROLLBACK;
 \set ON_ERROR_STOP on
 

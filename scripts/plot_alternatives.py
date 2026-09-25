@@ -5,7 +5,7 @@ straight from the authoritative benchmark CSVs, so the published numbers
 can never drift from the measurements.
 
 Each figure is emitted in two languages. The bare filename is the Russian
-(primary) asset; the English one carries an _en suffix -- the same naming
+(primary) asset, and the English one carries an _en suffix -- the same naming
 convention docs/ already uses (runbook.md / runbook_en.md):
 
     assets/overview.png  / overview_en.png             headline throughput
@@ -112,7 +112,7 @@ COMMON_FOOT = "PG 17, ITERS=200, fsync=on, ACCOUNT_POOL=1M"
 
 # Per-language display strings. Technical jargon (tx/sec, p95, WAL, NOWAIT,
 # disjoint/overlap, UNLOGGED/LOGGED, deadlock, sort, INSERT) stays English in
-# BOTH languages, matching README.md's house style; only the connective prose
+# BOTH languages, matching README.md's house style. Only the connective prose
 # is translated. The deadlock count line is a .format() template.
 STRINGS = {
     "en": {
@@ -182,7 +182,7 @@ PNG_META = {"Software": None}
 
 
 def out_name(base, lang):
-    """Bare filename is the Russian (primary) asset; English gets an _en
+    """Bare filename is the Russian (primary) asset. English gets an _en
     suffix -- the same convention docs/ uses (runbook.md / runbook_en.md)."""
     return f"{base}.png" if lang == "ru" else f"{base}_en.png"
 
@@ -255,7 +255,7 @@ def plot_overview(disjoint, out, lang):
     ax.set_yscale("log")
     ax.set_xticks(K_VALUES)
     ax.set_xticklabels(K_LABELS)
-    ax.set_ylim(1, 20000)  # A peaks at 13505; 10000 would clip it
+    ax.set_ylim(1, 20000)  # A peaks at 13505, so 10000 would clip it
     ax.set_yticks([1, 10, 100, 1000, 10000])
     ax.set_yticklabels(["1", "10", "100", "1000", "10000"])
     ax.set_xlabel(S["xlabel_keys"])
@@ -326,7 +326,7 @@ def plot_tradeoffs(disjoint, overlap, out, lang):
 
     # ---- RIGHT: WAL bytes, disjoint only ----
     djw = [disjoint[i][K]["wal"] for i in IMPLS]
-    # Log axis cannot show A's ~0; floor it and annotate honestly.
+    # Log axis cannot show A's ~0, so floor it and annotate honestly.
     floor = 100
     heights = [max(v, floor) for v in djw]
     axW.bar(list(x), heights, w * 1.6, color=colors, alpha=0.7)

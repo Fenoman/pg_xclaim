@@ -7,7 +7,7 @@
 # src/pg_xclaim.h XCLAIM_REQUIRE_INIT) -- the documented behaviour.
 #
 # This is the symmetric companion to scripts/smoke_gate.sh: smoke_gate.sh
-# proves preloaded init does not panic; this script proves the no-preload
+# proves preloaded init does not panic, and this script proves the no-preload
 # fallback path raises the documented user-error code instead of crashing.
 #
 # Usage:
@@ -15,7 +15,7 @@
 #   scripts/smoke_gate_no_preload.sh /path/to/pg_config # explicit
 #
 # Exit:
-#   0  PASS  -- LOAD ok; xclaim.try raises SQLSTATE 55000 (object_not_in_prerequisite_state)
+#   0  PASS  -- LOAD ok, xclaim.try raises SQLSTATE 55000 (object_not_in_prerequisite_state)
 #   1  FAIL  -- LOAD failed, FATAL observed, or xclaim.try succeeded
 
 set -euo pipefail
@@ -59,6 +59,10 @@ echo "smoke_gate_no_preload: PG_CONFIG=$PG_CONFIG_BIN  PORT=$PORT  DATADIR=$DATA
     echo "logging_collector = off"
 } >> "$DATADIR/postgresql.conf"
 
+# Inline locale, as in run_temp_cluster.sh: on macOS a postmaster started
+# without one exits with FATAL "postmaster became multithreaded during
+# startup".
+LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
 "$PGCTL" start -D "$DATADIR" -w -l "$DATADIR/server.log" -o "-p $PORT" >/dev/null
 
 if grep -qE 'FATAL|PANIC' "$DATADIR/server.log"; then
@@ -67,7 +71,7 @@ if grep -qE 'FATAL|PANIC' "$DATADIR/server.log"; then
     exit 1
 fi
 
-# Step 0: CREATE EXTENSION (installs SQL objects; .so loaded lazily on first call).
+# Step 0: CREATE EXTENSION (installs SQL objects, .so loaded lazily on first call).
 # Without this the schema "xclaim" doesn't exist and we'd get 3F000 instead of 55000.
 CE_OUT="$("$PSQL" -h "$DATADIR" -p "$PORT" -U postgres -d postgres \
     -X -At -v ON_ERROR_STOP=1 \

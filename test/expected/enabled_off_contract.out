@@ -73,7 +73,7 @@ WHERE scope IN (50001, 50002, 50003, 50004, 50005, 50006, 50007, 8);
 
 ROLLBACK;
 -- 3. disabled_calls counter advanced. The exact delta is the count
---    of disabled-mode entry-points entered above; pinning it down in
+--    of disabled-mode entry-points entered above. Pinning it down in
 --    the baseline catches changes that silently skip a
 --    `disabled_calls` increment on one of the four acquisition surfaces.
 SELECT disabled_calls - :disabled_before AS disabled_delta

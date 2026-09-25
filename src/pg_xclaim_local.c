@@ -43,6 +43,7 @@
 #include "common/hashfn.h"              /* hash_bytes */
 #include "miscadmin.h"                  /* MyProcPid, MaxBackends */
 #include "port/atomics.h"
+#include "storage/ipc.h"                /* on_shmem_exit */
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
@@ -64,6 +65,7 @@
 /* SH_HASH_KEY      hash_bytes over the 16-byte key footprint           */
 /* SH_EQUAL         memcmp() of 16 bytes                                */
 /* SH_SCOPE         static inline (this TU only)                        */
+/* SH_USE_NONDEFAULT_ALLOCATOR  bucket arrays from xcl_local_allocate() */
 /* SH_DEFINE        emit definitions                                    */
 /* SH_DECLARE       emit declarations                                   */
 /*                                                                      */
@@ -94,6 +96,7 @@
 #define SH_EQUAL(tb, a, b)      \
     (memcmp(&(a), &(b), sizeof(XClaimKey)) == 0)
 #define SH_SCOPE                static inline
+#define SH_USE_NONDEFAULT_ALLOCATOR
 #define SH_DECLARE
 #define SH_DEFINE
 #include "lib/simplehash.h"
@@ -101,7 +104,7 @@
 /* -------------------------------------------------------------------- */
 /* File-scope state.                                                    */
 /*                                                                      */
-/* All four globals are TU-private (`static`). The header exposes a    */
+/* All globals are TU-private (`static`). The header exposes a         */
 /* small read-only API instead of the raw pointers so refactors (e.g.  */
 /* dynahash fallback) do not break consumers.                          */
 /* -------------------------------------------------------------------- */
@@ -112,6 +115,70 @@ static uint64          XClaimMyOwnerToken  = 0;             /* 0 = unallocated *
 static uint64          XClaimMyLocalCount  = 0;             /* live entries */
 static uint64          XClaimMyPeakCount   = 0;             /* high-water-mark */
 static bool            XClaimMyPeakWarned  = false;         /* per-session, one-shot */
+static bool            XClaimMyExitCbRegistered = false;    /* once per backend */
+
+/* -------------------------------------------------------------------- */
+/* Bucket-array allocator (SH_ALLOCATE / SH_FREE).                      */
+/*                                                                      */
+/* A growth of the set allocates a bucket array twice the size of the   */
+/* current one, and that allocation can fail with an out-of-memory      */
+/* ERROR. PostgreSQL 16's simplehash sets the new size, mask and grow   */
+/* threshold BEFORE the allocation, so the failure would leave the      */
+/* current array under the doubled size: a later lookup, delete,        */
+/* iteration or reset would read and write past its end. PostgreSQL 17  */
+/* and later allocate first, but the long-probe path zeroes the grow    */
+/* threshold before it grows, so the failure would leave it at zero     */
+/* and every later insert would try to grow again, even into an empty   */
+/* set.                                                                 */
+/*                                                                      */
+/* Every bucket array of the set comes from xcl_local_allocate(), and   */
+/* XClaimLocalArraySize holds the bucket count of the array the set     */
+/* uses. When the allocation for a growth fails, the allocator gives    */
+/* the set the size, mask and grow threshold of that array back, the    */
+/* way simplehash computes them, and re-throws the ERROR. One insert    */
+/* can grow the set more than once (a long probe right after a growth   */
+/* grows it again), and every growth allocates here, so the set comes   */
+/* back to the array it uses whichever growth fails.                    */
+/* -------------------------------------------------------------------- */
+
+static uint64 XClaimLocalArraySize = 0;
+
+#if PG_VERSION_NUM >= 170000
+#define xclaim_local_set_geometry(tb, size) \
+    xcl_local_update_parameters((tb), (size))
+#else
+#define xclaim_local_set_geometry(tb, size) \
+    xcl_local_compute_parameters((tb), (size))
+#endif
+
+static inline void *
+xcl_local_allocate(xcl_local_hash *tb, Size size)
+{
+    void       *volatile data = NULL;
+
+    PG_TRY();
+    {
+        data = MemoryContextAllocExtended(tb->ctx, size,
+                                          MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
+    }
+    PG_CATCH();
+    {
+        /* tb->data is NULL only while xcl_local_create() builds the set. */
+        if (tb->data != NULL)
+            xclaim_local_set_geometry(tb, XClaimLocalArraySize);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    XClaimLocalArraySize = size / sizeof(XClaimLocalEntry);
+    return data;
+}
+
+static inline void
+xcl_local_free(xcl_local_hash *tb, void *pointer)
+{
+    pfree(pointer);
+}
 
 /* -------------------------------------------------------------------- */
 /* xclaim_local_init                                                    */
@@ -122,7 +189,7 @@ static bool            XClaimMyPeakWarned  = false;         /* per-session, one-
 /* and instantiates the simplehash with `expected_claims_per_backend`   */
 /* slots so steady-state acquisition does not pay rehash cost. Sessions */
 /* that legitimately exceed the GUC value (e.g. >16k concurrent claims  */
-/* on the default) WILL trigger simplehash growth; raise the GUC to     */
+/* on the default) WILL trigger simplehash growth. Raise the GUC to     */
 /* keep the burst path rehash-free.                                     */
 /* -------------------------------------------------------------------- */
 
@@ -142,8 +209,8 @@ xclaim_local_init(void)
      * cleanup truncates the live set via xcl_local_reset() (a memset
      * over the simplehash bucket array), leaving the underlying chunks
      * pinned to this context so the next acquisition burst reuses
-     * already-allocated pages. The context is torn down only at backend
-     * exit with TopMemoryContext.
+     * already-allocated pages. Once the set exists, the context is torn
+     * down only at backend exit with TopMemoryContext.
      */
     XClaimLocalContext = AllocSetContextCreate(TopMemoryContext,
                                                "xclaim local set",
@@ -156,15 +223,30 @@ xclaim_local_init(void)
      * Avoids rehash during steady-state acquisition for sessions that
      * stay below the GUC value. High-cardinality sessions (e.g. >16k
      * simultaneous claims at the default) WILL hit the simplehash
-     * grow path; raise the GUC for those workloads. simplehash grows
+     * grow path. Raise the GUC for those workloads. simplehash grows
      * at SH_FILLFACTOR (0.9), so rehash-free capacity actually extends
      * somewhat ABOVE the GUC value. The 75%-of-GUC peak warning emitted
      * elsewhere is a deliberately early heads-up, well before that
      * 0.9-fillfactor grow point.
+     *
+     * When the first bucket array does not fit, the context with the
+     * half-built set is dropped, so every failed attempt leaves nothing
+     * under TopMemoryContext and the next claim starts from scratch.
      */
-    XClaimLocalSet = xcl_local_create(XClaimLocalContext,
-                                      (uint32) xclaim_expected_claims_per_backend,
-                                      NULL);
+    PG_TRY();
+    {
+        XClaimLocalSet = xcl_local_create(XClaimLocalContext,
+                                          (uint32) xclaim_expected_claims_per_backend,
+                                          NULL);
+    }
+    PG_CATCH();
+    {
+        MemoryContextSwitchTo(old);
+        MemoryContextDelete(XClaimLocalContext);
+        XClaimLocalContext = NULL;
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
 
     MemoryContextSwitchTo(old);
 
@@ -182,7 +264,7 @@ xclaim_local_init(void)
 /*                                                                      */
 /* Lazy, idempotent. On first call: atomically increment                */
 /* XClaimCtl->next_token (initialised to 1 in shared startup -- so the  */
-/* first fetch_add returns 1, never 0; 0 is the reserved sentinel for   */
+/* first fetch_add returns 1 and never 0, the reserved sentinel for     */
 /* `XClaimBackendInfo.current_token`). Publish the value into our       */
 /* per-backend slot so the stale-owner reaper can consult it.           */
 /*                                                                      */
@@ -201,8 +283,32 @@ xclaim_ensure_owner_token(void)
         return;                         /* already published */
 
     /*
+     * Register the backend-exit callback before the first token is
+     * published, so every backend with a published token also has the
+     * callback that releases leftover claims and invalidates the token
+     * at exit. The registration has to happen here, in the backend: in
+     * fork-based builds InitPostmasterChild() calls on_exit_reset(), so
+     * nothing _PG_init registers in the postmaster reaches a backend.
+     *
+     * on_shmem_exit, not before_shmem_exit: this call can run inside a
+     * PG_ENSURE_ERROR_CLEANUP scope (a claim taken by an opclass
+     * comparator during btbulkdelete, for example), and such a scope
+     * removes its own before_shmem_exit entry with
+     * cancel_before_shmem_exit(), which fails unless that entry is the
+     * latest one. on_shmem_exit entries have no such removal.
+     *
+     * session_reset() rotates the token but keeps the registration,
+     * which therefore happens once per backend.
+     */
+    if (!XClaimMyExitCbRegistered)
+    {
+        on_shmem_exit(xclaim_shmem_exit_cb, (Datum) 0);
+        XClaimMyExitCbRegistered = true;
+    }
+
+    /*
      * Atomic fetch-and-add. next_token starts at 1, so the first reader
-     * gets 1; subsequent readers get 2, 3, ... A token is issued at most
+     * gets 1, and subsequent readers get 2, 3, ... A token is issued at most
      * once per backend session (plus once per session_reset), so the
      * counter advances very slowly. Even at an absurd 1e6 tokens/sec the
      * 64-bit space (2^64 ~= 1.8e19) lasts ~585,000 years before
@@ -215,19 +321,19 @@ xclaim_ensure_owner_token(void)
      * Publish before record. Write the per-backend slot's
      * `current_token` BEFORE assigning XClaimMyOwnerToken. A reaper
      * in another backend reads `XClaimBackendInfos[procno].current_token`
-     * to decide whether a row owned by `token` is stale; if the reaper
+     * to decide whether a row owned by `token` is stale. If the reaper
      * ran while XClaimMyOwnerToken=token but the slot still held the
      * inactive sentinel (0), it would treat freshly-acquired rows as
      * stale and reap them -- a false positive that silently releases
      * a valid claim.
      *
-     * Any ereport between issuing the token and publishing it (Assert
-     * failure on a corrupted procno, a CHECK_FOR_INTERRUPTS in this
-     * path) would leave us with a token that was never published.
+     * Any ereport between issuing the token and publishing it (the
+     * FATAL on an out-of-range procno below, for example) would leave
+     * us with a token that was never published.
      * Publishing before recording XClaimMyOwnerToken keeps the slot
      * consistent on every unwind path. If a retry occurs, the next
-     * fetch_add issues a FRESH token (the counter only moves forward);
-     * that is safe because the failed attempt never published the
+     * fetch_add issues a FRESH token (the counter only moves forward).
+     * That is safe because the failed attempt never published the
      * previous value, so no row was ever stamped with it.
      *
      * Slot index = procno (0..MaxBackends-1). The compat helper picks
@@ -279,7 +385,7 @@ xclaim_ensure_owner_token(void)
 /*                                                                      */
 /* `lxid` is read VIA the compat helper which selects MyProc->lxid on   */
 /* PG 16 and MyProc->vxid.lxid on PG 17+. We deliberately read the     */
-/* TOP-LEVEL lxid; subtxn lxid would not match the shared entry's      */
+/* TOP-LEVEL lxid. A subtxn lxid would not match the shared entry's    */
 /* owner_lxid (cleanup runs at top-level xact end).                    */
 /* -------------------------------------------------------------------- */
 
@@ -371,11 +477,11 @@ xclaim_local_lookup_with_hash(const XClaimKey *key,
 /*     `!found` enforces this.                                          */
 /*                                                                      */
 /* MEMORY-CONTEXT WRAPPING (HARD invariant -- see file-top comment):    */
-/*   simplehash.h's xcl_local_insert() palloc's any growth segments    */
-/*   from CurrentMemoryContext. We MemoryContextSwitchTo the child     */
-/*   context BEFORE invoking it and restore AFTER -- dropping this     */
-/*   wrapper would let a subtxn-rolled allocation                      */
-/*   leak the shared entry.                                            */
+/*   simplehash.h allocates growth segments from the context passed    */
+/*   to xcl_local_create() (XClaimLocalContext), independently of      */
+/*   CurrentMemoryContext. The MemoryContextSwitchTo to the child      */
+/*   context BEFORE the insert and the restore AFTER are a second      */
+/*   guard for the same invariant.                                     */
 /* -------------------------------------------------------------------- */
 
 void
@@ -405,7 +511,7 @@ xclaim_local_insert_held(const XClaimKey *key,
      * which is `hash_bytes(bytes, size)` -- byte-for-byte identical to
      * our SH_HASH_KEY macro. Reusing the value keeps the simplehash
      * insert at one hash compute per slot, shared with the dynahash
-     * insert; on bulk paths every slot already holds its hashvalue
+     * insert. On bulk paths every slot already holds its hashvalue
      * in `slots[i].hashvalue` from the unpack loop.
      */
     entry = xcl_local_insert_hash(XClaimLocalSet, *key, hashvalue, &found);
@@ -443,7 +549,7 @@ xclaim_local_insert_held(const XClaimKey *key,
      *
      * The check uses XClaimMyLocalCount (not XClaimMyPeakCount). Peak is
      * a session-lifetime high-water-mark intentionally not reset by
-     * session_reset(); using it would suppress legitimate re-warnings
+     * session_reset(), so using it would suppress legitimate re-warnings
      * after a session_reset followed by a fresh accumulation cycle. The
      * one-shot guard is the per-session XClaimMyPeakWarned flag, which
      * IS reset by session_reset().
@@ -486,8 +592,8 @@ xclaim_local_reset_peak_warning(void)
 /* xclaim_local_remove                                                  */
 /*                                                                      */
 /* No-op when the local set is uninitialised or the key is absent --    */
-/* the cleanup path MUST be idempotent (xact callback may run before    */
-/* before_shmem_exit; both must tolerate already-empty state).          */
+/* the cleanup path MUST be idempotent (the xact callback and the       */
+/* backend-exit callback both reach it with possibly empty state).      */
 /* -------------------------------------------------------------------- */
 
 void
@@ -503,8 +609,7 @@ xclaim_local_remove(const XClaimKey *key)
     /*
      * simplehash's SH_DELETE deletes by key. There is no allocation
      * involved, so no MemoryContextSwitchTo wrapper is required for the
-     * HARD invariant -- still, kept inside the local-context for
-     * symmetry with insert.
+     * HARD invariant.
      */
     removed = xcl_local_delete(XClaimLocalSet, *key);
     if (removed && XClaimMyLocalCount > 0)
@@ -571,8 +676,8 @@ xclaim_local_my_owner_token(void)
 /*                                                                      */
 /* Used by the acquisition own-entry-recovery branch -- "we hold this   */
 /* entry but the local set somehow lost it". Reads CURRENT MyProc state */
-/* (live triple) -- safe during acquisition because we are mid-xact;    */
-/* the trap that proc->lxid is cleared by ProcArrayEndTransaction does  */
+/* (live triple) -- safe during acquisition because we are mid-xact.    */
+/* The trap that proc->lxid is cleared by ProcArrayEndTransaction does  */
 /* not apply on the acquisition path.                                   */
 /*                                                                      */
 /* Precondition: caller has invoked xclaim_ensure_owner_token() so      */
@@ -603,8 +708,8 @@ xclaim_shared_owner_matches_self(const XClaimEntry *shared)
 /*     EXACTLY num_partitions LWLock acquire/release cycles -- per-key  */
 /*     LWLock cycles are FORBIDDEN (MANDATORY group-by-partition).      */
 /*   * The ratio of cycles vs per-key cleanup at 750k claims is         */
-/*     750000 / 128 = ~5860 entries/partition; 128 cycles vs 750000     */
-/*     cycles == 2900x speedup.                                         */
+/*     750000 / 128 = ~5860 entries/partition, so 128 cycles vs 750000  */
+/*     cycles is a ~5860x speedup.                                      */
 /*                                                                      */
 /* Algorithm:                                                           */
 /*   1. Gather all live local-set pointers into a transient array       */
@@ -614,7 +719,7 @@ xclaim_shared_owner_matches_self(const XClaimEntry *shared)
 /*      keyspace is bounded to num_partitions (128 default), so the     */
 /*      sort is O(N + num_partitions) -- beats qsort O(N log N) for     */
 /*      typical N.                                                      */
-/*   3. Walk the sorted array; for each contiguous run with the same    */
+/*   3. Walk the sorted array. For each contiguous run with the same    */
 /*      partition_id, acquire its LWLock ONCE, HASH_REMOVE every entry  */
 /*      whose shared row matches our SAVED owner triple, then release.  */
 /*   4. xcl_local_reset() truncates the simplehash in-place. This       */
@@ -622,13 +727,13 @@ xclaim_shared_owner_matches_self(const XClaimEntry *shared)
 /*      would otherwise dominate cleanup latency for large batches.     */
 /*                                                                      */
 /* Why precomputed partition_id? At acquire time the local entry        */
-/* records `partition_id = hashvalue & (num_partitions - 1)`; cleanup   */
+/* records `partition_id = hashvalue & (num_partitions - 1)`. Cleanup   */
 /* would otherwise need to recompute hash + mask per entry under load.  */
 /* The saved value is the SOLE input to the bucket-sort key.            */
 /*                                                                      */
 /* Idempotency: if the local set is empty (count == 0) the function     */
-/* returns immediately. xact callback may run before before_shmem_exit; */
-/* both must tolerate already-empty state. ABORT re-entry after a 2PC   */
+/* returns immediately. The xact callback and the backend-exit callback */
+/* both call it with possibly empty state. ABORT re-entry after a 2PC   */
 /* PRE_PREPARE ERROR also lands here twice -- the second call is a     */
 /* no-op.                                                               */
 /* -------------------------------------------------------------------- */
@@ -653,27 +758,35 @@ xclaim_local_cleanup_held(void)
     /*
      * Allocate the pointer array inside XClaimLocalContext using the
      * NO_OOM allocator. This callback runs from xact-end
-     * (XACT_EVENT_COMMIT/ABORT) and `before_shmem_exit`; ereport(ERROR)
-     * from inside an xact callback escalates to FATAL because there is
-     * no transaction frame to roll back into. A FATAL here orphans the
-     * shared dynahash rows -- they will eventually be reaped by the
-     * stale-owner reaper, but we want to do better than that.
+     * (XACT_EVENT_COMMIT/ABORT) and from the backend-exit callback
+     * (`on_shmem_exit`), where an ereport(ERROR) must not escape. At xact
+     * end it ends in PANIC and a crash restart of the cluster: PostgreSQL
+     * either refuses to abort an already committed transaction or retries
+     * the abort until the error stack overflows. During proc_exit it
+     * escalates to FATAL, which skips the rest of the cleanup and the
+     * owner_token invalidation, so the remaining shared rows stay held
+     * until the stale-owner reaper can take them over (on PG 16 only
+     * after the PGPROC slot is reused).
      *
      * Strategy: try the bulk-grouped fast path (palloc with NO_OOM
-     * returns NULL on failure); on NULL, fall back to the per-entry
+     * returns NULL on failure). On NULL, fall back to the per-entry
      * slow path that does NO additional palloc -- it iterates the
      * simplehash directly and HASH_REMOVEs each shared row under its
      * own partition LWLock. The slow path is O(N * lwlock_cost) instead
      * of O(N + num_partitions), but it cannot ereport(ERROR) due to
      * memory pressure.
      *
+     * Known limit: MCXT_ALLOC_NO_OOM covers out-of-memory only. A request
+     * above MaxAllocSize still raises ERROR, and count * sizeof(pointer)
+     * crosses it at 134217728 held claims (2^27 on 64-bit), which needs
+     * pg_xclaim.max_claims >= 134217728 (docs/runbook.md section 9).
+     *
      * MemoryContextSwitchTo restore safety: every switch into
      * XClaimLocalContext is paired with a switch back to `old` BEFORE
-     * any code path that can ereport. The fast path's palloc calls use
-     * MCXT_ALLOC_NO_OOM, so they cannot ereport -- they return NULL.
-     * The simplehash iteration helpers do not allocate. Net: no PG_TRY
-     * is required around the body; control flow always reaches the
-     * MemoryContextSwitchTo(old) before any ereport-prone code.
+     * any code path that can ereport. Below the known limit the fast
+     * path's palloc calls cannot ereport -- they return NULL on
+     * out-of-memory. The simplehash iteration helpers do not allocate.
+     * Net: no PG_TRY is required around the body.
      */
     old = MemoryContextSwitchTo(XClaimLocalContext);
     buf = (XClaimLocalEntry **) palloc_extended(count * sizeof(XClaimLocalEntry *),
@@ -692,7 +805,7 @@ xclaim_local_cleanup_held(void)
          * We MUST NOT iterate the simplehash while mutating it, so
          * we collect at most one entry per pass and remove until the
          * count reaches zero. simplehash's iteration is safe under
-         * delete only via xcl_local_delete; we use the latter.
+         * delete only via xcl_local_delete, which this loop uses.
          */
         while (XClaimMyLocalCount > 0)
         {
@@ -709,7 +822,7 @@ xclaim_local_cleanup_held(void)
             xcl_local_start_iterate(XClaimLocalSet, &it);
             probe = xcl_local_iterate(XClaimLocalSet, &it);
             if (probe == NULL)
-                break;                  /* count out-of-sync; defensive exit */
+                break;                  /* count out-of-sync, defensive exit */
 
             saved_key    = probe->key;
             saved_hash   = probe->hashvalue;
@@ -742,7 +855,7 @@ xclaim_local_cleanup_held(void)
                      * (vs the fast path's batched flush). If a FATAL or
                      * panic interrupts the loop mid-flight, each row
                      * already removed has already had its capacity
-                     * decremented; live_capacity stays consistent with
+                     * decremented, so live_capacity stays consistent with
                      * the actual dynahash row count without needing a
                      * post-loop reconciliation. Do NOT consistency-
                      * refactor this into a deferred batch.
@@ -910,11 +1023,14 @@ xclaim_local_cleanup_held(void)
      *
      * For each entry whose shared row matches our SAVED owner triple
      * (saved_procno + saved_lxid + saved_token -- never read MyProc
-     * here; MyProc->lxid was cleared by ProcArrayEndTransaction() before
+     * here, as MyProc->lxid was cleared by ProcArrayEndTransaction() before
      * the xact callback fired), HASH_REMOVE under the partition lock.
-     * Mismatches increment cleanup_misses (the stale-owner reaper may
-     * have already removed the row, or session_reset regenerated our
-     * token -- both are valid, non-leak conditions).
+     * A mismatch (row gone, or owned by someone else) increments
+     * cleanup_misses. Normal operation never produces one: the reaper
+     * takes over only rows whose owner exited or rotated its token,
+     * and session_reset releases the held entries before it rotates
+     * the token. A non-zero counter means an entry left its live owner
+     * (a reaper false positive or corrupted shared state).
      */
     i = 0;
     while (i < count)
@@ -930,7 +1046,7 @@ xclaim_local_cleanup_held(void)
 
         /*
          * pid was computed as `hashvalue & (num_partitions - 1)` at
-         * acquisition time; same mask is applied below to map the
+         * acquisition time, and the same mask is applied below to map the
          * partition_id to its lock. partition_locks[] is indexed
          * [0, num_partitions).
          */
@@ -968,14 +1084,14 @@ xclaim_local_cleanup_held(void)
                 /*
                  * Defer the live_capacity decrement out of the
                  * partition-local hot loop. A non-atomic local counter
-                 * accumulates removals across ALL partitions; a SINGLE
+                 * accumulates removals across ALL partitions, and a SINGLE
                  * pg_atomic_fetch_sub_u64 fires after the partition sweep
                  * completes. For a 50000-entry batch this collapses
                  * 50000 atomic ops on the shared live_capacity cache
                  * line into 1.
                  *
                  * Correctness: live_capacity is a free-running counter not
-                 * protected by any partition lock; the eventual aggregate
+                 * protected by any partition lock. The eventual aggregate
                  * delta is identical whether each row decrements
                  * separately or the whole batch decrements once at the
                  * end. Concurrent readers (xclaim.stats(), watermark
@@ -987,11 +1103,9 @@ xclaim_local_cleanup_held(void)
             else
             {
                 /*
-                 * Defensive cleanup miss: shared row already gone (reaper
-                 * raced us, or different owner now -- e.g. previous
-                 * session_reset rotated our token and another backend
-                 * reaped the entry, then re-acquired). Counter is for
-                 * diagnostic only; SHOULD remain 0 under normal load.
+                 * Cleanup miss: the row is gone or belongs to another
+                 * owner. Normal operation never gets here (see the sweep
+                 * comment above), so the counter flags a defect.
                  */
                 pg_atomic_fetch_add_u64(&XClaimCtl->cleanup_misses, 1);
             }
@@ -1012,7 +1126,7 @@ xclaim_local_cleanup_held(void)
 
     /*
      * Truncate the simplehash in-place. xcl_local_reset() is a single
-     * memset over the bucket array; it preserves the arena so the next
+     * memset over the bucket array. It preserves the arena so the next
      * acquisition burst reuses already-allocated pages. We deliberately
      * AVOID MemoryContextReset on the hot path because returning blocks
      * to glibc invokes munmap for large allocations, triggering a TLB
@@ -1050,8 +1164,8 @@ xclaim_local_clear_owner_token(void)
      * Publish 0 (invalid sentinel) into our slot so any conflicting
      * backend's stale-owner reaper sees a token mismatch on the saved
      * owner_token of any leftover shared row and reaps it. Reads of
-     * the slot are unlocked atomic loads; we use atomic write here for
-     * publication consistency.
+     * the slot are unlocked atomic loads, and we use an atomic write here
+     * for publication consistency.
      */
     procno = xclaim_get_current_procno();
     if (procno >= 0 && procno < MaxBackends)

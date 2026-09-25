@@ -13,26 +13,26 @@
 #      branch-misses, page-faults, context-switches, cpu-migrations.
 #   3. Wait events -- `pg_wait_sampling` profile snapshot. Answers
 #      "what was the backend WAITING on when it was OFF-CPU?". A pure
-#      FlameGraph cannot see this; this is the critical complementary
-#      data point.
+#      FlameGraph cannot see this, so wait events are the critical
+#      complementary data point.
 #
 # The four scenarios mirror `record_flamegraphs.sh`:
 #   1. scalar-acquire        -- single-backend scalar `xclaim.try`
 #   2. bulk-try-many         -- single-backend bulk `xclaim.try_many`
-#   3. cleanup-commit        -- 50 transactions x 50k commit cleanup
+#   3. cleanup-commit        -- one COMMIT cleanup of 50 x 50k claims (2.5M)
 #   4. concurrent-contention -- 10 backends x 100k overlapping keys
 #
 # Output layout:
-#   docs/perf/flamegraphs/<scenario>.svg          -- existing path
-#   docs/perf/perf-stat/<scenario>.txt            -- new: HW counters
-#   docs/perf/wait-events/<scenario>.csv          -- new: wait_event profile
+#   docs/perf/flamegraphs/<scenario>.svg          -- FlameGraph, as in record_flamegraphs.sh
+#   docs/perf/perf-stat/<scenario>.txt            -- HW counters
+#   docs/perf/wait-events/<scenario>.csv          -- wait_event profile
 #
 # Usage:
 #   sudo scripts/record_perf_evidence.sh                # auto pg_config 17
 #   sudo scripts/record_perf_evidence.sh /path/to/pg_config
 #
 # Requirements:
-#   - Linux (perf record); the script aborts on non-Linux.
+#   - Linux (perf record). The script aborts on non-Linux.
 #   - Run as root (perf needs CAP_PERFMON, kernel symbol resolution needs
 #     root, pg_wait_sampling capture queries are unprivileged).
 #   - sysctl kernel.kptr_restrict / kernel.perf_event_paranoid handled
@@ -49,7 +49,7 @@
 #
 # HARD INVARIANTS:
 #   - set -euo pipefail
-#   - /tmp temp cluster only; trap cleanup
+#   - /tmp temp cluster only, trap cleanup
 #   - locale ru_RU.UTF-8
 
 set -euo pipefail
@@ -102,7 +102,7 @@ if [[ -z "$PG_CONFIG_BIN" ]]; then
     fi
 fi
 if [[ -z "$PG_CONFIG_BIN" || ! -x "$PG_CONFIG_BIN" ]]; then
-    echo "record_perf_evidence: no usable pg_config; pass as argument or set PG_CONFIG" >&2
+    echo "record_perf_evidence: no usable pg_config, pass as argument or set PG_CONFIG" >&2
     exit 2
 fi
 
@@ -122,7 +122,7 @@ fi
 PGDATA="$(mktemp -d "/tmp/pg_xclaim_evidence_${USER:-root}_$$.XXXXXX")"
 
 # Free-port probe -- python3 is available on Linux CI/dev hosts. A blind
-# 55880+RANDOM%200 pick can collide with an in-use port and fail boot.
+# random port pick can collide with an in-use port and fail boot.
 PGPORT="$(python3 -c '
 import socket
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -169,7 +169,7 @@ echo "record_perf_evidence: FLAME_DIR=$FLAME_DIR PERFSTAT_DIR=$PERFSTAT_DIR WAIT
 # otherwise die silently with no diagnostic.
 if ! INITDB_OUT="$(runuser -u "$RUN_USER" -- "$PGBIN/initdb" -D "$PGDATA" --locale=ru_RU.UTF-8 \
         -E UTF8 --auth=trust -U postgres 2>&1)"; then
-    echo "record_perf_evidence: initdb failed; output follows:" >&2
+    echo "record_perf_evidence: initdb failed, output follows:" >&2
     printf '%s\n' "$INITDB_OUT" >&2
     exit 1
 fi
@@ -184,8 +184,8 @@ pg_xclaim.expected_claims_per_backend = 1048576
 log_min_messages = warning
 logging_collector = off
 max_connections = 64
-# 10ms sampling -> ~100 samples/sec/backend; over 12s = 1200 samples,
-# enough for top-10 wait event resolution per backend.
+# 10ms sampling -> ~100 samples/sec/backend. A 12s window gives 1200
+# samples, enough for top-10 wait event resolution per backend.
 pg_wait_sampling.profile_period = 10
 pg_wait_sampling.profile_pid = true
 CONF
@@ -340,7 +340,7 @@ for leaf, cnt in agg.most_common(15):
     # Parse + echo headline metrics. The `|| true` keeps the loop alive
     # even if parsing hits an unexpected `perf stat` layout (e.g. a
     # counter labeled "<not counted>" or "<not supported>" on a kernel
-    # that lacks the event); the raw .txt is always preserved.
+    # that lacks the event). The raw .txt is always preserved.
     python3 - "$PERF_STAT_OUT" 2>&1 <<'PYEOF' || true
 import re, sys
 path = sys.argv[1]

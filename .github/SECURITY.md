@@ -3,11 +3,11 @@
 ## Supported versions
 
 `pg_xclaim` is in **release-candidate** state. Security fixes land on
-the current tag (`v1.0.0-rc1`) and on `main`.
+the current tag (`v1.0.0-rc2`) and on `main`.
 
 | Version | Security fixes |
 |---------|----------------|
-| `v1.0.0-rc1` (current) / `main` | Yes |
+| `v1.0.0-rc2` (current) / `main` | Yes |
 
 PostgreSQL major-version matrix: PG 16, 17, 18 (upstream and
 ABI-compatible forks). Security fixes apply to all three majors
@@ -26,7 +26,7 @@ Suspected security issues include:
   that crashes the cluster, exhausts shared memory irrecoverably, or
   permanently deadlocks the LockManager).
 - Anything that breaks the cleanup-correctness invariant
-  (`cleanup_misses` increasing without a clear root cause; orphaned
+  (`cleanup_misses` increasing without a clear root cause, or orphaned
   shared rows that the reaper cannot collect).
 
 **Do not file a public GitHub issue for security reports.** Instead,
@@ -41,13 +41,13 @@ When reporting, please include:
 - Minimal reproduction (SQL or shell snippet).
 - Observed behaviour and the impact you believe it has.
 - Whether the issue is already public (e.g. discussed on a mailing
-  list); if so, where.
+  list) and, if so, where.
 
 ## What is not a security issue
 
 - Performance regressions or sizing surprises under legitimate load
-  (`capacity_errors > 0`, `cleanup_misses > 0` because the cluster
-  outgrew its `pg_xclaim.max_claims` budget). Open a regular GitHub
+  (`capacity_errors > 0` because the cluster outgrew its
+  `pg_xclaim.max_claims` budget). Open a regular GitHub
   issue with `xclaim.stats()` output and the server log excerpt -- see
   `.github/ISSUE_TEMPLATE/bug_report.md`.
 - Documented limitations: 2PC rejection at `PRE_PREPARE`, hot-standby
@@ -80,7 +80,7 @@ REVOKE EXECUTE ON FUNCTION xclaim.try_many(int4, int4[]) FROM PUBLIC;
 Setting `pg_xclaim.on_capacity_exhaustion=warn` degrades to a failed
 acquisition (the call returns `false` instead of raising), which keeps
 unrelated sessions running but lets the exhausting role deny claims to
-others. Privilege restriction is the primary mitigation; the `warn`
+others. Privilege restriction is the primary mitigation. The `warn`
 fallback only softens the blast radius.
 
 ## Disclosure policy

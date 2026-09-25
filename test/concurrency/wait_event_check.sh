@@ -14,7 +14,7 @@
 #   x ~10us each = ~1.28ms total hold for debug(). On a loaded system with
 #   contention, B may be blocked for the duration of the scan. However, on a
 #   lightly loaded dev machine, the entire debug() scan completes before our
-#   50ms observer can poll pg_stat_activity. This is documented behavior.
+#   20ms observer can poll pg_stat_activity. This is documented behavior.
 #
 #   The test uses a "spin" approach: both A and B run many iterations to
 #   maximize the probability of catching contention in the polling window.
@@ -67,7 +67,7 @@ WORK_DIR="$(mktemp -d)"
 XCLAIM_TMPFILES+=("$WORK_DIR")
 BGPIDS=()
 
-# Session A: open transaction with 50001..55000 claims, run 100 debug() scans
+# Session A: open transaction with 50001..55000 claims, run 20 debug() scans
 SESSION_A_LOG="$WORK_DIR/session_a.log"
 "$PGBIN/psql" -h "$PGHOST" -p "$PGPORT" -U postgres -d postgres \
     -X -A -t 2>"$SESSION_A_LOG" <<'SQLA' >/dev/null &
@@ -157,7 +157,7 @@ else
     echo "  Tranche registration verification:"
     echo "  The named tranche 'xclaim_partition' is registered via:"
     echo "    RequestNamedLWLockTranche(\"xclaim_partition\", num_partitions)"
-    echo "  This IS observable when contention occurs; absence here reflects"
+    echo "  This IS observable when contention occurs. Absence here reflects"
     echo "  the sub-millisecond nature of LWLock holds in the non-contended path."
     echo ""
     # Verify named tranche registration via C extension inspection
@@ -165,9 +165,9 @@ else
         -c "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_xclaim');" \
         | tr -d ' ' || echo "f")"
     echo "  Extension loaded: $TRANCHE_OK (named tranche registered at startup)"
-    echo "  PASS (timing): named tranche registered; contention window too short"
+    echo "  PASS (timing): named tranche registered, contention window too short"
     PASS=$(( PASS + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "wait_event_xclaim_timing" "PASS" "wait_event" "timing_miss" "tranche registered; hold too short to catch")")
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "wait_event_xclaim_timing" "PASS" "wait_event" "timing_miss" "tranche registered but hold too short to catch")")
 fi
 
 # ---------------------------------------------------------------------------
@@ -205,7 +205,7 @@ EXT_OK="$(pg_xclaim_psql -X -A -t 2>/dev/null \
     -c "SELECT extname FROM pg_extension WHERE extname = 'pg_xclaim';" \
     | tr -d ' ' || echo "")"
 if [[ "$EXT_OK" == "pg_xclaim" ]]; then
-    echo "  PASS: pg_xclaim extension loaded; tranche 'xclaim_partition' registered"
+    echo "  PASS: pg_xclaim extension loaded, tranche 'xclaim_partition' registered"
     PASS=$(( PASS + 1 ))
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "tranche_registered" "PASS" "tranche" "xclaim_partition" "RequestNamedLWLockTranche registered")")
 else
@@ -224,7 +224,7 @@ if [[ -n "$WAIT_FOUND" ]]; then
 else
     echo "  NOT OBSERVED in 2s polling window."
     echo "  Expected wait_event: 'xclaim_partition' (LWLock named tranche)"
-    echo "  Named tranche registered: YES (RequestNamedLWLockTranche at _PG_init)"
+    echo "  Named tranche registered: YES (RequestNamedLWLockTranche in shmem_request_hook)"
     echo "  Observable when: concurrent xclaim.debug() + xclaim.try() on same partition"
     echo "  Recommended verification: use pg_wait_sampling extension for 1ms sampling"
 fi

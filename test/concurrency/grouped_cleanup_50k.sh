@@ -9,9 +9,12 @@
 # Why <100ms? Group-by-partition cleanup:
 #   128 partitions (default) = up to 128 LWLock cycles (acquire/release
 #   per partition that has entries). Each cycle is ~1-10 microseconds.
-#   Worst case 128 x 10us = 1.28ms. The 100ms bound is conservative;
-#   per-key cleanup would be 50000 x 1-3us = 50-150ms. This test
-#   validates the >50x speedup the cleanup driver promises.
+#   Worst case 128 x 10us = 1.28ms. This counts the lock cycles only:
+#   the 50000 HASH_FIND + HASH_REMOVE pairs made under those locks come
+#   on top. The 100ms bound is conservative.
+#   Per-key cleanup would be 50000 x 1-3us = 50-150ms. The latency
+#   checks are absolute bounds (see Test 3): the test runs no per-key
+#   cleanup to compare against, so it measures no speedup ratio.
 #
 # HARD INVARIANTS: set -euo pipefail, /tmp cluster, ru_RU.UTF-8, trap cleanup
 set -euo pipefail
@@ -165,12 +168,12 @@ ACQUIRE_ONLY_MS=$(( T_ACQ_END - T_ACQ_START ))
 # COMMIT overhead = total - acquire_with_rollback (rollback also triggers cleanup)
 # More accurately: cleanup happens at both COMMIT and ROLLBACK.
 # Use: compare COMMIT path vs baseline from total timing.
-# Conservative estimate: commit latency ~= total_ms / 2 for symmetric acquire/commit
+# When the difference is not positive, the estimate falls back to total_ms.
 COMMIT_ESTIMATE_MS=$(( TOTAL_MS - ACQUIRE_ONLY_MS > 0 ? TOTAL_MS - ACQUIRE_ONLY_MS : TOTAL_MS ))
 echo "  Acquire+ROLLBACK reference: ${ACQUIRE_ONLY_MS}ms"
 echo "  Commit-path delta estimate: ${COMMIT_ESTIMATE_MS}ms"
 
-# The critical assertion: total commit path must be < LATENCY_BUDGET_MS
+# Soft check on the total commit path: at 5x LATENCY_BUDGET_MS or more it only warns.
 # We use TOTAL_MS as conservative upper bound (includes both acquire and commit).
 # Even the TOTAL including all SQL overhead should be well under budget for
 # a 128-partition grouped cleanup at 50k entries.
@@ -181,7 +184,7 @@ if (( TOTAL_MS < LATENCY_BUDGET_MS * 5 )); then
     PASS=$(( PASS + 1 ))
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "commit_latency_total" "PASS" "total_ms" "$TOTAL_MS" "within ceiling")")
 else
-    echo "  WARN: total acquire+COMMIT=${TOTAL_MS}ms exceeds ceiling; likely acquire overhead"
+    echo "  WARN: total acquire+COMMIT=${TOTAL_MS}ms exceeds ceiling, likely acquire overhead"
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "commit_latency_total" "PASS" "total_ms" "$TOTAL_MS" "warn: high latency")")
     PASS=$(( PASS + 1 ))
 fi
@@ -202,8 +205,8 @@ SQLEOF3
 # Force the C locale on this invocation only: psql's \timing prints the
 # label in the active locale ("Time:" in C, "Время:" under ru_RU), and the
 # parser below greps for "Time:". LC_ALL/LC_MESSAGES=C make it deterministic
-# regardless of the temp cluster's ru_RU.UTF-8 setup; the wall-clock fallback
-# still covers any unexpected format.
+# regardless of the temp cluster's ru_RU.UTF-8 setup, and the wall-clock
+# fallback still covers any unexpected format.
 TIMING_OUTPUT="$(LC_ALL=C LC_MESSAGES=C pg_xclaim_psql -X -A -t -f "$TIMING_SQL_FILE" 2>&1)"
 rm -f "$TIMING_SQL_FILE"
 
@@ -232,8 +235,8 @@ if [[ -n "$COMMIT_TIMING" ]]; then
 fi
 
 if [[ -z "$COMMIT_MS_PSQL" ]]; then
-    echo "  INFO: could not parse \\timing output; using wall-clock fallback"
-    # Wall-clock fallback: measure COMMIT-only step
+    echo "  INFO: could not parse \\timing output, using wall-clock fallback"
+    # Wall-clock fallback: measure the whole acquire+COMMIT step
     T_C_START="$(xclaim_now_ms)"
     pg_xclaim_psql -X -A -t >/dev/null 2>/dev/null <<SQLCOMMIT
 BEGIN;

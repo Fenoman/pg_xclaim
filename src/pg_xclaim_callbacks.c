@@ -2,7 +2,7 @@
  *
  * pg_xclaim_callbacks.c
  *      Xact callback (group-by-partition cleanup) and
- *      `before_shmem_exit` cleanup, with 2PC reject in
+ *      `on_shmem_exit` backend-exit cleanup, with 2PC reject in
  *      `XACT_EVENT_PRE_PREPARE`.
  *
  * Lifecycle contract:
@@ -19,18 +19,31 @@
  *   deliberately tied to the post-outcome COMMIT/ABORT callbacks so we
  *   never release a claim before the transaction outcome is known. The
  *   PRE_PREPARE event is used ONLY to reject 2PC (PREPARE TRANSACTION)
- *   when claims are held; the subsequent ABORT re-entry then runs
+ *   when claims are held. The subsequent ABORT re-entry then runs
  *   cleanup.
  *
- *   xclaim_shmem_exit_cb is `before_shmem_exit` -- shared memory and
- *   LWLocks are still live at that point. The xact callback usually
- *   ran first (normal disconnect / FATAL re-driven abort), but on
- *   pathological exit paths cleanup may have been skipped; this hook
- *   is the safety net. It is idempotent with the xact callback (early-
- *   return when local set is empty).
+ *   xclaim_shmem_exit_cb is an `on_shmem_exit` callback. Each backend
+ *   registers it on its first claim (xclaim_ensure_owner_token()),
+ *   because in fork-based builds InitPostmasterChild() clears the
+ *   exit-callback lists a backend would otherwise inherit from the
+ *   postmaster. It runs after every before_shmem_exit callback, so
+ *   ShutdownPostgres has already aborted a transaction left open at
+ *   exit and the xact callback has released its claims. It runs before
+ *   ProcKill(), which InitProcess() registered earlier, so MyProc and
+ *   the partition LWLocks are still usable. It releases the claims that
+ *   abort did not: when a sibling extension's xact callback called
+ *   ahead of ours raises ERROR in it, the ERROR becomes FATAL during
+ *   exit and skips the rest of the chain. It then invalidates the
+ *   backend's published owner_token. It is idempotent with the xact
+ *   callback (early return when the local set is empty).
  *
- *   Hard-process-death caveat: SIGKILL/segfault does NOT fire
- *   `before_shmem_exit`. PostgreSQL treats unexpected backend death as
+ *   A failing sibling callback does not leave claims behind in a
+ *   running backend: PostgreSQL aborts the transaction and calls every
+ *   xact callback again with XACT_EVENT_ABORT, or, when the transaction
+ *   has an xid and the failure hit XACT_EVENT_COMMIT, ends in PANIC.
+ *
+ *   Hard-process-death caveat: SIGKILL/segfault does NOT fire exit
+ *   callbacks. PostgreSQL treats unexpected backend death as
  *   a child crash and crash-restarts shared memory, so ordinary hard
  *   backend death does not leave rows for the lazy reaper. The reaper is
  *   a defensive path for extension-level stale-owner signals (slot reuse
@@ -44,7 +57,7 @@
  *   callback (where MyProcNumber / lxid / owner_token would not match
  *   the saved triple). We reject up front in PRE_PREPARE with
  *   ERRCODE_FEATURE_NOT_SUPPORTED. The ERROR triggers ABORT, which
- *   re-enters the same callback; cleanup runs on that ABORT pass
+ *   re-enters the same callback, and cleanup runs on that ABORT pass
  *   (idempotent re-entry).
  *
  * Performance contract:
@@ -82,7 +95,7 @@
 /*                                                                      */
 /* All other events (PRE_COMMIT / PARALLEL_PRE_COMMIT / PREPARE /       */
 /* etc.) are no-ops. Cleanup before the transaction outcome is known    */
-/* would release claims too early; using PREPARE (vs PRE_PREPARE) for   */
+/* would release claims too early. Using PREPARE (vs PRE_PREPARE) for   */
 /* the user-facing reject is also too late -- by then the xact has      */
 /* crossed into prepare cleanup paths and the operator gets a much less */
 /* actionable error.                                                    */
@@ -141,9 +154,10 @@ xclaim_xact_callback(XactEvent event, void *arg)
              * gate.
              *
              * Idempotent: xclaim_local_cleanup_held() early-returns if
-             * the local set is empty, so PRE_PREPARE -> ABORT re-entry
-             * (which runs cleanup, then before_shmem_exit re-runs the
-             * same path) is a no-op on the second pass.
+             * the local set is empty, so a second pass is a no-op. That
+             * covers the ABORT re-entry after a rejected PRE_PREPARE and
+             * xclaim_shmem_exit_cb, which runs after the final abort at
+             * backend exit.
              *
              * MyProc state has already been cleared by
              * ProcArrayEndTransaction() at this point -- the cleanup
@@ -158,7 +172,7 @@ xclaim_xact_callback(XactEvent event, void *arg)
         case XACT_EVENT_PREPARE:
             /*
              * Idempotent no-op. Cleanup before outcome is known would
-             * release claims too early; throwing the 2PC ERROR from
+             * release claims too early. Throwing the 2PC ERROR from
              * XACT_EVENT_PREPARE is also too late (the xact has crossed
              * into prepare cleanup).
              */
@@ -169,19 +183,35 @@ xclaim_xact_callback(XactEvent event, void *arg)
 /* -------------------------------------------------------------------- */
 /* xclaim_shmem_exit_cb                                                 */
 /*                                                                      */
-/* `before_shmem_exit` (NOT on_shmem_exit, NOT on_proc_exit -- HARD     */
-/* invariant):                                                          */
-/*   * before_shmem_exit: shared memory and LWLocks still live -- safe  */
-/*     to acquire partition locks for cleanup.                          */
-/*   * on_shmem_exit:    too late, LWLocks may already be torn down.    */
-/*   * on_proc_exit:     even later.                                    */
+/* `on_shmem_exit`, registered by the backend after InitProcess() (HARD */
+/* invariant), once per backend, by xclaim_ensure_owner_token() on the  */
+/* first claim. Every before_shmem_exit callback runs before any        */
+/* on_shmem_exit callback, and each list runs in reverse registration   */
+/* order:                                                               */
+/*   * ShutdownPostgres (before_shmem_exit) has already aborted a       */
+/*     transaction left open at exit, and the xact callback has         */
+/*     released its claims.                                             */
+/*   * ProcKill (on_shmem_exit, registered by InitProcess() before this */
+/*     callback) has not run yet, so MyProc is set and the partition    */
+/*     LWLocks can be taken, as core's RemoveProcFromArray does from    */
+/*     the same list.                                                   */
+/*   * Not before_shmem_exit: a PG_ENSURE_ERROR_CLEANUP scope around    */
+/*     the first claim removes its own before_shmem_exit entry with     */
+/*     cancel_before_shmem_exit(), which fails if a newer entry sits on */
+/*     top. Not on_proc_exit: it runs after ProcKill().                 */
 /*                                                                      */
-/* On normal disconnect / SIGTERM / FATAL error this fires AFTER the    */
-/* xact callback has already cleaned. The local set is empty by then    */
-/* and xclaim_local_cleanup_held() returns immediately. Idempotent.     */
+/* Never registered from _PG_init: in fork-based builds                 */
+/* InitPostmasterChild() calls on_exit_reset(), so no exit callback the */
+/* postmaster registers survives into a backend.                        */
+/*                                                                      */
+/* The local set is normally empty here and the cleanup call returns    */
+/* immediately. It still holds entries when a sibling's xact callback   */
+/* called ahead of ours failed in the abort at exit (the ERROR becomes  */
+/* FATAL and skips the rest of the chain). The cleanup releases them.   */
+/* Idempotent.                                                          */
 /*                                                                      */
 /* On hard process death (e.g. SIGKILL/SIGSEGV) this callback does not */
-/* fire in the dead backend; PostgreSQL crash-restarts shared memory.  */
+/* fire in the dead backend. PostgreSQL crash-restarts shared memory.  */
 /*                                                                      */
 /* The lazy stale-owner reaper is therefore a defensive path for       */
 /* extension-level stale-owner signals, not the primary hard-crash     */
@@ -200,53 +230,34 @@ xclaim_shmem_exit_cb(int code, Datum arg)
         return;
 
     /*
-     * Defensive cleanup -- usually a no-op because the xact callback
-     * already ran. Idempotent by xclaim_local_cleanup_held()'s
+     * Release the claims the abort at exit did not: a sibling's xact
+     * callback called ahead of ours that fails in that abort ends the
+     * chain with FATAL. Normally the abort released them and the set
+     * is empty here. Idempotent by xclaim_local_cleanup_held()'s
      * early-return when the local set is empty.
      */
     xclaim_local_cleanup_held();
 
     /*
-     * Force-invalidate our published owner_token before releasing the
-     * backend slot. Closes a narrow ABA window:
+     * Invalidate our published owner_token before the backend slot is
+     * released. The stale-owner reaper judges a leftover row by the
+     * PGPROC slot of its owner (pid) and by the token published in
+     * XClaimBackendInfos. On PG 16 ProcKill() leaves the exited
+     * backend's pid in its PGPROC slot until the slot is reused, so the
+     * pid checks keep treating a leftover row of this backend as live.
+     * On PG 17+ the pid is cleared, but a new backend that reuses the
+     * slot with the same OS pid and never calls pg_xclaim would pass the
+     * pid checks the same way. Leftover rows are only possible after an
+     * incomplete cleanup path, and writing 0 (the reserved-invalid token
+     * sentinel) makes the token check fail for all of them: the next
+     * conflicting backend's reaper sees published_token == 0 !=
+     * entry->owner_token and reaps the row. xclaim.session_reset uses
+     * the same atomic write for the same reason.
      *
-     *   1. This backend's xact callback removed every shared row it
-     *      owned; local set is empty.
-     *   2. We exit gracefully and our PGPROC slot is freed.
-     *   3. A new backend grabs the same procno AND -- on OSes with a
-     *      small pid_max and high backend turnover -- coincidentally the
-     *      same OS pid. If that backend never invokes pg_xclaim, it
-     *      never calls xclaim_ensure_owner_token() and the published
-     *      token in our old slot stays at our value.
-     *   4. Should any leftover row owned by our OLD token still exist in
-     *      shared memory (only possible after an incomplete cleanup path),
-     *      the stale-owner reaper would
-     *      observe pid_match + token_match and treat the orphan as
-     *      live, defeating recovery.
-     *
-     * Writing 0 (the reserved-invalid token sentinel) into our slot at
-     * exit defangs the third signal of xclaim_is_stale_owner: the next
-     * conflicting backend's reaper will see published_token == 0 !=
-     * entry->owner_token and reap the row. xclaim.session_reset uses
-     * the same atomic write for the same reason; this exit-cb mirrors
-     * its publication contract for the backend-lifetime boundary.
-     *
-     * Gate the procno read on MyProc != NULL. `before_shmem_exit` fires
-     * in every process that inherited this callback registration via
-     * fork() from the postmaster -- including PostgreSQL's auxiliary
-     * subprocesses (checkpointer, walwriter, bgwriter, etc.). Those
-     * aux procs do not occupy a slot in XClaimBackendInfos[0..MaxBackends),
-     * and a process whose MyProc is already NULL (e.g. one exiting before
-     * InitProcess, or a re-entrant teardown) has no procno to publish.
-     * xclaim_get_current_procno() dereferences MyProc on PG 16; without
-     * this guard, an aux-proc shutdown
-     * pass would segfault, postmaster would treat it as a child crash
-     * and refuse to complete the shutdown sequence, hanging the
-     * cluster stop.
-     *
-     * The same guard also protects against an extremely late teardown
-     * where XClaimBackendInfos is mid-detach; observability over
-     * correctness, but free.
+     * MyProc is set here: ProcKill(), which clears it, is an
+     * on_shmem_exit callback that InitProcess() registered before this
+     * one, so it runs after this one. The check stays as a guard for
+     * xclaim_get_current_procno(), which dereferences MyProc on PG 16.
      */
     if (MyProc == NULL || XClaimBackendInfos == NULL)
         return;

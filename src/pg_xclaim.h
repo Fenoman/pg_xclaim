@@ -37,8 +37,8 @@ extern int  xclaim_capacity_behavior;           /* XClaimCapBehavior enum   */
 
 /* -------------------------------------------------------------------- */
 /* Capacity-exhaustion enum.                                            */
-/* Defined here so DefineCustomEnumVariable in _PG_init has access; the */
-/* acquisition path is the actual consumer.                             */
+/* Defined here so DefineCustomEnumVariable in _PG_init has access,     */
+/* while the acquisition path is the actual consumer.                   */
 /* -------------------------------------------------------------------- */
 
 typedef enum XClaimCapBehavior
@@ -85,7 +85,7 @@ extern bool xclaim_state_initialized;
             ereport(ERROR,                                                  \
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),                \
                      errmsg("pg_xclaim does not support hot-standby/recovery mode"), \
-                     errhint("Remove from shared_preload_libraries on standby clusters"))); \
+                     errhint("Calls succeed once the server is promoted, so keep pg_xclaim in shared_preload_libraries on standbys."))); \
     } while (0)
 
 /* -------------------------------------------------------------------- */
@@ -97,13 +97,13 @@ extern Size xclaim_shmem_size(void);
 extern void xclaim_shmem_startup(void);
 extern void xclaim_install_shmem_hook(void);
 
-/* pg_xclaim_callbacks.c: xact callback + before_shmem_exit callback. */
+/* pg_xclaim_callbacks.c: xact callback + backend-exit (on_shmem_exit) callback. */
 extern void xclaim_xact_callback(XactEvent event, void *arg);
 extern void xclaim_shmem_exit_cb(int code, Datum arg);
 
 /* pg_xclaim_acquire.c: main 12-step acquisition algorithm + capacity
  * dispatch. The full XClaimKey / XClaimEntry types live in
- * pg_xclaim_internal.h; we forward-declare here so this header stays
+ * pg_xclaim_internal.h. We forward-declare here so this header stays
  * free of internal headers and remains includable from any TU. */
 struct XClaimKey;
 struct XClaimEntry;
@@ -114,15 +114,15 @@ extern bool xclaim_handle_capacity_exhaustion(const struct XClaimKey *lk);
  * pg_xclaim_stats.c: capacity-watermark logging.
  *
  * Both bodies live in pg_xclaim_stats.c (where the static suppression
- * timestamp is colocated with the stats counters they report against);
- * the acquisition path in pg_xclaim_acquire.c is the only caller.
+ * timestamp is colocated with the stats counters they report against),
+ * and the acquisition path in pg_xclaim_acquire.c is the only caller.
  *
  * xclaim_check_capacity_watermark is the call site exposed to the
- * acquisition path; it reads the live used count and forwards to
- * xclaim_capacity_watermark_check, which does the actual comparison.
+ * acquisition path. It forwards to xclaim_capacity_watermark_check,
+ * which reads the live used count and does the actual comparison.
  *
  * Called from the acquisition path AFTER a successful HASH_ENTER (so the
- * `used` count just incremented). Compares used / max_claims against the
+ * live used count just incremented). Compares used / max_claims against the
  * 80/90/95% thresholds, with a 60-second suppression window to avoid log
  * floods during sustained capacity pressure.
  */
@@ -130,7 +130,7 @@ extern void xclaim_check_capacity_watermark(uint64 used);
 extern void xclaim_capacity_watermark_check(uint64 used);
 
 /* pg_xclaim_reaper.c: lazy stale-owner reaper consulted by the
- * acquisition conflict path under the partition LWLock; true => the
+ * acquisition conflict path under the partition LWLock. On true the
  * caller takes over the entry by overwriting its owner triple in place. */
 extern bool xclaim_is_stale_owner(const struct XClaimEntry *entry);
 

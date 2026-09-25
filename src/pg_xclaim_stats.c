@@ -9,15 +9,16 @@
  *   xclaim.count             -- backend-local count, PARALLEL RESTRICTED
  *                               STABLE.
  *   xclaim.debug             -- consistent, all-partition LWLock,
- *                               superuser only; PARALLEL UNSAFE STABLE.
+ *                               superuser only. PARALLEL UNSAFE STABLE.
  *   xclaim.debug_snapshot    -- all-partition shared LWLock snapshot,
- *                               pg_monitor; PARALLEL RESTRICTED STABLE.
- *   xclaim.stats             -- 14 columns (counters / gauges); 80/90/95%
+ *                               pg_monitor. PARALLEL RESTRICTED STABLE.
+ *   xclaim.stats             -- 14 columns (counters / gauges), 80/90/95%
  *                               capacity watermark logging with 60s
  *                               suppression. PARALLEL RESTRICTED STABLE.
- *   pg_xclaim.enabled = off  -- count, stats, debug, debug_snapshot all
- *                               return zero/empty without touching shared
- *                               state and bump `disabled_calls`.
+ *   pg_xclaim.enabled = off  -- count, debug, debug_snapshot return
+ *                               zero/empty without reading the shared
+ *                               hash, stats still reads its counters,
+ *                               and all four bump `disabled_calls`.
  *   xclaim.debug_inject_stale -- superuser-only test helper that seeds
  *                                an XClaimEntry with a guaranteed-stale
  *                                owner triple so the reaper test can
@@ -27,13 +28,14 @@
  * HARD invariants enforced here:
  *   * stats counters read via pg_atomic_read_u64 (lock-free atomic load).
  *   * watermark logging uses static last-warn timestamp + threshold
- *     comparisons; emits at most one message per 60s per backend.
+ *     comparisons. Within 60s of its last message a backend emits
+ *     again only on a climb into a higher band.
  *   * debug_snapshot holds ALL partition LWLocks SHARED for the entire
  *     scan because dynahash has no "scan one partition" iterator.
  *   * debug holds ALL partition LWLocks SHARED for the entire scan and
  *     releases them on PG_CATCH (LWLockReleaseAll for ERROR paths).
- *   * Tuplestore SRF MaterializeMode pattern; per-query memory context
- *     for tuplestore allocation; rsinfo ReturnSetInfo validated.
+ *   * Tuplestore SRF MaterializeMode pattern: per-query memory context
+ *     for tuplestore allocation, rsinfo ReturnSetInfo validated.
  *
  *-------------------------------------------------------------------------
  */
@@ -77,7 +79,7 @@
 /* shared timestamp would silence the leader once and never wake up).  */
 /*                                                                      */
 /* Precomputed absolute thresholds.                                    */
-/* The acquisition hot path used to evaluate                            */
+/* The acquisition hot path avoids evaluating                           */
 /*   pct = (100 * capacity_used) / max_claims                           */
 /* on every successful HASH_ENTER -- a 64-bit integer division costs   */
 /* 10-40 cycles on aarch64/amd64. max_claims is PGC_POSTMASTER (frozen */
@@ -94,11 +96,11 @@ static int   xcl_threshold_warn_seen_pct = -1;  /* last warn_pct used  */
 
 #define XCLAIM_WATERMARK_SUPPRESSION_USEC ((int64) 60 * USECS_PER_SEC)
 
-/* Per-backend last-emit timestamp; persists for the backend's lifetime. */
+/* Per-backend last-emit timestamp, kept for the backend's lifetime. */
 static TimestampTz xclaim_last_watermark_log = 0;
 
 /* Per-backend "highest observed band" (0=none, warn_pct=warn band,
- * 90=90%, 95=95%; warn_pct comes from pg_xclaim.capacity_warn_pct).
+ * 90=90%, 95=95%, where warn_pct comes from pg_xclaim.capacity_warn_pct).
  * Resets when capacity drops below warn_pct so a subsequent climb
  * re-fires. */
 static int         xclaim_last_watermark_band = 0;
@@ -109,7 +111,7 @@ static int         xclaim_last_watermark_band = 0;
  *      (and thus after the dynahash entry-count has incremented). Cheap
  *      no-op when capacity is below the configured warn percentage.
  *
- *      The `used` argument is unused; the body reads `capacity_used`
+ *      The `used` argument is unused because the body reads `capacity_used`
  *      directly from `XClaimCtl->live_capacity` (atomic counter
  *      mirroring HASH_ENTER/HASH_REMOVE). Callers may pass 0 to skip
  *      a redundant atomic load on the hot path. The argument stays
@@ -117,8 +119,13 @@ static int         xclaim_last_watermark_band = 0;
  *      across modules.
  *
  *      live_capacity is preferred over `hash_get_num_entries(XClaimHash)`
- *      -- the latter walks all partitions; the atomic counter is a
- *      single-cache-line read and reflects the live count exactly.
+ *      -- the latter sums the per-freelist entry counts of the partitioned
+ *      table, while the atomic counter is a single-cache-line read. The
+ *      counter is a batched observability figure, not an exact snapshot:
+ *      the bulk path adds its fresh inserts in one step after the batch,
+ *      and the grouped cleanup subtracts its removals in one step after
+ *      the partition sweep, so a concurrent reader can see rows already
+ *      inserted or removed while the counter has not moved yet.
  *
  *      Bands are 80/90/95%. The 80% band emits LOG, 90% LOG, 95% WARNING
  *      (95 escalates to WARNING).
@@ -133,7 +140,7 @@ xclaim_capacity_watermark_check(uint64 used)
     TimestampTz     now;
     int             level;
 
-    (void) used;                            /* hook contract; we read live count */
+    (void) used;                            /* hook contract, we read live count */
 
     if (XClaimCtl == NULL || XClaimHash == NULL)
         return;                             /* not yet initialized */
@@ -148,7 +155,7 @@ xclaim_capacity_watermark_check(uint64 used)
      * Lazy threshold cache.
      *
      * max_claims is PGC_POSTMASTER so the 90% / 95% trip points are
-     * frozen for the cluster's lifetime; they are computed once and
+     * frozen for the cluster's lifetime. They are computed once and
      * never revisited. warn_pct is PGC_SIGHUP so the warn trip point
      * is recomputed on the (rare) reload that actually moves it.
      *
@@ -161,8 +168,8 @@ xclaim_capacity_watermark_check(uint64 used)
      * Ceiling division: the watermark fires exactly when
      * `floor(100 * used / max_claims) >= pct`, equivalently
      * `used >= ceil(pct * max_claims / 100)`. Truncating integer
-     * division would fire one slot too early at the band boundary;
-     * `+ 99` carries the ceiling without floating point. The cap_warn
+     * division would fire one slot too early at the band boundary,
+     * while `+ 99` carries the ceiling without floating point. The cap_warn
      * and cap_error regress baselines pin the exact slot at which
      * each band's message lands.
      */
@@ -179,7 +186,7 @@ xclaim_capacity_watermark_check(uint64 used)
 
     /*
      * Decide the highest band currently crossed. The warn ladder starts
-     * at the configured capacity_warn_pct; the hardcoded escalation bands
+     * at the configured capacity_warn_pct, and the hardcoded escalation bands
      * (90, 95) only apply when they sit strictly ABOVE warn_pct. A band
      * below warn_pct must never fire -- otherwise raising warn_pct past 90
      * would let the 90 band emit before the operator-configured floor.
@@ -225,7 +232,7 @@ xclaim_capacity_watermark_check(uint64 used)
      */
     pct = (int) ((100 * capacity_used) / (int64) xclaim_max_claims);
 
-    /* WARNING at 95%; LOG at 80% / 90%. */
+    /* WARNING at 95%, LOG at 80% / 90%. */
     level = (band >= 95) ? WARNING : LOG;
 
     /*
@@ -250,7 +257,7 @@ xclaim_capacity_watermark_check(uint64 used)
 
 /* -------------------------------------------------------------------- */
 /* `xclaim_check_capacity_watermark` is forward-declared in pg_xclaim.h */
-/* and called from the acquisition path; the body delegates to the     */
+/* and called from the acquisition path. The body delegates to the      */
 /* real implementation here.                                            */
 /* -------------------------------------------------------------------- */
 
@@ -269,7 +276,7 @@ xclaim_check_capacity_watermark(uint64 used)
 /* in the leader backend.                                               */
 /*                                                                      */
 /* enabled=off: return 0 (no claims held under kill switch). The caller */
-/* sees zero for the count; stats.disabled_calls increments.            */
+/* sees zero for the count, and stats.disabled_calls increments.        */
 /* -------------------------------------------------------------------- */
 
 PG_FUNCTION_INFO_V1(xclaim_count);
@@ -308,12 +315,12 @@ xclaim_count(PG_FUNCTION_ARGS)
 /*   session_resets int8                                                 */
 /*                                                                      */
 /* PARALLEL RESTRICTED: counters are pg_atomic_uint64 (lock-free       */
-/* reads) and the dynahash entry count is a plain counter load, but    */
-/* the per-backend slot sums in xclaim.stats() read per-backend memory  */
-/* that parallel workers do not inherit. Keeping execution in the      */
-/* leader gives a consistent view of leader-local counters; stale      */
-/* (slightly out-of-date) values across backends are acceptable --      */
-/* this is observability, not correctness.                              */
+/* reads) and capacity_used is an atomic load of live_capacity, but     */
+/* peak_per_backend also reads this backend's local peak                */
+/* (xclaim_local_peak()), which parallel workers do not inherit.        */
+/* Keeping execution in the leader gives a consistent view of           */
+/* leader-local counters. Stale (slightly out-of-date) values across    */
+/* backends are acceptable -- this is observability, not correctness.   */
 /* -------------------------------------------------------------------- */
 
 PG_FUNCTION_INFO_V1(xclaim_stats);
@@ -364,20 +371,20 @@ xclaim_stats(PG_FUNCTION_ARGS)
                         "that cannot accept type record")));
 
     /*
-     * enabled=off: still produce a single row (with zeros for all GAUGES;
-     * counters are honest reads from atomics). The caller can detect the
+     * enabled=off: still produce a single row (gauges and counters are
+     * honest reads from atomics). The caller can detect the
      * disabled state via disabled_calls > 0 (pre-incremented before the
      * read here) and capacity_used = whatever was already in shmem (we
      * don't pretend it is zero -- that would mislead operators).
      */
     /*
      * STABLE function with observability side-effect.
-     * SQL declares xclaim.stats() as STABLE; the atomic counter
+     * SQL declares xclaim.stats() as STABLE. The atomic counter
      * increment below is an observability bump on shared memory,
      * NOT a logical row-set mutation -- functionally equivalent to
      * PG core bumping wait_event counters during a STABLE function
      * call. The planner may collapse repeated xclaim.stats()
-     * invocations within a single statement; under such collapse
+     * invocations within a single statement. Under such collapse
      * `disabled_calls` increments by however many physical calls
      * actually executed, not by the SQL-visible call count. This is
      * acceptable: the counter's purpose is to detect "did anyone
@@ -395,10 +402,10 @@ xclaim_stats(PG_FUNCTION_ARGS)
 
     /*
      * Per-backend stat slots. Hot-path counters live in
-     * XClaimBackendInfos[procno] to avoid global cache-line ping-pong;
-     * the SRF reader sums across all MaxBackends slots for a global view.
+     * XClaimBackendInfos[procno] to avoid global cache-line ping-pong,
+     * and the SRF reader sums across all MaxBackends slots for a global view.
      * Reads are eventually-consistent (a slot may bump between two
-     * reads); acceptable for observability. We deliberately include all
+     * reads), acceptable for observability. We deliberately include all
      * slots, not just live backends -- a slot whose backend has exited
      * still contains its lifetime counters until cluster restart.
      */
@@ -555,10 +562,10 @@ xclaim_emit_debug_row(Tuplestorestate *tupstore, TupleDesc tupdesc,
 /*                                                                      */
 /* Concurrency: dynahash hash_seq_init/hash_seq_search visits ALL       */
 /* entries. Since we hold all partition locks, the loop can emit every  */
-/* row directly; no per-partition filtering is attempted.               */
+/* row directly, without per-partition filtering.                       */
 /*                                                                      */
-/* Memory: tuplestore is created in per-query context; per-row palloc   */
-/* (CStringGetTextDatum) lands there too.                               */
+/* Memory: tuplestore is created in per-query context, and per-row      */
+/* palloc (CStringGetTextDatum) lands there too.                        */
 /* -------------------------------------------------------------------- */
 
 PG_FUNCTION_INFO_V1(xclaim_debug_snapshot);
@@ -592,8 +599,8 @@ xclaim_debug_snapshot(PG_FUNCTION_ARGS)
                         "that cannot accept type record")));
 
     /*
-     * enabled=off short-circuit: return empty tuplestore; bump counter.
-     * The caller observes zero rows; xclaim.stats().disabled_calls > 0
+     * enabled=off short-circuit: return empty tuplestore and bump counter.
+     * The caller observes zero rows, and xclaim.stats().disabled_calls > 0
      * is the diagnostic.
      */
     if (!xclaim_enabled)
@@ -619,16 +626,15 @@ xclaim_debug_snapshot(PG_FUNCTION_ARGS)
      *
      * `hash_seq_search` walks ALL buckets of the hash table -- not just
      * one partition's slice. With HASH_PARTITION, the partition LWLocks
-     * synchronise per-partition mutators only; a writer modifying
-     * partition X's bucket linked list concurrently with our scan that
+     * synchronise per-partition mutators only. When a writer modifies
+     * partition X's bucket linked list concurrently, a scan that
      * happens to traverse a bucket in partition X observes inconsistent
      * state (bucket pointer torn between dynahash's segment-pointer
-     * write and the ELEMENT->link assignment). The original
-     * implementation here held ONLY the current `p`'s partition lock
-     * SHARED while running a full hash_seq_search and filtering by
-     * partition_id -- that is incorrect: writers in partitions != p
-     * are NOT serialised with us, and dynahash does not document a
-     * "scan one partition" mode.
+     * write and the ELEMENT->link assignment). Holding ONLY one
+     * partition's lock SHARED while running a full hash_seq_search and
+     * filtering by partition_id is therefore incorrect: writers in
+     * other partitions are NOT serialised with us, and dynahash does
+     * not document a "scan one partition" mode.
      *
      * The minimal correct behavior is to acquire ALL partition LWLocks
      * SHARED for the entire scan, identical to xclaim.debug(). This
@@ -636,7 +642,7 @@ xclaim_debug_snapshot(PG_FUNCTION_ARGS)
      * profile -- documented below.
      *
      * MAX_SIMUL_LWLOCKS guard mirrors xclaim.debug() -- PG limits
-     * concurrent LWLocks per backend to ~200; we cap at 192 to leave
+     * concurrent LWLocks per backend to ~200, so we cap at 192 to leave
      * headroom for catalog access etc.
      */
     if (num_partitions > 192)
@@ -651,7 +657,7 @@ xclaim_debug_snapshot(PG_FUNCTION_ARGS)
     /*
      * Acquire ALL partition LWLocks SHARED. Errors inside the scan loop
      * are wrapped with PG_TRY/PG_CATCH so the locks are released even
-     * on ereport (e.g. tuplestore palloc OOM). `seq_initialized` gates
+     * on ereport (e.g. tuplestore palloc OOM). `seq_ds_initialized` gates
      * `hash_seq_term` in PG_CATCH so we only call it when the iterator
      * was actually started.
      */
@@ -708,12 +714,12 @@ xclaim_debug_snapshot(PG_FUNCTION_ARGS)
 /* surface restricted to superuser via REVOKE PUBLIC (no GRANT).       */
 /*                                                                      */
 /* Use case: regression tests that need a single consistent snapshot   */
-/* across all partitions. NOT for routine production polling; use      */
+/* across all partitions. NOT for routine production polling. Use      */
 /* xclaim.stats() for steady observability.                            */
 /*                                                                      */
 /* Lock ordering: ascending partition index. Other code paths (acquire,*/
 /* cleanup) lock at most ONE partition at a time, so cross-partition  */
-/* deadlock cannot occur regardless of our order; we use ascending so  */
+/* deadlock cannot occur regardless of our order. We use ascending so  */
 /* any multi-partition operation has a documented total order.         */
 /* -------------------------------------------------------------------- */
 
@@ -780,10 +786,10 @@ xclaim_debug(PG_FUNCTION_ARGS)
      * MAX_SIMUL_LWLOCKS guard: PG limits each backend to at most 200
      * simultaneous LWLocks (`MAX_SIMUL_LWLOCKS` in lwlock.c). The
      * production default `num_partitions = 128` stays comfortably
-     * inside this budget; clusters that raise it above 192 (e.g. to
+     * inside this budget, while clusters that raise it above 192 (e.g. to
      * 256 on >100-core deployments) will see this function refuse with
      * the message below. xclaim.debug_snapshot() has the same all-lock
-     * scan guard; use xclaim.stats() for routine production
+     * scan guard. Use xclaim.stats() for routine production
      * observability.
      *
      * 192 is a safe margin -- PG core may take a handful of LWLocks on
@@ -796,7 +802,7 @@ xclaim_debug(PG_FUNCTION_ARGS)
                         "simultaneously (PG MAX_SIMUL_LWLOCKS = ~200)",
                         num_partitions),
                  errhint("Set pg_xclaim.num_partitions <= 192 in test "
-                         "clusters that use xclaim.debug(); use xclaim.stats() "
+                         "clusters that use xclaim.debug(). Use xclaim.stats() "
                          "for routine production observability.")));
 
     /*
@@ -833,7 +839,7 @@ xclaim_debug(PG_FUNCTION_ARGS)
         /*
          * Terminate the hash_seq iterator first. dynahash tracks
          * in-flight scans in a process-global fixed-size array
-         * (seq_scan_tables[MAX_SEQ_SCANS]); an abandoned hash_seq_search
+         * (seq_scan_tables[MAX_SEQ_SCANS]). An abandoned hash_seq_search
          * leaves the HTAB registered there, so the next hash_seq_init
          * for the SAME HTAB can assert (or worse, silently corrupt
          * iteration). hash_seq_term requires
@@ -841,10 +847,10 @@ xclaim_debug(PG_FUNCTION_ARGS)
          * gate on the `seq_initialized` flag tracked in the TRY body.
          *
          * Then release every lock we may have acquired so far. We do
-         * not know which partition failed; iterate all and let
+         * not know which partition failed, so iterate all and let
          * LWLockHeldByMe release silently if we never acquired it
-         * (LWLockReleaseAll is the canonical contrib-module pattern;
-         * we replicate the safe subset by iterating in reverse).
+         * (LWLockReleaseAll is the canonical contrib-module pattern,
+         * and we replicate the safe subset by iterating in reverse).
          */
         int q;
 
@@ -893,7 +899,7 @@ xclaim_debug_inject_stale(PG_FUNCTION_ARGS)
     XCLAIM_REQUIRE_INIT();
 
     /*
-     * Superuser gate (defense-in-depth; SQL surface also REVOKEs from
+     * Superuser gate (defense-in-depth, SQL surface also REVOKEs from
      * PUBLIC). Without superuser, refuse to inject stale state.
      */
     if (!superuser())
@@ -940,7 +946,7 @@ xclaim_debug_inject_stale(PG_FUNCTION_ARGS)
      * stale and recycle it, silently violating mutual exclusion.
      *
      * The helper is intended exclusively to seed reaper test cases on
-     * keys that no one holds; overwriting a live claim is never a valid
+     * keys that no one holds. Overwriting a live claim is never a valid
      * use case, so make it loudly fail rather than corrupt state.
      */
     if (found)
@@ -959,9 +965,9 @@ xclaim_debug_inject_stale(PG_FUNCTION_ARGS)
      *   - procno = INT32_MAX -> out of [0, MaxBackends) -> hits the
      *     reaper's "out-of-range procno" check, which precedes
      *     signal 1 (proc slot empty) in pg_xclaim_reaper.c.
-     *   - owner_pid = 999999 -> sentinel; matched against the dead PGPROC
+     *   - owner_pid = 999999 -> sentinel, matched against the dead PGPROC
      *     pid, but the procno bounds check fires first.
-     *   - owner_token = 0 -> reserved-invalid; never legitimately issued
+     *   - owner_token = 0 -> reserved-invalid, never legitimately issued
      *     (next_token starts at 1).
      *   - owner_lxid = 0 -> never matches a live xact (lxids start at 1).
      */

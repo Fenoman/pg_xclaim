@@ -50,7 +50,7 @@ PNG_META = {"Software": None}
 
 # Per-language prose. C identifiers and macros (hash() & mask, ShmemInitHash,
 # HASH_PARTITION, HASH_BLOBS) stay verbatim in both languages, matching
-# README.md's house style; only the connective prose is translated.
+# README.md's house style. Only the connective prose is translated.
 STRINGS = {
     "en": {
         "partitions_title": "128 partitions (default)",
@@ -90,7 +90,7 @@ ROUTES = [
 
 
 def out_name(lang):
-    """Bare filename is the Russian (primary) asset; English gets an _en
+    """Bare filename is the Russian (primary) asset. English gets an _en
     suffix -- the same convention docs/ uses (runbook.md / runbook_en.md)."""
     return "concept.png" if lang == "ru" else "concept_en.png"
 
@@ -125,7 +125,7 @@ def cell_y_center(row_from_top):
 def bucket_cell(ax, col, row, edge=CELL_EC, fc=CELL_FC, lw=0.8):
     """One partition tile, kept intentionally plain. The accurate
     'each partition is an array of buckets, each a short chained list'
-    statement lives in the bottom caption; a per-cell motif at this scale
+    statement lives in the bottom caption. A per-cell motif at this scale
     could only assert a misleading fixed bucket/chain count, so the tile
     stays a clean partition slot."""
     x, y = cell_xy(col, row)
@@ -191,7 +191,7 @@ def draw(lang, out):
                 lw=1.1, zorder=4)
 
         # hash box -> target PARTITION: a clean two-leg dashed route. Leg 1
-        # diagonal to just left of the grid at the target row's height; leg 2
+        # diagonal to just left of the grid at the target row's height, leg 2
         # a horizontal arrowhead landing on the tile's left border -- pointing
         # at the partition as a whole (key -> partition), not at any one bucket
         # inside it.

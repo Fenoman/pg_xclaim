@@ -5,7 +5,7 @@
  *        * `xclaim_shmem_size`  -- exact sizing formula.
  *        * `xclaim_shmem_startup` -- partitioned ShmemInitHash, control
  *          singleton, per-backend info array, named LWLock tranche
- *          pointer; flips `xclaim_state_initialized = true` at the tail.
+ *          pointer. Flips `xclaim_state_initialized = true` at the tail.
  *        * Forbidden-pattern comment block warning contributors
  *          that simplehash.h MUST NOT be used in shared memory.
  *
@@ -21,10 +21,10 @@
  *
  * HARD invariants enforced here:
  *   * `simplehash.h` MUST NOT be used in shmem -- documented in the
- *     forbidden-pattern comment block right next to ShmemInitHash.
+ *     forbidden-pattern comment block above xclaim_shmem_startup.
  *   * State held in shared memory exclusively (ShmemInitStruct /
- *     ShmemInitHash); no palloc'd state crosses the postmaster boundary.
- *   * AddinShmemInitLock acquired EXCLUSIVE around all ShmemInit*; never
+ *     ShmemInitHash), and no palloc'd state crosses the postmaster boundary.
+ *   * AddinShmemInitLock acquired EXCLUSIVE around all ShmemInit* and never
  *     left held through any code that can ereport(ERROR).
  *
  * PG version notes:
@@ -32,7 +32,7 @@
  *     * RequestAddinShmemSpace, RequestNamedLWLockTranche,
  *       GetNamedLWLockTranche, AddinShmemInitLock, ShmemInitStruct,
  *       ShmemInitHash, hash_estimate_size, get_hash_value.
- *   No version branching is required in this file; the only compat
+ *   No version branching is required in this file. The only compat
  *   surface (procno, lxid) lives in pg_xclaim_compat.h.
  *
  *-------------------------------------------------------------------------
@@ -64,7 +64,7 @@ XClaimBackendInfo   *XClaimBackendInfos = NULL;
  * Backend-local cache of the named partition LWLock tranche pointer.
  *
  * PG core lays out the named-tranche LWLocks in the main shmem segment,
- * which every backend attaches at the same base address; calling
+ * which every backend attaches at the same base address. Calling
  * GetNamedLWLockTranche from each backend's shmem_startup_hook is safe
  * and the conventional pattern (the alternative -- storing the pointer
  * inside our own shmem block -- works in practice on EXEC_BACKEND today
@@ -103,7 +103,7 @@ static Size xclaim_shmem_total_bytes = 0;
  * xclaim_install_shmem_hook
  *      Capture the existing shmem_startup_hook (if any) and replace it
  *      with our own. Called once from _PG_init AFTER the preload gate
- *      and ABI check have passed.
+ *      has passed.
  */
 void
 xclaim_install_shmem_hook(void)
@@ -124,7 +124,7 @@ xclaim_install_shmem_hook(void)
 /*                                                                      */
 /* Note: the stride is `sizeof(LWLockPadded)`, not `sizeof(LWLock)`.    */
 /* `RequestNamedLWLockTranche` returns a cache-line-padded array (see   */
-/* `storage/lwlock.h`); using the bare LWLock size would under-count   */
+/* `storage/lwlock.h`), so using the bare LWLock size would under-count */
 /* the actual allocation by ~7 MB at the 65536-partition GUC ceiling.   */
 /* The 25% headroom would absorb the drift, but the formula MUST       */
 /* match the real stride for the LOG-line accounting to be honest.     */
@@ -132,14 +132,14 @@ xclaim_install_shmem_hook(void)
 /* Memory size at default GUCs (max_claims=4M, num_partitions=128,      */
 /* MaxBackends=100):                                                    */
 /*    XClaimControl                  ~120 bytes (negligible)            */
-/*    hash_estimate_size(4M, 48B)    ~270-320 MB (depends on PG ver)    */
+/*    hash_estimate_size(4M, 48B)    ~288 MB, same on PG 16/17/18       */
 /*    128 * sizeof(LWLockPadded)     ~16-32 KB (cache-line-padded)      */
 /*    100 * sizeof(XClaimBackendInfo) ~12.5 KB (cache-line padded)      */
 /*    + 25% headroom                                                    */
 /*    ----------------                                                  */
-/*    ~340-400 MB shared memory total at defaults.                      */
+/*    ~360 MB shared memory total at defaults.                          */
 /*                                                                      */
-/* At max_claims=16M (high-concurrency clusters): ~1.2-1.6 GB.          */
+/* At max_claims=16M (high-concurrency clusters): ~1.4 GB.              */
 /* DBA must size shared_buffers + shmem reservation accordingly. The    */
 /* number is logged at LOG level in xclaim_shmem_startup (below) using  */
 /* the cached value computed here, so the request and the log line     */
@@ -154,7 +154,7 @@ xclaim_shmem_size(void)
 
     /*
      * Memoize. The first call (from `xclaim_shmem_request_hook`) computes
-     * the formula; subsequent calls (e.g. the LOG line in
+     * the formula, and subsequent calls (e.g. the LOG line in
      * `xclaim_shmem_startup`) reuse the cached value so both code paths
      * agree byte-for-byte across formula edits. All inputs
      * (PGC_POSTMASTER GUCs, MaxBackends) are immutable for the lifetime
@@ -166,7 +166,7 @@ xclaim_shmem_size(void)
     /*
      * MaxBackends is initialized before shared_preload_libraries fires
      * shmem_request_hook, so it is safe to read here. (For paranoid
-     * defense-in-depth we Max() with 1 below; this also keeps
+     * defense-in-depth we Max() with 1 below, which also keeps
      * mul_size happy if a PG version ever zero-initializes it.)
      */
     mb = MaxBackends > 0 ? MaxBackends : 1;
@@ -186,22 +186,22 @@ xclaim_shmem_size(void)
 /* -------------------------------------------------------------------- */
 /* shmem_startup_hook body.                                             */
 /*                                                                      */
-/* Order of operations under AddinShmemInitLock:                        */
+/* Order of operations (steps 2-6 under AddinShmemInitLock):            */
 /*   1. Chain prev_shmem_startup_hook (cooperate with other extensions).*/
 /*   2. ShmemInitStruct("xclaim_control", ...) -- allocate or attach.   */
 /*   3. ShmemInitStruct("xclaim_backend_infos", ...) -- per-backend     */
 /*      slots indexed by procno.                                        */
 /*   4. ShmemInitHash("xclaim_hash", init=max, max=max, &info,          */
 /*      HASH_ELEM | HASH_BLOBS | HASH_PARTITION | HASH_FIXED_SIZE).     */
-/*   5. GetNamedLWLockTranche("xclaim_partition") -- pointer recorded   */
-/*      in XClaimCtl->partition_locks for downstream consumers.         */
+/*   5. GetNamedLWLockTranche("xclaim_partition") -- pointer cached in  */
+/*      XClaimPartitionLocks (backend-local) for downstream consumers.  */
 /*   6. Flip xclaim_state_initialized = true.                           */
 /*                                                                      */
 /* Steps 2-5 are pure shmem setup that cannot ereport(ERROR) under      */
 /* normal conditions. If any underlying call ereport(FATAL)s on         */
 /* allocator exhaustion, the postmaster aborts before LWLockRelease     */
 /* runs -- which is the correct behaviour (cluster start fails). The    */
-/* hook is therefore safe without PG_TRY/PG_CATCH wrapping; LWLock-     */
+/* hook is therefore safe without PG_TRY/PG_CATCH wrapping. LWLock-     */
 /* leak concerns apply to ERROR-returning user code paths in the        */
 /* acquisition / cleanup hot paths, not to shmem startup.               */
 /* -------------------------------------------------------------------- */
@@ -239,8 +239,8 @@ xclaim_shmem_startup(void)
      *   (a) `XLogCtl` is NULL during `process_shared_preload_libraries`
      *       (called BEFORE `CreateSharedMemoryAndSemaphores`). Calling
      *       `RecoveryInProgress()` from `_PG_init` therefore crashes
-     *       the postmaster with EXC_BAD_ACCESS. The check MUST move
-     *       out of `_PG_init`.
+     *       the postmaster with EXC_BAD_ACCESS. The check MUST NOT
+     *       run in `_PG_init`.
      *
      *   (b) By the time `shmem_startup_hook` runs, `XLogCtl` IS
      *       attached, so `RecoveryInProgress()` is safe to call here.
@@ -248,8 +248,8 @@ xclaim_shmem_startup(void)
      *       `RecoveryInProgress()` ALSO returns `true` here (the
      *       startup process is still replaying the last checkpoint
      *       before promotion). We therefore CANNOT use the value at
-     *       shmem-startup time as a primary-vs-standby discriminator;
-     *       a `false` from here would be reliable, but a `true`
+     *       shmem-startup time as a primary-vs-standby discriminator.
+     *       A `false` from here would be reliable, but a `true`
      *       conflates "standby" with "primary still in startup".
      *
      *   (c) The accurate place to check `RecoveryInProgress()` is at
@@ -261,8 +261,8 @@ xclaim_shmem_startup(void)
      *       Contrib's pg_surgery follows the same defer-to-call-time
      *       pattern (a call-time `RecoveryInProgress()` check).
      *
-     * The shmem-startup body therefore initializes unconditionally;
-     * the per-call recovery check lives in `XCLAIM_REQUIRE_INIT()`
+     * The shmem-startup body therefore initializes unconditionally,
+     * and the per-call recovery check lives in `XCLAIM_REQUIRE_INIT()`
      * (see `pg_xclaim.h`).
      */
 
@@ -283,7 +283,7 @@ xclaim_shmem_startup(void)
      * then release. The chained extension's lock acquire/release is
      * fully nested inside its own body and serialized w.r.t. our region
      * by the postmaster's single-threaded shmem-startup phase on regular
-     * starts; on EXEC_BACKEND / Windows per-backend re-entry, each
+     * starts. On EXEC_BACKEND / Windows per-backend re-entry, each
      * extension still serializes its own ShmemInit* under its own
      * AddinShmemInitLock acquire.
      */
@@ -341,7 +341,7 @@ xclaim_shmem_startup(void)
     }
 
     /* ----------------------------------------------------------------
-     * 2. Per-backend info array. MaxBackends slots; a backend at
+     * 2. Per-backend info array of MaxBackends slots. A backend at
      *    procno i publishes its current owner_token in
      *    XClaimBackendInfos[i].current_token.
      * ---------------------------------------------------------------- */
@@ -359,7 +359,7 @@ xclaim_shmem_startup(void)
             XClaimBackendInfos[i].pid = 0;
             /*
              * Per-backend hot-path counters. Initialized once at cluster
-             * start; never zeroed at session_reset (cumulative stats
+             * start and never zeroed at session_reset (cumulative stats
              * survive backend reuse).
              */
             pg_atomic_init_u64(&XClaimBackendInfos[i].total_acquires_local, 0);
@@ -372,12 +372,12 @@ xclaim_shmem_startup(void)
      * 3. Partitioned shared dynahash.
      *
      *    info.num_partitions is the number of internal hash partitions
-     *    dynahash maintains; we pair this with our own `num_partitions`
+     *    dynahash maintains, and we pair this with our own `num_partitions`
      *    LWLocks via partition_id = hashvalue & (num_partitions - 1).
      *
      *    init_size == max_size for HASH_FIXED_SIZE -- both equal
-     *    xclaim_max_claims so there is no growth path; the table is a
-     *    hard ceiling and capacity exhaustion is signalled via
+     *    xclaim_max_claims so there is no growth path. The table is a
+     *    hard ceiling, and capacity exhaustion is signalled via
      *    HASH_ENTER_NULL in the acquisition path.
      * ---------------------------------------------------------------- */
     memset(&info, 0, sizeof(info));
@@ -394,7 +394,7 @@ xclaim_shmem_startup(void)
 
     /* ----------------------------------------------------------------
      * 4. Named LWLock tranche pointer. RequestNamedLWLockTranche was
-     *    already issued from the shmem_request_hook in pg_xclaim.c;
+     *    already issued from the shmem_request_hook in pg_xclaim.c, and
      *    GetNamedLWLockTranche returns the LWLockPadded array PG carved
      *    out for us.
      *
@@ -403,19 +403,17 @@ xclaim_shmem_startup(void)
      * ---------------------------------------------------------------- */
     /*
      * Resolve the named-tranche pointer into the backend-local cache.
-     * The same shmem-resident pointer slot in XClaimControl is kept in
-     * sync for backwards-compatibility with any in-tree reader that
-     * still goes through XClaimCtl, but the hot path (xclaim_partition_lock
-     * inline) reads the backend-local cache directly to avoid storing or
-     * dereferencing an absolute pointer that lives inside our own shmem
-     * block.
+     * The same pointer is also stored in XClaimControl.partition_locks,
+     * but the hot path (xclaim_partition_lock inline) reads the
+     * backend-local cache directly to avoid dereferencing an absolute
+     * pointer that lives inside our own shmem block.
      */
     XClaimPartitionLocks       = GetNamedLWLockTranche("xclaim_partition");
     XClaimCtl->partition_locks = XClaimPartitionLocks;
 
     /*
      * Final flag flip INSIDE the lock. On EXEC_BACKEND / Windows,
-     * `shmem_startup_hook` runs per-backend on attach; bracketing the
+     * `shmem_startup_hook` runs per-backend on attach, and bracketing the
      * flag set with `AddinShmemInitLock` ensures a sibling-extension
      * hook in the same per-backend invocation cannot observe
      * `xclaim_state_initialized = true` before our ShmemInit calls

@@ -4,7 +4,7 @@
 --
 -- Both functions iterate the shared dynahash under SHARED locks on
 -- EVERY partition simultaneously. PG core caps a single backend at
--- ~200 concurrent LWLocks (MAX_SIMUL_LWLOCKS); xclaim caps at 192 to
+-- ~200 concurrent LWLocks (MAX_SIMUL_LWLOCKS), and xclaim caps at 192 to
 -- leave headroom for catalog access. With num_partitions=256 (this
 -- cluster's config) the cap is exceeded and both functions must
 -- refuse with ERRCODE_FEATURE_NOT_SUPPORTED + an actionable hint.
@@ -12,8 +12,8 @@
 -- A regression in this guard would either (a) tip PG into its own
 -- LWLock-overflow assertion or (b) leak the partial set of acquired
 -- partition locks across the ereport unwind. The asserts below
--- exercise both code paths (debug() under EXCLUSIVE, debug_snapshot()
--- under SHARED) and verify that a normal acquisition still works
+-- exercise both code paths (debug() and debug_snapshot(), each under
+-- SHARED) and verify that a normal acquisition still works
 -- after the failed snapshot calls (i.e., no orphaned partition lock).
 \set VERBOSITY terse
 \set ON_ERROR_STOP on

@@ -6,7 +6,7 @@
  * The acquisition conflict path consults `xclaim_is_stale_owner` UNDER
  * the partition LWLock. If it returns true, the caller takes over the
  * slot by overwriting the entry's owner triple in place under the same
- * lock (linearizable; no HASH_REMOVE + HASH_ENTER cycle since the
+ * lock (linearizable, with no HASH_REMOVE + HASH_ENTER cycle, since the
  * combined HASH_ENTER_NULL already returned the existing entry pointer).
  * The reaper is deliberately lazy: no background worker scans shared
  * memory. Stale rows are reclaimed only when a conflicting acquisition
@@ -15,19 +15,24 @@
  * Three stale signals:
  *   1. Proc slot empty:           ProcGlobal->allProcs[procno].pid == 0
  *      (or procno is out of range -- defensive against corrupted
- *      XClaimEntry).
+ *      XClaimEntry). PG 17+ clears the pid when a backend exits. PG 16
+ *      keeps the exited backend's pid in the slot until the slot is
+ *      reused, so there this signal fires only for never-used slots.
  *   2. PID mismatch:              live PGPROC at procno has a DIFFERENT
  *      OS pid than entry->owner_pid -- the slot was reused by an
  *      unrelated backend.
  *   3. Token regenerated:         XClaimBackendInfos[procno].current_token
- *      != entry->owner_token. Same OS pid (or NEW backend at same
- *      slot) but session_reset has rotated the token -- any rows owned
- *      by the OLD token are stale.
+ *      != entry->owner_token. The owner rotated its token
+ *      (session_reset), or exited (xclaim_shmem_exit_cb publishes 0),
+ *      or a NEW backend at the same slot published its own token --
+ *      any rows owned by the OLD token are stale. On PG 16 this is the
+ *      signal that catches rows of an exited backend before its slot is
+ *      reused.
  *
  * Reads are unlocked -- the published `XClaimBackendInfo.current_token`
- * is an `pg_atomic_uint64` with lock-free atomic load; PGPROC->pid is a
- * stable plain field updated only at backend init/exit. False negatives
- * are tolerated (caller returns false / conflict; next acquisition
+ * is a `pg_atomic_uint64` with lock-free atomic load, and PGPROC->pid is
+ * a stable plain field updated only at backend init/exit. False negatives
+ * are tolerated (caller returns false / conflict, and the next acquisition
  * retries the check). False POSITIVES (reaping a live owner) MUST never
  * occur -- they would silently release a held claim.
  *
@@ -37,8 +42,9 @@
  * Ordinary hard backend death therefore does not leave xclaim rows for
  * this lazy reaper. The reaper covers extension-level stale-owner cases:
  * an empty/reused PGPROC slot after normal proc cleanup, PID mismatch,
- * or session_reset-issued token mismatch. There is intentionally no
- * "is this PID alive" syscall (it would be racy and platform-specific).
+ * or a token mismatch after session_reset or backend exit. There is
+ * intentionally no "is this PID alive" syscall (it would be racy and
+ * platform-specific).
  *
  *-------------------------------------------------------------------------
  */
@@ -60,16 +66,17 @@
  *      in place under the same partition LWLock when this returns true.
  *
  *      Decision rule:
- *        * Out-of-range procno -> stale (corrupted entry; reap defensively).
+ *        * Out-of-range procno -> stale (corrupted entry, reaped defensively).
  *        * PGPROC slot empty (pid == 0) -> stale.
  *        * PGPROC->pid != entry->owner_pid -> slot reused by different
  *          OS process -> stale.
  *        * XClaimBackendInfos[procno].current_token != entry->owner_token
- *          -> token regenerated (session_reset) -> stale.
+ *          -> token regenerated (session_reset) or invalidated at
+ *          backend exit -> stale.
  *        * Otherwise alive and current -> NOT stale.
  *
  *      All checks are unlocked atomic / plain reads (the publish path
- *      is atomic; reads tolerate false negatives).
+ *      is atomic, and reads tolerate false negatives).
  *
  *      Read-only -- never mutates the shared dynahash. The caller owns
  *      the in-place overwrite (populate of owner triple) under the
@@ -85,8 +92,8 @@ xclaim_is_stale_owner(const XClaimEntry *entry)
 
     /*
      * Defense-in-depth: a procno outside the legal range cannot index a
-     * valid PGPROC. Treat as stale (reap the entry; the saved owner
-     * identifier is corrupted or from a previous postmaster lifetime).
+     * valid PGPROC. Treat as stale and reap the entry: the saved owner
+     * identifier is corrupted or from a previous postmaster lifetime.
      */
     if (entry->owner_procno < 0 || entry->owner_procno >= MaxBackends)
         return true;
@@ -95,7 +102,7 @@ xclaim_is_stale_owner(const XClaimEntry *entry)
      * Compat helper bounds-checks against ProcGlobal->allProcCount and
      * returns NULL on out-of-range. Available unchanged on PG 16/17/18
      * (GetPGProcByNumber is `&ProcGlobal->allProcs[(n)]` in every
-     * target release; the wrapper adds the bounds check).
+     * target release, and the wrapper adds the bounds check).
      */
     p = xclaim_get_pgproc_by_procno(entry->owner_procno);
     if (p == NULL)
@@ -103,10 +110,14 @@ xclaim_is_stale_owner(const XClaimEntry *entry)
 
     /*
      * pid == 0 means "no live backend process owns this PGPROC". PGPROC
-     * slots are recycled through ProcGlobal's freeProcs list and pid is
-     * set to 0 when a backend exits; prepared-transaction dummy procs
-     * also have pid 0, but pg_xclaim rejects PREPARE TRANSACTION while
-     * claims are held, so they cannot be valid xclaim owners.
+     * slots are recycled through ProcGlobal's freeProcs list. PG 17+
+     * ProcKill() sets pid to 0 when a backend exits. PG 16 leaves the
+     * exited backend's pid in the slot until the slot is reused, so on
+     * PG 16 rows of an exited backend pass this check and the pid check
+     * below, and fall to the token check (xclaim_shmem_exit_cb publishes
+     * token 0 at exit). Prepared-transaction dummy procs also have pid 0,
+     * but pg_xclaim rejects PREPARE TRANSACTION while claims are held, so
+     * they cannot be valid xclaim owners.
      */
     if (p->pid == 0)
         return true;                /* slot empty -> stale */
@@ -117,15 +128,16 @@ xclaim_is_stale_owner(const XClaimEntry *entry)
     /*
      * Token freshness check. The owning backend publishes its
      * `current_token` into XClaimBackendInfos[procno] on the first
-     * acquisition, and rotates it on session_reset. A mismatch means
-     * the live PGPROC at this slot is the SAME OS process but it has
-     * since called session_reset -- any rows owned by the OLD token
-     * are stale.
+     * acquisition, rotates it on session_reset, and publishes 0 when
+     * it exits (xclaim_shmem_exit_cb). A mismatch means the owner
+     * rotated its token or exited, or a new backend at this slot
+     * published its own token -- any rows owned by the OLD token are
+     * stale.
      *
-     * Atomic load (unlocked); false negatives tolerated (we'd just
-     * return false on this iteration; next conflict retries). XClaim
-     * BackendInfos is sized MaxBackends; the procno bounds check above
-     * also guards this index.
+     * Atomic load (unlocked), false negatives tolerated (we'd just
+     * return false on this iteration, and the next conflict retries).
+     * XClaimBackendInfos is sized MaxBackends, so the procno bounds
+     * check above also guards this index.
      */
     published_token = pg_atomic_read_u64(&XClaimBackendInfos[entry->owner_procno].current_token);
     if (published_token != entry->owner_token)
