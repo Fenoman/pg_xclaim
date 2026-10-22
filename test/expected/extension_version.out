@@ -10,13 +10,13 @@ NOTICE:  extension "pg_xclaim" already exists, skipping
 SELECT extversion FROM pg_extension WHERE extname = 'pg_xclaim';
  extversion 
 ------------
- 1.0.0-rc2
+ 1.0.0-rc3
 (1 row)
 
 SELECT default_version FROM pg_available_extensions WHERE name = 'pg_xclaim';
  default_version 
 -----------------
- 1.0.0-rc2
+ 1.0.0-rc3
 (1 row)
 
 SELECT version FROM pg_available_extension_versions
@@ -25,7 +25,8 @@ SELECT version FROM pg_available_extension_versions
 -----------
  1.0.0-rc1
  1.0.0-rc2
-(2 rows)
+ 1.0.0-rc3
+(3 rows)
 
 -- The session_reset() comment comes from the update script, so a fresh
 -- install and an updated 1.0.0-rc1 installation carry the same text.
@@ -38,7 +39,8 @@ SELECT :'session_reset_comment' LIKE '%xclaim.count() > 0%' AS points_to_count,
  t               | f
 (1 row)
 
--- An installation created at 1.0.0-rc1 updates to 1.0.0-rc2 in place.
+-- An installation created at 1.0.0-rc1 updates in place, through 1.0.0-rc2
+-- to the default version.
 SELECT current_database() AS main_db \gset
 CREATE DATABASE xclaim_version_update;
 \c xclaim_version_update
@@ -61,6 +63,20 @@ SELECT extversion FROM pg_extension WHERE extname = 'pg_xclaim';
  extversion 
 ------------
  1.0.0-rc2
+(1 row)
+
+SELECT obj_description('xclaim.session_reset()'::regprocedure, 'pg_proc')
+       = :'session_reset_comment' AS same_comment_as_fresh_install;
+ same_comment_as_fresh_install 
+-------------------------------
+ t
+(1 row)
+
+ALTER EXTENSION pg_xclaim UPDATE;
+SELECT extversion FROM pg_extension WHERE extname = 'pg_xclaim';
+ extversion 
+------------
+ 1.0.0-rc3
 (1 row)
 
 SELECT obj_description('xclaim.session_reset()'::regprocedure, 'pg_proc')

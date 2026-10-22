@@ -20,7 +20,8 @@ SELECT obj_description('xclaim.session_reset()'::regprocedure, 'pg_proc')
 SELECT :'session_reset_comment' LIKE '%xclaim.count() > 0%' AS points_to_count,
        :'session_reset_comment' LIKE '%cleanup_misses > 0%' AS points_to_cleanup_misses;
 
--- An installation created at 1.0.0-rc1 updates to 1.0.0-rc2 in place.
+-- An installation created at 1.0.0-rc1 updates in place, through 1.0.0-rc2
+-- to the default version.
 SELECT current_database() AS main_db \gset
 CREATE DATABASE xclaim_version_update;
 \c xclaim_version_update
@@ -29,6 +30,10 @@ SELECT extversion FROM pg_extension WHERE extname = 'pg_xclaim';
 SELECT obj_description('xclaim.session_reset()'::regprocedure, 'pg_proc')
        = :'session_reset_comment' AS same_comment_as_fresh_install;
 ALTER EXTENSION pg_xclaim UPDATE TO '1.0.0-rc2';
+SELECT extversion FROM pg_extension WHERE extname = 'pg_xclaim';
+SELECT obj_description('xclaim.session_reset()'::regprocedure, 'pg_proc')
+       = :'session_reset_comment' AS same_comment_as_fresh_install;
+ALTER EXTENSION pg_xclaim UPDATE;
 SELECT extversion FROM pg_extension WHERE extname = 'pg_xclaim';
 SELECT obj_description('xclaim.session_reset()'::regprocedure, 'pg_proc')
        = :'session_reset_comment' AS same_comment_as_fresh_install;

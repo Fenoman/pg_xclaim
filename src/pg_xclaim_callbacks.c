@@ -99,6 +99,13 @@
 /* the user-facing reject is also too late -- by then the xact has      */
 /* crossed into prepare cleanup paths and the operator gets a much less */
 /* actionable error.                                                    */
+/*                                                                      */
+/* Tantor SE adds PRE_ABORT / PARALLEL_PRE_ABORT, both no-ops here. It  */
+/* fires them at the start of AbortTransaction, after the LWLocks are   */
+/* released and before the abort is recorded. The same AbortTransaction */
+/* call delivers ABORT / PARALLEL_ABORT after ProcArrayEndTransaction,  */
+/* on the same condition as in PostgreSQL, so claims are released at    */
+/* the same point of the abort on both servers.                         */
 /* -------------------------------------------------------------------- */
 
 void
@@ -177,6 +184,16 @@ xclaim_xact_callback(XactEvent event, void *arg)
              * into prepare cleanup).
              */
             return;
+
+#ifdef XCLAIM_HAVE_XACT_EVENT_PRE_ABORT
+        case XACT_EVENT_PRE_ABORT:
+        case XACT_EVENT_PARALLEL_PRE_ABORT:
+            /*
+             * No-op (Tantor SE). ABORT / PARALLEL_ABORT of the same
+             * AbortTransaction call releases the claims.
+             */
+            return;
+#endif
     }
 }
 

@@ -25,7 +25,8 @@ OBJS = \
 # and then each update script in turn.
 DATA = \
 	sql/pg_xclaim--1.0.0-rc1.sql \
-	sql/pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql
+	sql/pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql \
+	sql/pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql
 
 # Regression test list. The main suite runs with
 # shared_preload_libraries='pg_xclaim' (test/regress.conf).
@@ -73,6 +74,14 @@ EXTRA_CLEAN = \
 
 # pg_config discovery: explicit override wins, otherwise look in PATH.
 PG_CONFIG ?= pg_config
+
+# Tantor SE adds XACT_EVENT_PRE_ABORT and XACT_EVENT_PARALLEL_PRE_ABORT to
+# XactEvent. The switch in xclaim_xact_callback names every event (-Wswitch
+# under -Werror), so the server headers decide which cases it compiles.
+ifneq ($(shell grep -s -l -w XACT_EVENT_PRE_ABORT $(shell $(PG_CONFIG) --includedir-server)/access/xact.h),)
+PG_CPPFLAGS += -DXCLAIM_HAVE_XACT_EVENT_PRE_ABORT
+endif
+
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 

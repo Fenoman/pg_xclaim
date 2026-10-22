@@ -7,6 +7,28 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [1.0.0-rc3] - 2026-10-22
+
+### Fixed
+
+- **Build on Tantor SE 18.** Tantor SE adds `XACT_EVENT_PRE_ABORT` and
+  `XACT_EVENT_PARALLEL_PRE_ABORT` to `XactEvent`, and the build stopped
+  with `-Werror=switch` in `xclaim_xact_callback`. The Makefile checks
+  the server's `access/xact.h` for these events, and the callback takes
+  them as no-ops: Tantor SE fires them at the start of the abort, and
+  the same abort later delivers `XACT_EVENT_ABORT`, which releases the
+  claims, as on PostgreSQL. Builds against PostgreSQL are unchanged.
+
+### Changed
+
+- **Extension version 1.0.0-rc3.** No SQL object changes:
+  `pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql` only moves the version. To
+  update an installation, install the new build, restart the server,
+  then run `ALTER EXTENSION pg_xclaim UPDATE;` in each database that has
+  the extension. On PostgreSQL the library behaves as 1.0.0-rc2: the
+  new cases compile only against server headers that declare the
+  events.
+
 ## [1.0.0-rc2] - 2026-09-25
 
 ### Fixed
@@ -173,6 +195,7 @@ extension passes the full test matrix on PostgreSQL 16, 17, and 18.
   and `PREPARE TRANSACTION` is rejected with `0A000`.
 - Not supported on hot-standby replicas or Windows.
 
-[Unreleased]: https://github.com/Fenoman/pg_xclaim/compare/v1.0.0-rc2...HEAD
+[Unreleased]: https://github.com/Fenoman/pg_xclaim/compare/v1.0.0-rc3...HEAD
+[1.0.0-rc3]: https://github.com/Fenoman/pg_xclaim/compare/v1.0.0-rc2...v1.0.0-rc3
 [1.0.0-rc2]: https://github.com/Fenoman/pg_xclaim/compare/v1.0.0-rc1...v1.0.0-rc2
 [1.0.0-rc1]: https://github.com/Fenoman/pg_xclaim/releases/tag/v1.0.0-rc1
