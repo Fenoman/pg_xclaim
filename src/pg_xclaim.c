@@ -406,6 +406,23 @@ _PG_init(void)
      * first claim in xclaim_ensure_owner_token().
      */
     RegisterXactCallback(xclaim_xact_callback, NULL);
+
+#ifdef XCLAIM_HAVE_ATX_MARK_EXTENSION_AS_INCOMPATIBLE
+    /*
+     * Autonomous transactions of Postgres Pro Enterprise are refused.
+     *
+     * Why. An autonomous transaction runs inside its parent in the same
+     * backend, and its COMMIT or ABORT reaches xclaim_xact_callback as an
+     * ordinary transaction end. The cleanup would release every claim of
+     * the backend, the parent's too, while the parent still relies on them.
+     *
+     * What it does. While pg_xclaim is preloaded, the server refuses
+     * BEGIN AUTONOMOUS and autonomous PL/pgSQL blocks in every backend with
+     * "pg_xclaim extension is incompatible with autonomous transactions".
+     * Test: test/concurrency/autonomous_xact.sh.
+     */
+    atx_mark_extension_as_incompatible("pg_xclaim");
+#endif
 }
 
 /* -------------------------------------------------------------------- */

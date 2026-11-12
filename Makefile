@@ -75,12 +75,26 @@ EXTRA_CLEAN = \
 # pg_config discovery: explicit override wins, otherwise look in PATH.
 PG_CONFIG ?= pg_config
 
-# Tantor SE adds XACT_EVENT_PRE_ABORT and XACT_EVENT_PARALLEL_PRE_ABORT to
-# XactEvent. The switch in xclaim_xact_callback names every event (-Wswitch
-# under -Werror), so the server headers decide which cases it compiles.
-ifneq ($(shell grep -s -l -w XACT_EVENT_PRE_ABORT $(shell $(PG_CONFIG) --includedir-server)/access/xact.h),)
-PG_CPPFLAGS += -DXCLAIM_HAVE_XACT_EVENT_PRE_ABORT
-endif
+# Server-specific API, found in the server headers. Each name found defines
+# XCLAIM_HAVE_<name in upper case>.
+#
+# XactEvent values (access/xact.h). The switch in xclaim_xact_callback names
+# every event (-Wswitch under -Werror), so the headers decide which cases it
+# compiles:
+#   XACT_EVENT_PRE_ABORT       Tantor SE, with XACT_EVENT_PARALLEL_PRE_ABORT
+#   XACT_EVENT_START           Postgres Pro Enterprise, autonomous transactions
+#   XACT_EVENT_COMMIT_COMMAND  Postgres Pro Enterprise, multimaster
+#
+# atx_mark_extension_as_incompatible (miscadmin.h), Postgres Pro Enterprise:
+# _PG_init refuses autonomous transactions with it.
+XCLAIM_INCLUDEDIR_SERVER := $(shell $(PG_CONFIG) --includedir-server)
+xclaim_probe = $(if $(shell grep -s -l -w $(1) $(XCLAIM_INCLUDEDIR_SERVER)/$(2)),-DXCLAIM_HAVE_$(shell echo $(1) | tr a-z A-Z))
+XCLAIM_PROBE_CPPFLAGS := \
+	$(call xclaim_probe,XACT_EVENT_PRE_ABORT,access/xact.h) \
+	$(call xclaim_probe,XACT_EVENT_START,access/xact.h) \
+	$(call xclaim_probe,XACT_EVENT_COMMIT_COMMAND,access/xact.h) \
+	$(call xclaim_probe,atx_mark_extension_as_incompatible,miscadmin.h)
+PG_CPPFLAGS += $(strip $(XCLAIM_PROBE_CPPFLAGS))
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)

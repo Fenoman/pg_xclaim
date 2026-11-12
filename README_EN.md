@@ -582,6 +582,12 @@ each item are in [`docs/runbook_en.md`](docs/runbook_en.md).
   time) and the cluster goes into PANIC. It needs
   `max_claims >= 134217728`, so with the default 4M the limit cannot be
   reached. See `docs/runbook_en.md` §9.
+- **Postgres Pro Enterprise autonomous transactions** are refused while
+  pg_xclaim is in `shared_preload_libraries`: `BEGIN AUTONOMOUS` and an
+  autonomous PL/pgSQL block fail with `pg_xclaim extension is incompatible
+  with autonomous transactions`. The COMMIT or ABORT of an autonomous
+  transaction would end its parent for pg_xclaim, and the parent would lose
+  its claims.
 - **Windows** is untested and unsupported.
 - **Transaction pooling** (pgbouncer/odyssey in `transaction` mode):
   claims are tied to the transaction and released at its boundary, so do

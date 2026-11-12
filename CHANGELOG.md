@@ -7,6 +7,30 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed
+
+- **Build on Postgres Pro Enterprise 18.** Postgres Pro Enterprise adds
+  `XACT_EVENT_START` (autonomous transactions) and
+  `XACT_EVENT_COMMIT_COMMAND` (multimaster) to `XactEvent`, and the build
+  stopped with `-Werror=switch` in `xclaim_xact_callback`. The Makefile
+  checks the server's `access/xact.h` for these events, and the callback
+  takes them as no-ops. The server delivers each of them only to callbacks
+  registered for its kind, and `RegisterXactCallback` registers pg_xclaim's
+  for the vanilla events only.
+- **Autonomous transactions no longer release the claims of their parent
+  on Postgres Pro Enterprise.** The COMMIT or ABORT of an autonomous
+  transaction reaches the xact callback as an ordinary transaction end,
+  and the cleanup released every claim of the backend while the parent
+  transaction went on: another backend could take a key the parent still
+  relied on. While pg_xclaim is in `shared_preload_libraries`, it now marks
+  itself incompatible with autonomous transactions
+  (`atx_mark_extension_as_incompatible`), and the server refuses
+  `BEGIN AUTONOMOUS` and autonomous PL/pgSQL blocks with `pg_xclaim
+  extension is incompatible with autonomous transactions`. timescaledb in
+  `shared_preload_libraries` already makes the server refuse them.
+  `test/concurrency/autonomous_xact.sh` covers it and is skipped on servers
+  without autonomous transactions.
+
 ## [1.0.0-rc3] - 2026-10-22
 
 ### Fixed

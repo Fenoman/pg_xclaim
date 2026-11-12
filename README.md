@@ -580,6 +580,12 @@ overlap unsorted claim-table'ы (B и D) ловят по 7 deadlock'ов за
   за раз), и кластер уходит в PANIC. Для этого нужен
   `max_claims >= 134217728`, с дефолтом 4M предел недостижим. См.
   `docs/runbook.md` §9.
+- **Автономные транзакции Postgres Pro Enterprise** отклоняются, пока
+  pg_xclaim стоит в `shared_preload_libraries`: `BEGIN AUTONOMOUS` и
+  автономный блок PL/pgSQL получают ошибку `pg_xclaim extension is
+  incompatible with autonomous transactions`. COMMIT или ABORT автономной
+  транзакции завершили бы ее родителя для pg_xclaim, и родитель потерял бы
+  свои claim'ы.
 - **Windows** не тестировался и не поддерживается.
 - **Transaction-pooling** (pgbouncer/odyssey в режиме `transaction`):
   claim'ы привязаны к транзакции и освобождаются на ее границе, поэтому не

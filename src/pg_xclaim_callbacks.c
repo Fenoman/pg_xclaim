@@ -106,6 +106,13 @@
 /* call delivers ABORT / PARALLEL_ABORT after ProcArrayEndTransaction,  */
 /* on the same condition as in PostgreSQL, so claims are released at    */
 /* the same point of the abort on both servers.                         */
+/*                                                                      */
+/* Postgres Pro Enterprise adds START (autonomous transactions) and     */
+/* COMMIT_COMMAND (multimaster), both no-ops here. The server delivers  */
+/* an event only to callbacks registered for its kind, and              */
+/* RegisterXactCallback registers this one for the vanilla events only. */
+/* The COMMIT and ABORT of an autonomous transaction are vanilla events */
+/* of this callback, so _PG_init refuses autonomous transactions.       */
 /* -------------------------------------------------------------------- */
 
 void
@@ -191,6 +198,24 @@ xclaim_xact_callback(XactEvent event, void *arg)
             /*
              * No-op (Tantor SE). ABORT / PARALLEL_ABORT of the same
              * AbortTransaction call releases the claims.
+             */
+            return;
+#endif
+
+#ifdef XCLAIM_HAVE_XACT_EVENT_START
+        case XACT_EVENT_START:
+            /*
+             * No-op (Postgres Pro Enterprise). Delivered only to callbacks
+             * registered for autonomous transactions, never to this one.
+             */
+            return;
+#endif
+
+#ifdef XCLAIM_HAVE_XACT_EVENT_COMMIT_COMMAND
+        case XACT_EVENT_COMMIT_COMMAND:
+            /*
+             * No-op (Postgres Pro Enterprise). Delivered only to callbacks
+             * registered for multimaster, never to this one.
              */
             return;
 #endif

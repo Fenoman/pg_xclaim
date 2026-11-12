@@ -61,6 +61,8 @@ ALL_SCRIPTS=(
     "peak_warn"
     # out of memory while the local set grows (Linux only)
     "local_grow_oom"
+    # autonomous transactions refused, parent claims kept (Postgres Pro Enterprise only)
+    "autonomous_xact"
     # debug scan stress
     "debug_scan_stress"
     # bulk concurrent
