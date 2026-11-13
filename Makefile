@@ -26,7 +26,8 @@ OBJS = \
 DATA = \
 	sql/pg_xclaim--1.0.0-rc1.sql \
 	sql/pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql \
-	sql/pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql
+	sql/pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql \
+	sql/pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql
 
 # Regression test list. The main suite runs with
 # shared_preload_libraries='pg_xclaim' (test/regress.conf).

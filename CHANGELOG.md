@@ -7,6 +7,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [1.0.0-rc4] - 2026-11-13
+
 ### Fixed
 
 - **Build on Postgres Pro Enterprise 18.** Postgres Pro Enterprise adds
@@ -30,6 +32,17 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   `shared_preload_libraries` already makes the server refuse them.
   `test/concurrency/autonomous_xact.sh` covers it and is skipped on servers
   without autonomous transactions.
+
+### Changed
+
+- **Extension version 1.0.0-rc4.** No SQL object changes:
+  `pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql` only moves the version. To
+  update an installation, install the new build, restart the server,
+  then run `ALTER EXTENSION pg_xclaim UPDATE;` in each database that has
+  the extension. On servers without the Postgres Pro Enterprise events
+  and functions (PostgreSQL, Postgres Pro Standard, Tantor SE) the
+  library behaves as 1.0.0-rc3: the new code compiles only against
+  server headers that declare them.
 
 ## [1.0.0-rc3] - 2026-10-22
 
@@ -219,7 +232,8 @@ extension passes the full test matrix on PostgreSQL 16, 17, and 18.
   and `PREPARE TRANSACTION` is rejected with `0A000`.
 - Not supported on hot-standby replicas or Windows.
 
-[Unreleased]: https://github.com/Fenoman/pg_xclaim/compare/v1.0.0-rc3...HEAD
+[Unreleased]: https://github.com/Fenoman/pg_xclaim/compare/v1.0.0-rc4...HEAD
+[1.0.0-rc4]: https://github.com/Fenoman/pg_xclaim/compare/v1.0.0-rc3...v1.0.0-rc4
 [1.0.0-rc3]: https://github.com/Fenoman/pg_xclaim/compare/v1.0.0-rc2...v1.0.0-rc3
 [1.0.0-rc2]: https://github.com/Fenoman/pg_xclaim/compare/v1.0.0-rc1...v1.0.0-rc2
 [1.0.0-rc1]: https://github.com/Fenoman/pg_xclaim/releases/tag/v1.0.0-rc1

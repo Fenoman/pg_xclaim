@@ -10,13 +10,13 @@ NOTICE:  extension "pg_xclaim" already exists, skipping
 SELECT extversion FROM pg_extension WHERE extname = 'pg_xclaim';
  extversion 
 ------------
- 1.0.0-rc3
+ 1.0.0-rc4
 (1 row)
 
 SELECT default_version FROM pg_available_extensions WHERE name = 'pg_xclaim';
  default_version 
 -----------------
- 1.0.0-rc3
+ 1.0.0-rc4
 (1 row)
 
 SELECT version FROM pg_available_extension_versions
@@ -26,7 +26,8 @@ SELECT version FROM pg_available_extension_versions
  1.0.0-rc1
  1.0.0-rc2
  1.0.0-rc3
-(3 rows)
+ 1.0.0-rc4
+(4 rows)
 
 -- The session_reset() comment comes from the update script, so a fresh
 -- install and an updated 1.0.0-rc1 installation carry the same text.
@@ -76,7 +77,7 @@ ALTER EXTENSION pg_xclaim UPDATE;
 SELECT extversion FROM pg_extension WHERE extname = 'pg_xclaim';
  extversion 
 ------------
- 1.0.0-rc3
+ 1.0.0-rc4
 (1 row)
 
 SELECT obj_description('xclaim.session_reset()'::regprocedure, 'pg_proc')

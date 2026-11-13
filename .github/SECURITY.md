@@ -3,11 +3,11 @@
 ## Supported versions
 
 `pg_xclaim` is in **release-candidate** state. Security fixes land on
-the current tag (`v1.0.0-rc3`) and on `main`.
+the current tag (`v1.0.0-rc4`) and on `main`.
 
 | Version | Security fixes |
 |---------|----------------|
-| `v1.0.0-rc3` (current) / `main` | Yes |
+| `v1.0.0-rc4` (current) / `main` | Yes |
 
 PostgreSQL major-version matrix: PG 16, 17, 18 (upstream and
 ABI-compatible forks). Security fixes apply to all three majors

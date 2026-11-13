@@ -59,7 +59,7 @@ the planned maintenance window.
 
 | Stage | Action | Owner | Gate to next stage                                                                                                                                                                                                                         |
 |-------|--------|-------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 0 | Build `pg_xclaim.so` against the target PG major (16/17/18) on the build host: `make PG_CONFIG=... && sudo make PG_CONFIG=... install`. | Build | `smoke_gate.sh` exit 0 in CI (`.github/workflows/ci-pg-matrix.yml`). The `pg_xclaim.so`, `pg_xclaim.control`, `pg_xclaim--1.0.0-rc1.sql` and the update scripts `pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql` and `pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql` files are installed under `$(pg_config --pkglibdir)` and `$(pg_config --sharedir)/extension/`. |
+| 0 | Build `pg_xclaim.so` against the target PG major (16/17/18) on the build host: `make PG_CONFIG=... && sudo make PG_CONFIG=... install`. | Build | `smoke_gate.sh` exit 0 in CI (`.github/workflows/ci-pg-matrix.yml`). The `pg_xclaim.so`, `pg_xclaim.control`, `pg_xclaim--1.0.0-rc1.sql` and the update scripts `pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql`, `pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql` and `pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql` files are installed under `$(pg_config --pkglibdir)` and `$(pg_config --sharedir)/extension/`. |
 | 1 | Add `pg_xclaim` as the **last** entry in `shared_preload_libraries` (PostgreSQL invokes xact callbacks in LIFO order - the last one registered runs first) and the `pg_xclaim.*` GUCs in `postgresql.conf`. Restart the cluster. | DBA | server starts, log line `pg_xclaim: shared memory initialized (...)` is present, no `FATAL` during `_PG_init`.                                                                                                                             |
 | 2 | Run `CREATE EXTENSION pg_xclaim;` in every database that needs the new SQL surface. | DBA | `SELECT * FROM xclaim.stats();` returns a valid row in each database, `\dx pg_xclaim` shows the installed version.                                                                                                                         |
 | 3 | On the **dev cluster**: apply the per-site rewrite DDL (replace `pg_try_advisory_xact_lock(...)` with `xclaim.try(...)` in target functions). | DBA | The post-check finds zero remaining `pg_try_advisory_xact_lock` references on migrated paths, functional smoke tests pass.                                                                                                                 |
@@ -110,6 +110,7 @@ test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim.control"
 test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc1.sql"
 test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql"
 test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql"
+test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql"
 ```
 
 For a multi-major matrix (16/17/18), repeat the `make` + `make install`

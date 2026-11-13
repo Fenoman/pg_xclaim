@@ -60,7 +60,7 @@
 
 | Этап | Действие | Ответственный | Критерий перехода к следующему                                                                                                                                                                                              |
 |------|----------|---------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 0 | Собрать `pg_xclaim.so` под целевой PG-major (16/17/18) на build-хосте: `make PG_CONFIG=... && sudo make PG_CONFIG=... install`. | Build | `smoke_gate.sh` exit 0 в CI (`.github/workflows/ci-pg-matrix.yml`). Файлы `pg_xclaim.so`, `pg_xclaim.control`, `pg_xclaim--1.0.0-rc1.sql` и скрипты обновления `pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql` и `pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql` установлены в `$(pg_config --pkglibdir)` и `$(pg_config --sharedir)/extension/`. |
+| 0 | Собрать `pg_xclaim.so` под целевой PG-major (16/17/18) на build-хосте: `make PG_CONFIG=... && sudo make PG_CONFIG=... install`. | Build | `smoke_gate.sh` exit 0 в CI (`.github/workflows/ci-pg-matrix.yml`). Файлы `pg_xclaim.so`, `pg_xclaim.control`, `pg_xclaim--1.0.0-rc1.sql` и скрипты обновления `pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql`, `pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql` и `pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql` установлены в `$(pg_config --pkglibdir)` и `$(pg_config --sharedir)/extension/`. |
 | 1 | Добавить `pg_xclaim` в `shared_preload_libraries` **последним** элементом списка (PG вызывает xact-callback'и в LIFO-порядке - последний зарегистрированный отрабатывает первым) и GUC'и `pg_xclaim.*` в `postgresql.conf`. Перезапустить кластер. | DBA | сервер стартует, в логе строка `pg_xclaim: shared memory initialized (...)`, нет `FATAL` во время `_PG_init`.                                                                                                               |
 | 2 | Выполнить `CREATE EXTENSION pg_xclaim;` в каждой базе, которой нужен новый SQL surface. | DBA | `SELECT * FROM xclaim.stats();` возвращает валидную строку в каждой базе, `\dx pg_xclaim` показывает установленную версию.                                                                                                  |
 | 3 | На **dev-кластере**: пересобрать функции по местам вызова (заменить `pg_try_advisory_xact_lock(...)` на `xclaim.try(...)` в целевых функциях). | DBA | Пост-проверка не находит остаточных ссылок на `pg_try_advisory_xact_lock` на мигрированных путях, функциональные smoke-тесты проходят.                                                                                      |
@@ -112,6 +112,7 @@ test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim.control"
 test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc1.sql"
 test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql"
 test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql"
+test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql"
 ```
 
 Для multi-major матрицы (16/17/18) повторить последовательность

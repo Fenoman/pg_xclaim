@@ -355,7 +355,8 @@ pg_xclaim/
 ├── sql/
 │   ├── pg_xclaim--1.0.0-rc1.sql               # install script
 │   ├── pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql    # update script
-│   └── pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql    # update script
+│   ├── pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql    # update script
+│   └── pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql    # update script
 ├── src/
 │   ├── pg_xclaim.c                            # _PG_init + GUCs + glue
 │   ├── pg_xclaim_compat.h                     # PG 16/17/18 ABI shim
@@ -764,12 +765,12 @@ Copyright (c) 2026, E. Pavlichenko.
 
 ## Status
 
-**v1.0.0-rc3** - third release candidate of an experimental
+**v1.0.0-rc4** - fourth release candidate of an experimental
 proof-of-concept. Documentation and tests are in place, build matrix
 green on PG 16/17/18, the code is covered by a 3-tier test suite plus
 perf budgets.
 
-Why `1.0.0-rc3` rather than `0.x` while still "experimental": the public
+Why `1.0.0-rc4` rather than `0.x` while still "experimental": the public
 SQL API is frozen (function signatures, GUC names, schema), and the
 extension passes the full test matrix on PG 16/17/18. "Experimental"
 refers to the narrowness of the niche and operational maturity, not to
