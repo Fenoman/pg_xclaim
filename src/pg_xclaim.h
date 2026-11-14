@@ -109,6 +109,7 @@ struct XClaimKey;
 struct XClaimEntry;
 extern bool xclaim_try_internal(const struct XClaimKey *lk);
 extern bool xclaim_handle_capacity_exhaustion(const struct XClaimKey *lk);
+extern bool xclaim_try_many_in_progress(void);
 
 /*
  * pg_xclaim_stats.c: capacity-watermark logging.

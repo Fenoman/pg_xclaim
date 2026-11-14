@@ -140,7 +140,7 @@ Edit `postgresql.conf`:
 # at commit (PostgreSQL invokes xact callbacks in LIFO order).
 shared_preload_libraries = 'citus,timescaledb,pg_xclaim'
 
-pg_xclaim.max_claims                  = 4194304    # 4M (default, ~360 MB shmem)
+pg_xclaim.max_claims                  = 4194304    # 4M (default, ~291 MB shmem)
 pg_xclaim.num_partitions              = 128
 pg_xclaim.expected_claims_per_backend = 16384
 pg_xclaim.enabled                     = true
@@ -160,6 +160,26 @@ pg_xclaim.on_capacity_exhaustion      = error
 > first time a backend approaches the limit. That's the ready-made
 > "time to raise the GUC" signal. See `docs/runbook_en.md` §3.
 >
+> A raised GUC is a set of that size in every backend for its whole
+> life. With the default, the set grows only in a backend that needs it.
+> For `xclaim.try` the growth runs before the partition lock is taken.
+> `xclaim.try_many` grows the set before the lock at the boundary of each
+> run of keys of one partition, but inside a run the keys start their
+> probes from 1/`num_partitions` of the buckets, and the set grows by long
+> probes from a fill of ~0.1, under the partition lock (a known limit, see
+> `docs/runbook_en.md` §3). After 64 transactions in a row, each of which
+> took at least one claim and no more than the first array holds, a set
+> grown 4 times or more goes back to its first size and returns the
+> memory. An `xclaim.try_many` that needs half of the first array or more
+> breaks this count only while the set is less than 4 times the size the
+> call needs. Such a call gives the set, before its first lock, twice the
+> room the claims of the transaction need, up to the largest size the set
+> shrank from. Under a lock the set grows only when the backend has not
+> had a set of the needed size before (with keys the hash spreads evenly
+> over the partitions). Raise the GUC
+> when that first growth shows: for
+> example, behind a pooler that often replaces its backends.
+>
 > Total memory budget formula. Each held claim occupies a 48-byte
 > `XClaimLocalEntry`. With simplehash rounding to a power of two and a
 > ~75% load factor the effective cost is ~63 bytes per claim at 100k,
@@ -176,7 +196,7 @@ pg_xclaim.on_capacity_exhaustion      = error
 > Example. With `max_connections=200` and
 > `expected_claims_per_backend=750000`, that's ~10 GB cumulative
 > across backend TopMemoryContexts (~50.3 MB x 200), plus
-> ~360 MB shmem dynahash from `max_claims=4194304`. Account for this
+> ~291 MB shmem dynahash from `max_claims=4194304`. Account for this
 > in your cluster RAM sizing: per-backend pre-grow is the largest
 > line item in the cluster-wide budget.
 
@@ -207,14 +227,14 @@ never `public`).
 |----------|---------|
 | `xclaim.try(int4, int4) RETURNS boolean` | Two-arg API, signature matches `pg_try_advisory_xact_lock(int4, int4)` for ergonomic legacy migration. |
 | `xclaim.try(int8) RETURNS boolean` | Single-arg API, signature matches `pg_try_advisory_xact_lock(bigint)`. Distinct keyspace. |
-| `xclaim.try_many(int4, int4[]) RETURNS boolean[]` | Bulk variant, pre-sorts by partition (<= `num_partitions` LWLock cycles for the whole batch). |
+| `xclaim.try_many(int4, int4[]) RETURNS boolean[]` | Bulk variant, pre-sorts by partition (<= `num_partitions` LWLock cycles for the whole batch, in `warn` mode each capacity miss adds a cycle). |
 | `xclaim.try_many(int8[]) RETURNS boolean[]` | Bulk single-arg form. |
 | `xclaim.count() RETURNS int8` | Number of claims held by current top-level transaction. |
 | `xclaim.stats() RETURNS TABLE(...)` | Atomic counter snapshot + capacity gauges. `pg_monitor`. |
-| `xclaim.debug_snapshot() RETURNS TABLE(...)` | Detailed shared-state snapshot under shared locks on all partitions. `pg_monitor`, requires `pg_xclaim.num_partitions <= 192`. |
-| `xclaim.debug() RETURNS TABLE(...)` | All-partition consistent snapshot. **Superuser only.** |
+| `xclaim.debug_snapshot() RETURNS TABLE(...)` | Consistent snapshot of all claims. Under shared locks on all partitions it only copies the entries, and the result is built after the release: acquisitions wait for the copy only. `pg_monitor`, requires `pg_xclaim.num_partitions <= 192`. |
+| `xclaim.debug() RETURNS TABLE(...)` | The same snapshot as `debug_snapshot()`. **Superuser only.** |
 | `xclaim.debug_inject_stale(int4, int4) RETURNS void` | **Test-only.** Stale-entry injector (simulates an owner that did not survive a crash). **Superuser only**, `REVOKE`d from `PUBLIC`. Never called in production. |
-| `xclaim.session_reset() RETURNS void` | Optional triage hook. Force-clears local state and rotates owner_token. **Not required for routine operation:** claims are released automatically by the xact callback on every COMMIT/ABORT. Only for a session that holds claims outside a transaction (`xclaim.count() > 0` in autocommit). Normal operation never produces that state, see section 6 of `docs/runbook_en.md`. Do not wire into the pooler `server_reset_query` - it adds an RTT per handoff with no functional benefit. |
+| `xclaim.session_reset() RETURNS void` | Optional triage hook. Force-clears local state, gives an enlarged local set back to the allocator and rotates owner_token. Refuses inside a transaction block, in a parallel worker, inside `xclaim.try_many` and while the running transaction holds claims. **Not required for routine operation:** claims are released automatically by the xact callback on every COMMIT/ABORT. Only for a session that holds claims outside a transaction (`xclaim.count() > 0` in autocommit). It does not release claims of the running transaction: inside an explicit `BEGIN`, in a function, a DO block or the same statement as `xclaim.try` it raises an ERROR. Normal operation never produces that state, see section 6 of `docs/runbook_en.md`. Do not wire into the pooler `server_reset_query` - it adds an RTT per handoff with no functional benefit. |
 
 ### Function-attribute parity with `pg_try_advisory_xact_lock`
 
@@ -303,11 +323,11 @@ specific call site.
 
 | GUC | Type | Default | Description |
 |-----|------|---------|-------------|
-| `pg_xclaim.max_claims` | int4 | 4194304 | Shared dynahash capacity. Restart required. Footprint scales linearly with `max_claims`. Default sizing is ~360 MB, doubling `max_claims` -> doubling footprint. |
+| `pg_xclaim.max_claims` | int4 | 4194304 | Shared dynahash capacity. Restart required. Footprint scales linearly with `max_claims`. Default sizing is ~291 MB, doubling `max_claims` -> doubling footprint. |
 | `pg_xclaim.num_partitions` | int4 | 128 | Number of LWLock-protected partitions. Restart required. |
-| `pg_xclaim.expected_claims_per_backend` | int4 | 16384 | Pre-grow `simplehash` to avoid rehashes. Restart required. |
-| `pg_xclaim.enabled` | bool | true | Live kill-switch. Off = `xclaim.try` returns `true` unconditionally. `PGC_SUSET`. |
-| `pg_xclaim.capacity_warn_pct` | int4 | 80 | Watermark log threshold (LOG line at 80/90/95%). |
+| `pg_xclaim.expected_claims_per_backend` | int4 | 16384 | First size of the local `simplehash`: while a backend holds fewer claims, the set does not grow by its fill threshold (a long probe can grow it earlier). Restart required. |
+| `pg_xclaim.enabled` | bool | true | Live kill-switch. Off = `xclaim.try` and `xclaim.try_many` return `true` unconditionally and take nothing, `disabled_calls` grows per `try` call and per `try_many` element. Claims taken before the switch stay held until their transactions end, and `count()`, `debug()`, `debug_snapshot()` show them. `PGC_SUSET`. |
+| `pg_xclaim.capacity_warn_pct` | int4 | 80 | Watermark log threshold (LOG at 80% and 90%, WARNING at 95%). |
 | `pg_xclaim.on_capacity_exhaustion` | enum | error | `error` (default, ERRCODE 53400) / `warn` (log + return false). |
 
 See [`docs/runbook_en.md`](docs/runbook_en.md) for tuning guidance.
@@ -415,11 +435,11 @@ either infeasible or pays its own price in shmem. That is why this
 section gives a formula and an order of magnitude rather than one
 flattering number - size it for your own `max_connections` and claim peak.
 
-pg_xclaim **adds** a fixed shmem pool (`max_claims`, default ~360 MB)
+pg_xclaim **adds** a fixed shmem pool (`max_claims`, default ~291 MB)
 plus per-backend local memory:
 
 ```
-shmem (shared pool)       ~ chosen max_claims (default 4M -> ~360 MB)
+shmem (shared pool)       ~ chosen max_claims (default 4M -> ~291 MB)
 per-backend local         ~ 50.3 MB at 750k claims
                           ~ 6.3 MB at 100k claims
 cluster-wide local        ~ per-backend x number of active backends
@@ -429,7 +449,7 @@ Example (the high-cardinality scenario pg_xclaim is built for): 100k
 claims per transaction x 200 concurrent backends is 20M concurrent
 claims in the shared pool. The default 4M covers only ~41 such
 backends, so the scenario needs `pg_xclaim.max_claims` of at least
-20M, for example 25165824 (24M, ~2.2 GB of shmem). Local memory is
+20M, for example 25165824 (24M, ~1.8 GB of shmem). Local memory is
 ~6.3 MB x 200 = ~1.26 GB. In exchange you drop the per-backend memory
 of advisory locks (~34 MB/backend at 100k held locks: the LOCALLOCK
 hash and the lock owner arrays) and the need for an inflated
@@ -442,7 +462,7 @@ involved are backend-local, identical across versions). Full
 breakdown with pre-grown floor and simplehash growth is in
 [`docs/runbook_en.md` §9](docs/runbook_en.md#9-capacity-planning).
 Under a light workload (10-100 locks per transaction), switching to
-pg_xclaim **only adds** ~360 MB of shmem with no visible saving -
+pg_xclaim **only adds** ~291 MB of shmem with no visible saving -
 that kind of workload does not need pg_xclaim in the first place.
 
 ### Comparison with alternatives
@@ -567,7 +587,9 @@ each item are in [`docs/runbook_en.md`](docs/runbook_en.md).
 - **`PREPARE TRANSACTION` is rejected** (SQLSTATE `0A000`,
   `ERRCODE_FEATURE_NOT_SUPPORTED`). This is an explicit divergence from
   advisory: advisory locks **survive** `PREPARE`, pg_xclaim claims do
-  not. See `docs/runbook_en.md`.
+  not. The refusal also applies when a distributed transaction manager
+  sends `PREPARE`, for example to a Citus worker holding claims.
+  See `docs/runbook_en.md`.
 - **Try-only API:** no blocking acquire, no wait queue, no deadlock
   detection. Retry-loop acquisition ordering is the caller's
   responsibility. PostgreSQL's deadlock detector cannot see pg_xclaim
@@ -578,17 +600,16 @@ each item are in [`docs/runbook_en.md`](docs/runbook_en.md).
 - **Subtransaction lifetime** diverges from advisory: a claim survives
   `ROLLBACK TO SAVEPOINT` and is released only by the top-level
   COMMIT/ABORT (see the section above).
-- **At most 134217727 claims in one backend.** Beyond that the cleanup
-  at transaction end fails (PostgreSQL allocates at most 1 GB at a
-  time) and the cluster goes into PANIC. It needs
-  `max_claims >= 134217728`, so with the default 4M the limit cannot be
-  reached. See `docs/runbook_en.md` §9.
 - **Postgres Pro Enterprise autonomous transactions** are refused while
   pg_xclaim is in `shared_preload_libraries`: `BEGIN AUTONOMOUS` and an
   autonomous PL/pgSQL block fail with `pg_xclaim extension is incompatible
   with autonomous transactions`. The COMMIT or ABORT of an autonomous
   transaction would end its parent for pg_xclaim, and the parent would lose
   its claims.
+- **Tantor SE autonomous functions:** a claim taken by an SQL statement
+  belongs to the autonomous backend and ends with its transaction. A call
+  in a PL/pgSQL expression runs in the parent backend and keeps its claim
+  until the parent transaction ends.
 - **Windows** is untested and unsupported.
 - **Transaction pooling** (pgbouncer/odyssey in `transaction` mode):
   claims are tied to the transaction and released at its boundary, so do
@@ -612,6 +633,12 @@ REVOKE EXECUTE ON FUNCTION xclaim.try(int4, int4)        FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION xclaim.try_many(int8[])       FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION xclaim.try_many(int4, int4[]) FROM PUBLIC;
 ```
+
+Keys deliberately chosen for one partition can also keep its LWLock held
+through a long `try_many` run or transaction cleanup, delaying other claims
+in that partition. Interrupts, including `statement_timeout`, are deferred
+while that lock is held. The `warn` capacity mode does not bound this delay.
+Restrict `EXECUTE` for untrusted roles as above.
 
 Full threat model and vulnerability-disclosure process are in
 [`.github/SECURITY.md`](.github/SECURITY.md).

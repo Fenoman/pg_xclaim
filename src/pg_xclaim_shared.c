@@ -120,14 +120,19 @@ xclaim_install_shmem_hook(void)
 /*        + hash_estimate_size(max_claims, sizeof(XClaimEntry))         */
 /*        + num_partitions * sizeof(LWLockPadded)                       */
 /*        + MaxBackends    * sizeof(XClaimBackendInfo)                  */
-/*        + 25% headroom for dynahash freelist/segment growth           */
+/*        + 1% headroom for MAXALIGN / CACHELINEALIGN rounding          */
 /*                                                                      */
 /* Note: the stride is `sizeof(LWLockPadded)`, not `sizeof(LWLock)`.    */
 /* `RequestNamedLWLockTranche` returns a cache-line-padded array (see   */
 /* `storage/lwlock.h`), so using the bare LWLock size would under-count */
 /* the actual allocation by ~7 MB at the 65536-partition GUC ceiling.   */
-/* The 25% headroom would absorb the drift, but the formula MUST       */
-/* match the real stride for the LOG-line accounting to be honest.     */
+/* The formula matches the real stride so the LOG-line accounting is   */
+/* honest.                                                              */
+/*                                                                      */
+/* The table is HASH_FIXED_SIZE with init_size == max_size: dynahash    */
+/* allocates every bucket, segment and element at startup and never    */
+/* grows, and hash_estimate_size() covers exactly that allocation.      */
+/* The headroom covers rounding only.                                   */
 /*                                                                      */
 /* Memory size at default GUCs (max_claims=4M, num_partitions=128,      */
 /* MaxBackends=100):                                                    */
@@ -135,11 +140,11 @@ xclaim_install_shmem_hook(void)
 /*    hash_estimate_size(4M, 48B)    ~288 MB, same on PG 16/17/18       */
 /*    128 * sizeof(LWLockPadded)     ~16-32 KB (cache-line-padded)      */
 /*    100 * sizeof(XClaimBackendInfo) ~12.5 KB (cache-line padded)      */
-/*    + 25% headroom                                                    */
+/*    + 1% headroom                                                     */
 /*    ----------------                                                  */
-/*    ~360 MB shared memory total at defaults.                          */
+/*    ~291 MB shared memory total at defaults.                          */
 /*                                                                      */
-/* At max_claims=16M (high-concurrency clusters): ~1.4 GB.              */
+/* At max_claims=16M (high-concurrency clusters): ~1.14 GB.             */
 /* DBA must size shared_buffers + shmem reservation accordingly. The    */
 /* number is logged at LOG level in xclaim_shmem_startup (below) using  */
 /* the cached value computed here, so the request and the log line     */
@@ -176,8 +181,12 @@ xclaim_shmem_size(void)
     sz = add_size(sz, mul_size(xclaim_num_partitions, sizeof(LWLockPadded)));
     sz = add_size(sz, mul_size(mb, sizeof(XClaimBackendInfo)));
 
-    /* 25% headroom (rounded up to MAXALIGN). */
-    sz = add_size(sz, MAXALIGN(sz / 4));
+    /*
+     * 1% headroom (rounded up to MAXALIGN), at least 8 kB: the partitioned
+     * ShmemInitHash makes about 34 allocations, each rounded up to
+     * CACHELINEALIGN, which 1% of a small max_claims does not cover.
+     */
+    sz = add_size(sz, Max(MAXALIGN(sz / 100), (Size) 8192));
 
     xclaim_shmem_total_bytes = sz;
     return sz;

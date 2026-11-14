@@ -220,6 +220,8 @@ CREATE FUNCTION xclaim_test_published_token(int4) RETURNS int8
     AS '$XCLAIM_TEST_HOOKS', 'xclaim_test_published_token' LANGUAGE C STRICT;
 CREATE FUNCTION xclaim_test_set_published_token(int4, int8) RETURNS void
     AS '$XCLAIM_TEST_HOOKS', 'xclaim_test_set_published_token' LANGUAGE C STRICT;
+CREATE FUNCTION xclaim_test_call_with_lwlocks_held(regprocedure, int8) RETURNS bool
+    AS '$XCLAIM_TEST_HOOKS', 'xclaim_test_call_with_lwlocks_held' LANGUAGE C STRICT;
 SQL
 }
 

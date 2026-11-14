@@ -35,50 +35,61 @@
  *   * There is no Step 9: Step 8b falls through directly to Step 10. The gap
  *     is intentional, and "Step 9" does not appear anywhere in the body.
  *
+ *   Step 0     single CHECK_FOR_INTERRUPTS (only valid cancel point), before
+ *              any state is read
  *   Step 1     feature-flag short-circuit + transaction-state + parallel-
  *              worker guards
  *   Step 2     lazy init (local hash + owner_token)
  *   Step 3     key already constructed by caller (entry point), no-op here
  *   Step 5     hashvalue + partition_id compute (one get_hash_value call)
  *   Step 4     reentrancy fast-path -- O(1) local lookup, NO LWLock
- *   Step 4b    single CHECK_FOR_INTERRUPTS (only valid cancel point)
- *   Step 6     stack-only metadata: resolve `plock` from the hash -- no
- *              allocation (the local-set palloc is deferred to Step 11)
- *   Step 7     LWLockAcquire(partition_lock, LW_EXCLUSIVE)
+ *   Step 6     local entry added, NO LWLock: a growth of the local set
+ *              (which may ERROR on out of memory) runs before any shared
+ *              change. The entry is recorded as held only at Step 12
+ *   Step 7     LWLockAcquire(partition_lock, LW_EXCLUSIVE). Its ERROR
+ *              ("too many LWLocks taken") drops the Step 6 entry
  *   Step 8     combined lookup-or-insert (single HASH_ENTER_NULL under
  *              partition lock: *found distinguishes existing vs fresh,
  *              NULL signals capacity exhaustion on not-found path)
- *   Step 8a    own entry (found && matches_self) -> re-add to local set,
- *              release, return true
+ *   Step 8a    own entry (found && matches_self) -> the Step 6 entry
+ *              restores the local side, release, record, return true
  *   Step 8b    conflict (found && !matches_self) -> stale-owner reaper:
  *              if stale, take over via overwrite-in-place at Step 10,
- *              else release + return false
+ *              else release, drop the Step 6 entry, return false.
+ *              Capacity exhaustion (NULL) also releases and drops it
  *   Step 10    populate shared XClaimEntry owner_* fields (saved triple) --
  *              writes fresh-insert slot OR overwrites a stale-reap'd slot
- *   Step 11    LAST FALLIBLE STEP UNDER LOCK -- PG_TRY/PG_CATCH around
- *              `xclaim_local_insert_held` (palloc may ERROR -> rollback
- *              shared insert + release + PG_RE_THROW)
- *   Step 12    LWLockRelease (LINEARIZATION POINT) + counter increment
+ *   Step 12    LWLockRelease (LINEARIZATION POINT), the Step 6 entry is
+ *              recorded as held, counter increment
  *
  * HARD invariants enforced here:
  *   * `XCLAIM_REQUIRE_INIT()` is the FIRST executable statement of every
  *     SQL-callable C entry point (the entry points in pg_xclaim.c, NOT this
  *     internal helper -- the macro must run before any code path that could
  *     deref shared state).
- *   * `CHECK_FOR_INTERRUPTS()` ONLY in Step 4b -- never between Step 8
- *     (shared insert) and Step 12. Cancel between shared insert and local
- *     insert would leak the shared entry: the xact callback iterates the
- *     local set to find rows to remove, so an orphaned shared-without-local
- *     entry is invisible to it. Recovery in that scenario relies on the lazy
+ *   * `CHECK_FOR_INTERRUPTS()` ONLY in Step 0 -- never between the
+ *     reentrancy probe of Step 4 and the release of Step 12. Interrupts
+ *     processed between the probe and the insert could run SQL (a message
+ *     hook) that takes the same key. Between the local insert of Step 6
+ *     and the release of Step 12 only LWLockAcquire can raise an ERROR,
+ *     before it takes the lock, and Step 7 drops the Step 6 entry then. A
+ *     cancel there would leave a local entry without its shared row
+ *     (another backend takes the key while this one believes it holds
+ *     it), or a shared row without its local entry: the xact callback
+ *     iterates the local set to find rows to remove, so an orphaned
+ *     shared-without-local entry is invisible to it. Recovery in that
+ *     scenario relies on the lazy
  *     stale-owner reaper (which can only fire once ANOTHER backend conflicts
  *     on the same key AND the owning backend has since exited or rotated its
  *     owner_token -- it never reaps an entry whose owner backend is still
  *     alive and holding it). The backend-exit callback walks the local set
  *     too and cannot find such a row, but it invalidates the owner_token,
  *     so the reaper can take the row once the backend has exited.
- *   * LWLock acquire/release pairing 1:1 -- Step 11 wraps the fallible
- *     allocation in PG_TRY/PG_CATCH and rolls back the shared insert before
- *     PG_RE_THROW, so PostgreSQL's error path always fires LWLockRelease.
+ *   * LWLock acquire/release pairing 1:1 -- no code between Step 7 and
+ *     Step 12 can raise an ERROR, so every path reaches LWLockRelease.
+ *     The bulk path (xclaim_try_many_internal) inserts local entries under
+ *     the partition lock and keeps a PG_TRY/PG_CATCH that rolls back the
+ *     shared inserts and releases the lock.
  *   * Linearization point = `LWLockRelease` at Step 12 (success) or Step 8b
  *     (conflict) -- documented inline.
  *   * Capacity exhaustion is NOT logical conflict: default mode is
@@ -139,6 +150,19 @@
 static bool xclaim_bulk_warn_context_active = false;
 static bool xclaim_bulk_warn_emitted_this_call = false;
 static int  xclaim_bulk_warn_suppressed_count = 0;
+
+/*
+ * True while an xclaim.try_many loop runs in this backend: the scope above
+ * opens before the loop and closes after it. The capacity WARNING inside
+ * the loop runs an emit_log_hook, and xclaim.session_reset() refuses to
+ * run from there (it would rotate the owner token of the claims the loop
+ * is about to take).
+ */
+bool
+xclaim_try_many_in_progress(void)
+{
+    return xclaim_bulk_warn_context_active;
+}
 
 /* -------------------------------------------------------------------- */
 /* xclaim_handle_capacity_exhaustion                                    */
@@ -251,6 +275,7 @@ bool
 xclaim_try_internal(const XClaimKey *lk)
 {
     XClaimLocalEntry   *existing_local = NULL;
+    XClaimLocalEntry   *added;
     uint32              hashvalue;
     uint32              partition_id;
     LWLock             *plock;
@@ -259,6 +284,29 @@ xclaim_try_internal(const XClaimKey *lk)
 
     Assert(lk != NULL);
     Assert(lk->form == XCLAIM_FORM_SOLO || lk->form == XCLAIM_FORM_PAIR);
+
+    /* ----------------------------------------------------------------
+     * Step 0: single cancel point, before any state is read.
+     *
+     * `CHECK_FOR_INTERRUPTS()` ONLY here. The interrupts processed here
+     * can write messages, and an emit_log_hook can run SQL: an
+     * xclaim.try of the same key, or xclaim.session_reset(), which
+     * rotates the owner token to 0. Every step below reads the state
+     * after them: the guards, the owner token, the reentrancy probe
+     * and the local insert.
+     *
+     * Nothing below processes interrupts until the release in Step 12.
+     * From the local insert in Step 6 to that release the local entry
+     * and the shared row must change together: a cancel or terminate
+     * processed in between would leave a local entry without its shared
+     * row (another backend could take the key while this one believes
+     * it holds it), or a shared row without its local entry (the cleanup
+     * walks the LOCAL SET and would never release it). LWLockAcquire,
+     * HASH_ENTER_NULL, the populate and LWLockRelease do not process
+     * interrupts, and no step before them writes a message. Only
+     * LWLockAcquire raises an ERROR, before it takes the lock (Step 7).
+     * ---------------------------------------------------------------- */
+    CHECK_FOR_INTERRUPTS();
 
     /* ----------------------------------------------------------------
      * Step 1: feature-flag + transaction-state guards.
@@ -352,27 +400,24 @@ xclaim_try_internal(const XClaimKey *lk)
     }
 
     /* ----------------------------------------------------------------
-     * Step 4b: single cancel point.
+     * Step 6: local insert, BEFORE the partition LWLock.
      *
-     * `CHECK_FOR_INTERRUPTS()` ONLY here -- after the reentrancy
-     * fast-path and BEFORE any shared-state mutation. Placing it
-     * between Step 8 (shared insert) and Step 11 (local insert)
-     * would leave the shared entry orphaned on cancel: the xact
-     * callback's cleanup walks the LOCAL SET, so a shared-without-
-     * local row is invisible to it. Recovery in that case relies on
-     * the lazy stale-owner reaper -- which cannot fire while THIS
-     * backend is still alive and owns the token, so it only helps
-     * after the backend exits (its exit callback invalidates the
-     * token) or rotates its owner_token. That ordering is forbidden.
+     * A growth of the local set allocates and rehashes the whole set.
+     * simplehash grows by its fill threshold and, earlier, when a key
+     * probes too far from its bucket. Under the partition lock every
+     * backend that needs the partition would wait for that growth, so
+     * the local entry goes in first, with no lock held. An out-of-memory
+     * ERROR here leaves no shared state behind.
+     *
+     * The entry is only added here. Step 12 records it as held (live
+     * count, peak, held-key list, 75% hint) once the shared row is ours.
+     * When the shared insert fails (conflict, capacity), Step 8 drops the
+     * entry after the release and the backend's state is as before the
+     * call.
      * ---------------------------------------------------------------- */
-    CHECK_FOR_INTERRUPTS();
+    xclaim_local_reserve(1);
+    added = xclaim_local_add(lk, hashvalue, partition_id);
 
-    /* ----------------------------------------------------------------
-     * Step 6: stack-only metadata. No allocation -- the local-set
-     * `palloc` happens in Step 11, AFTER the shared insert. This
-     * ordering is what makes the PG_TRY/PG_CATCH wrap necessary (a
-     * palloc-ERROR after the shared insert needs to roll back).
-     * ---------------------------------------------------------------- */
     plock = xclaim_partition_lock(hashvalue);
     Assert(plock != NULL);
 
@@ -380,10 +425,25 @@ xclaim_try_internal(const XClaimKey *lk)
      * Step 7: acquire partition LWLock EXCLUSIVE.
      *
      * From here through Step 12 the lock is held. Every code path
-     * MUST end with `LWLockRelease(plock)` -- the PG_TRY/PG_CATCH at
-     * Step 11 enforces this even on `palloc(... )` -> ERROR.
+     * MUST end with `LWLockRelease(plock)`, and none of them raises an
+     * ERROR before it.
+     *
+     * LWLockAcquire raises "too many LWLocks taken" when the backend
+     * already holds MAX_SIMUL_LWLOCKS, before it takes the lock. The
+     * Step 6 entry is dropped then: a subtransaction that catches the
+     * ERROR must not find the key in the local set, where the reentrancy
+     * fast path would report a claim that has no shared row.
      * ---------------------------------------------------------------- */
-    LWLockAcquire(plock, LW_EXCLUSIVE);
+    PG_TRY();
+    {
+        LWLockAcquire(plock, LW_EXCLUSIVE);
+    }
+    PG_CATCH();
+    {
+        xclaim_local_drop(added);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
 
     /* ----------------------------------------------------------------
      * Step 8: combined lookup-or-insert under partition LWLock.
@@ -418,12 +478,12 @@ xclaim_try_internal(const XClaimKey *lk)
     {
         /*
          * Capacity exhaustion: key is not present AND HASH_FIXED_SIZE
-         * refuses to allocate. Release the LWLock BEFORE dispatching
-         * capacity policy: `XCLAIM_CAP_ERROR` calls ereport(ERROR),
-         * which unwinds through PG_TRY frames -- MUST NOT happen with
-         * the partition lock still held.
+         * refuses to allocate. Release the LWLock and drop the local
+         * entry of Step 6 BEFORE dispatching capacity policy:
+         * `XCLAIM_CAP_ERROR` calls ereport(ERROR).
          */
         LWLockRelease(plock);
+        xclaim_local_drop(added);
         return xclaim_handle_capacity_exhaustion(lk);
     }
 
@@ -433,44 +493,23 @@ xclaim_try_internal(const XClaimKey *lk)
          * Step 8a: own entry recovered.
          *
          * The shared entry exists AND its owner triple matches our
-         * saved triple (procno + lxid + token). This covers a local set
+         * live triple (procno + lxid + token). This covers a local set
          * that lost the entry while the shared row is still ours, which
-         * only a defect can cause. Re-add to the local set and return
-         * true.
+         * only a defect can cause. Step 6 put the local entry back, so
+         * both agree again: return true.
          *
          * We do NOT modify `new_entry` here -- HASH_ENTER_NULL returned
          * the existing entry pointer without touching its contents.
-         * The `xclaim_local_insert_held` palloc is fallible -- wrap in
-         * PG_TRY/PG_CATCH to roll back to a clean state on ERROR. We
-         * do NOT remove the shared row in CATCH here because the row
-         * was already ours BEFORE this call -- removing on ERROR would
-         * silently release a claim we held coming in. Re-throw the
-         * error after releasing the lock. The operator sees the
-         * palloc-ERROR and the shared row remains owned by us.
          * ------------------------------------------------------------ */
         if (xclaim_shared_owner_matches_self(new_entry))
         {
-            PG_TRY();
-            {
-                xclaim_local_insert_held(lk, hashvalue, partition_id);
-            }
-            PG_CATCH();
-            {
-                LWLockRelease(plock);
-                PG_RE_THROW();
-            }
-            PG_END_TRY();
-
-            /*
-             * LINEARIZATION POINT (own-entry recovery): the lock release
-             * below makes the local-set re-insertion visible-to-caller
-             * atomically with the shared row state.
-             */
             LWLockRelease(plock);
+            xclaim_local_note_held(lk, hashvalue);
             /* Per-backend stat slot (avoids shared cache-line ping-pong). */
             pg_atomic_fetch_add_u64(
                 &XClaimBackendInfos[xclaim_get_current_procno()].reentrant_hits_local,
                 1);
+            xclaim_local_emit_peak_warning();
             return true;
         }
 
@@ -502,9 +541,11 @@ xclaim_try_internal(const XClaimKey *lk)
              * LINEARIZATION POINT (conflict): the lock release below
              * publishes the "we did not modify the row" decision.
              * HASH_ENTER_NULL did not allocate -- it returned the
-             * existing pointer -- so no rollback needed.
+             * existing pointer -- so the shared side needs no rollback.
+             * The local entry of Step 6 goes away after the release.
              */
             LWLockRelease(plock);
+            xclaim_local_drop(added);
             /* Per-backend stat slot (avoids shared cache-line ping-pong). */
             pg_atomic_fetch_add_u64(
                 &XClaimBackendInfos[xclaim_get_current_procno()].conflicts_local,
@@ -517,14 +558,12 @@ xclaim_try_internal(const XClaimKey *lk)
         /*
          * Fresh insert (`!found`): track live entry count for the
          * capacity-watermark hot path. This scalar insert pairs its
-         * increment with a matching SUB at the two scalar HASH_REMOVE
-         * sites -- the xact-callback cleanup and this function's own
-         * PG_CATCH rollback below. (The BULK rollback helper deliberately
-         * does NOT decrement per removed row: its batched end-of-loop
-         * flush never ran, so those rows were never added to the counter
-         * in the first place -- see xclaim_bulk_rollback_inserted.) The
-         * atomic load by the watermark check is then a single-cache-line
-         * read instead of a num_partitions-wide hash walk.
+         * increment with the SUB of the xact-callback cleanup. (The BULK
+         * path adds its inserts at each partition lock release and its
+         * PG_CATCH subtracts what it had added -- see
+         * xclaim_try_many_internal.) The atomic load by the watermark
+         * check is then a single-cache-line read instead of a
+         * num_partitions-wide hash walk.
          */
         pg_atomic_fetch_add_u64(&XClaimCtl->live_capacity, 1);
     }
@@ -556,90 +595,25 @@ xclaim_try_internal(const XClaimKey *lk)
     }
 
     /* ----------------------------------------------------------------
-     * Step 11: commit local -- LAST FALLIBLE STEP UNDER LWLOCK.
-     *
-     * `xclaim_local_insert_held` does palloc inside
-     * MemoryContextSwitchTo(XClaimLocalContext) for the simplehash
-     * grow path. palloc can ereport(ERROR) on OOM. If it does, we MUST
-     * roll back the shared insert (HASH_REMOVE under same lock) and
-     * release the LWLock before re-throwing -- otherwise the shared
-     * row leaks: the xact callback walks the local set and never
-     * sees a shared row that has no local entry.
-     *
-     * `PG_RE_THROW` propagates the original error up the elog stack
-     * unchanged.
-     * ---------------------------------------------------------------- */
-    PG_TRY();
-    {
-        xclaim_local_insert_held(lk, hashvalue, partition_id);
-    }
-    PG_CATCH();
-    {
-        (void) hash_search_with_hash_value(XClaimHash,
-                                           lk,
-                                           hashvalue,
-                                           HASH_REMOVE,
-                                           NULL);
-        pg_atomic_fetch_sub_u64(&XClaimCtl->live_capacity, 1);
-        LWLockRelease(plock);
-
-        /*
-         * Drop any local entry that landed in XClaimLocalSet before the
-         * throw. xclaim_local_insert_held inserts into the simplehash
-         * BEFORE its own watermark ereport(LOG) -- if that ereport
-         * happens to longjmp (errmsg formatting OOM, QueryCancelPending
-         * delivered between the insert and the message emission, or an
-         * emit_log_hook that elevates LOG to ERROR), the local entry
-         * survives the throw while we have already HASH_REMOVE'd the
-         * shared row above. If the caller is a plpgsql block with
-         * EXCEPTION WHEN OTHERS, the transaction continues with a ghost
-         * local entry whose shared row is gone -- the next reentrancy
-         * probe via xclaim_local_lookup returns true (silently
-         * "reentrant hit") while a concurrent backend can simultaneously
-         * acquire the same key against the empty shared hash, breaking
-         * mutual exclusion.
-         *
-         * xclaim_local_remove is idempotent: if the throw fired BEFORE
-         * the local insert (e.g. xcl_local_insert palloc OOM during
-         * grow), it is a no-op. A failed growth leaves the set consistent
-         * (xcl_local_allocate in pg_xclaim_local.c), so the delete probes
-         * the bucket array the set uses. The bulk path's xclaim_bulk_-
-         * rollback_inserted helper applies the same defense for the same
-         * reason.
-         */
-        xclaim_local_remove(lk);
-
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-
-    /* ----------------------------------------------------------------
      * Step 12: success.
      *
      * LINEARIZATION POINT: the `LWLockRelease` immediately below is
      * the moment another backend can observe our newly-inserted row.
-     * Every state mutation (shared insert + local insert) is atomic
+     * Every state mutation (local insert + shared insert) is atomic
      * with respect to other backends as of this release.
      *
-     * After the release we increment `total_acquires` and feed the
-     * watermark trigger. Both touch only atomic counters and are not
-     * order-sensitive vs other backends.
+     * After the release the Step 6 entry is recorded as held, then we
+     * increment `total_acquires`, publish the peak and write the messages
+     * of the call. These touch only backend-local state and atomic
+     * counters and are not order-sensitive vs other backends.
      * ---------------------------------------------------------------- */
     LWLockRelease(plock);
+    xclaim_local_note_held(lk, hashvalue);
 
-    {
-        /*
-         * Per-backend stat slot (avoids shared cache-line ping-pong).
-         * xclaim_check_capacity_watermark reads live_capacity from its
-         * own atomic and ignores its argument, so we pass 0 to avoid an
-         * extra atomic load on the hot path.
-         */
-        pg_atomic_fetch_add_u64(
-            &XClaimBackendInfos[xclaim_get_current_procno()].total_acquires_local,
-            1);
-
-        xclaim_check_capacity_watermark(0);
-    }
+    /* Per-backend stat slot (avoids shared cache-line ping-pong). */
+    pg_atomic_fetch_add_u64(
+        &XClaimBackendInfos[xclaim_get_current_procno()].total_acquires_local,
+        1);
 
     /*
      * Update the global per-backend peak high-water-mark. CAS loop bounded
@@ -658,6 +632,15 @@ xclaim_try_internal(const XClaimKey *lk)
         } while (!pg_atomic_compare_exchange_u64(&XClaimCtl->peak_per_backend,
                                                  &prev_peak, cur_local));
     }
+
+    /*
+     * Messages last. Writing one ends with CHECK_FOR_INTERRUPTS() in
+     * errfinish(), and a cancel processed there finds every counter of
+     * this call updated. xclaim_check_capacity_watermark reads
+     * live_capacity from its own atomic and ignores its argument.
+     */
+    xclaim_local_emit_peak_warning();
+    xclaim_check_capacity_watermark(0);
 
     return true;
 }
@@ -702,8 +685,8 @@ xclaim_try_internal(const XClaimKey *lk)
  *     HASH_ENTER_NULL miss.
  *   - reentrancy fast-path per slot via xclaim_local_lookup happens
  *     here in the inner loop.
- *   - watermark check after each successful per-slot insert (and
- *     observability re-checks at end of batch).
+ *   - one watermark check after the loop, once every partition lock is
+ *     released (live_capacity moves only at the lock releases).
  * ===================================================================== */
 
 /*
@@ -841,13 +824,12 @@ xclaim_bulk_bucket_sort(XClaimBulkSlot *slots, int nslots)
  *      local entry IS present and gets cleared. Net: the local set is
  *      kept consistent with the shared dynahash on every code path.
  *
- *      live_capacity bookkeeping: deliberately omitted here. The
- *      end-of-loop batched ADD never executed (PG_CATCH skipped past
- *      it), so the rows we are now removing were never counted in
- *      live_capacity in the first place -- a counter SUB here would
- *      overshoot. Reap-site SUBs fired earlier at their own call sites
- *      and stay applied because the reaped stale rows are gone for
- *      good. See the long-form analysis at the top of
+ *      live_capacity bookkeeping: not here. Part of the removed rows was
+ *      already added to live_capacity at a lock release of the loop, the
+ *      rest was not, and the caller subtracts the added part
+ *      (`flushed_capacity`) once. Reap-site SUBs fired earlier at their
+ *      own call sites and stay applied because the reaped stale rows are
+ *      gone for good. See the live_capacity accounting at the top of
  *      `xclaim_try_many_internal` for the full case enumeration.
  */
 static void
@@ -892,6 +874,22 @@ xclaim_bulk_rollback_inserted(XClaimBulkInserted *inserted, uint32 count)
  *      slots directly. The caller then constructs the Postgres array via
  *      construct_md_array, honouring the result-NULL bitmap.
  */
+/*
+ * Adds the rows inserted under the partition lock held now to
+ * live_capacity. Runs before every LWLockRelease of the bulk loop, see the
+ * live_capacity accounting in xclaim_try_many_internal.
+ */
+#define XCLAIM_BULK_FLUSH_CAPACITY() \
+    do { \
+        if (pending_capacity > 0) \
+        { \
+            pg_atomic_fetch_add_u64(&XClaimCtl->live_capacity, \
+                                    (uint64) pending_capacity); \
+            flushed_capacity += pending_capacity; \
+            pending_capacity = 0; \
+        } \
+    } while (0)
+
 static void
 xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
                          bool *result_values, bool *result_nulls)
@@ -910,27 +908,18 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
      * cleans up shared rows that should already be gone, and its
      * SUBs drive live_capacity negative.)
      *
-     * `total_inserted` (declared below) is `volatile` for the SAME
-     * reason: it is mutated inside PG_TRY (incremented per fresh insert)
-     * and the C99 setjmp-clobber rule applies to it as well. The batched
-     * live_capacity flush that reads it runs at the tail of the PG_TRY
-     * body, but keeping it volatile is the safe, rule-conforming choice
-     * for any local crossing the sigsetjmp boundary. `procno` is the one
+     * `total_inserted` and the other per-call counters (declared below)
+     * are `volatile` for the SAME reason: they are mutated inside PG_TRY
+     * and read after PG_END_TRY, and the C99 setjmp-clobber rule (and
+     * GCC -Wclobbered) applies to them as well. `procno` is the one
      * local that is genuinely non-volatile: it is assigned ONCE before
      * the PG_TRY and never read from PG_CATCH, so no clobber hazard
      * applies.
-     *
-     * `current_pid_marker` is also NOT read from PG_CATCH, but it is
-     * declared `volatile` to suppress a GCC -Werror=clobbered
-     * false-positive on aarch64 (GCC 13.3, PG 16 build). The single
-     * extra stack reload per iteration of the bulk loop is negligible
-     * vs the partition-LWLock work that follows it.
      */
     XClaimBulkInserted  * volatile inserted = NULL;
     volatile uint32      inserted_count = 0;
     LWLock              * volatile current_plock = NULL;
     volatile bool        have_partition_lock = false;
-    volatile uint32      current_pid_marker;
     int                  procno;            /* cached for per-slot stat slot */
 
     /*
@@ -944,55 +933,54 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
     volatile bool        saved_warn_emitted    = false;
     volatile int         saved_warn_suppressed = 0;
     /*
-     * Batched live_capacity increment. `total_inserted` counts fresh
-     * HASH_ENTER_NULL successes during the bulk loop. We add the
-     * aggregate to live_capacity exactly ONCE after the loop, avoiding
-     * per-slot contention on that cache line.
+     * live_capacity accounting.
      *
-     * Stale-reap path does the per-call atomic SUB at the reap site
-     * (the slot's previous, stale occupant is being dropped from the
-     * live count) and then OVERWRITES the entry's owner triple in place
-     * in Step 10 -- there is no HASH_REMOVE, and the dynahash slot itself
-     * never leaves the table. The overwrite is recorded in inserted[]
-     * just like a fresh insert and bumps total_inserted, so the batched
-     * flush re-adds the slot. Aggregate delta is correct for any
-     * reap+insert combination.
+     * What it does. `pending_capacity` counts the rows this call
+     * inserted under the partition lock it holds now. Every
+     * LWLockRelease inside the loop is preceded by one atomic ADD of
+     * `pending_capacity` to live_capacity, and `flushed_capacity` keeps
+     * the running total of those ADDs. That is at most one ADD per
+     * partition run, so <= num_partitions atomics per call.
      *
-     * Rollback path (PG_CATCH) consistency analysis:
-     *   - The flush at end-of-loop never runs, so the `inserted_count`
-     *     fresh inserts contribute 0 to live_capacity.
-     *   - `xclaim_bulk_rollback_inserted` HASH_REMOVE's exactly those
-     *     recorded inserts, and they were never counted in live_capacity,
-     *     so no counter adjustment is needed for them.
-     *   - Reap-side SUBs already fired immediately at each reap site.
-     *     The reap is an overwrite-in-place: the SUB drops the stale
-     *     occupant from the live count while the dynahash slot stays in
-     *     the table. That slot is recorded in inserted[], so rollback
-     *     HASH_REMOVE's it here -- which is exactly the removal the SUB
-     *     anticipated, now made real.
-     *   - For a reap-then-insert slot whose overwrite gets rolled back,
-     *     the net hash-state change is "row gone" (-1 live entry: it
-     *     existed before the call, rollback removed it) and the net
-     *     live_capacity change is "-1" (the SUB at reap, no ADD because
-     *     no flush). They match.
+     * Why at each release. Interrupts are processed only while no
+     * partition lock is held (the CHECK_FOR_INTERRUPTS before the probe
+     * of a slot handled with no lock held, the ereport of WARN mode). A FATAL there (terminate,
+     * transaction_timeout, lost client) goes to proc_exit without
+     * PG_CATCH, and the backend-exit cleanup subtracts every row in the
+     * local set. With each run already added, the counter matches the
+     * rows it subtracts.
      *
-     * Net: rollback path itself needs no counter work. The per-reap
-     * SUBs and the absent flush cooperate to keep live_capacity in sync
-     * with the post-rollback shared-hash state -- PROVIDED that
-     * `inserted` and `inserted_count` are observed correctly in
-     * PG_CATCH (see the `volatile` declarations above: without them
-     * the rollback would run with `inserted_count == 0`, leak the
-     * shared rows for the xact callback to find, and the cleanup-side
-     * SUB would double-count, driving live_capacity negative).
+     * Stale reap. The reap site subtracts the stale occupant at once,
+     * and Step 10 overwrites the entry in place. The overwrite is
+     * recorded in inserted[] and counted in `pending_capacity` like a
+     * fresh insert.
+     *
+     * Rollback (PG_CATCH). `xclaim_bulk_rollback_inserted` removes every
+     * row in inserted[], and the catch subtracts `flushed_capacity`:
+     *   - a fresh insert already added: +1 then -1, row gone
+     *   - a fresh insert not yet added: 0, row gone
+     *   - a reaped slot already added: -1 +1 -1, the stale row is gone
+     *   - a reaped slot not yet added: -1, the stale row is gone
+     *
+     * `inserted`, `inserted_count` and `flushed_capacity` are volatile:
+     * PG_CATCH reads them (see above). Without that the rollback could
+     * run with `inserted_count == 0`, leave the rows for the xact
+     * callback, and its SUBs would drive live_capacity negative.
+     * `pending_capacity` is volatile for the same C99 rule, and so are
+     * the per-call counters below, which the loop changes and the code
+     * after PG_END_TRY reads (GCC -Wclobbered).
      */
-    volatile uint32      total_inserted = 0;
+    volatile uint32      pending_capacity = 0;
+    volatile uint32      flushed_capacity = 0;
+    volatile uint32      total_inserted = 0;    /* fresh rows of this call */
+    volatile uint64      acquires = 0;          /* per-backend stat deltas, */
+    volatile uint64      reentrant_hits = 0;    /* added once after the loop */
+    volatile uint64      conflicts = 0;
 
     Assert(nslots >= 0);
     Assert(slots != NULL || nslots == 0);
     Assert(result_values != NULL || nslots == 0);
     Assert(result_nulls != NULL || nslots == 0);
-
-    current_pid_marker = (uint32) -1;       /* sentinel: no partition active */
 
     /* enabled=off short-circuit: every non-NULL slot returns true. */
     if (!xclaim_enabled)
@@ -1027,9 +1015,12 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
     if (nslots == 0)
         return;                              /* empty array -> empty result */
 
-    /* Lazy init -- same as scalar xclaim_try_internal Step 2. */
+    /*
+     * Lazy init -- same as scalar xclaim_try_internal Step 2. The owner
+     * token is ensured inside the try_many scope below, where
+     * xclaim.session_reset() refuses.
+     */
     xclaim_local_init();
-    xclaim_ensure_owner_token();
 
     /*
      * Cache the per-backend stat-slot index once for the whole bulk call.
@@ -1058,6 +1049,14 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
      * this beats qsort O(N log N) for typical N.
      */
     xclaim_bulk_bucket_sort(slots, nslots);
+
+    /*
+     * Size the local set for the call before the first partition lock (see
+     * xclaim_local_prepare_bulk()): the runs below would otherwise grow it
+     * under their partition locks. An out-of-memory ERROR here touches no
+     * shared state.
+     */
+    xclaim_local_prepare_bulk((uint64) nslots);
 
     /*
      * Allocate the rollback tracker. Worst case: every input becomes a
@@ -1102,6 +1101,18 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
      */
     PG_TRY();
     {
+        /* Slots below it have room reserved in the local set. */
+        int         reserved_end = 0;
+        /* Partition of the run the loop is in. */
+        uint32      run_pid = (uint32) -1;
+
+        /*
+         * The token is ensured inside the try_many scope: a message
+         * written before it (an emit_log_hook can run SQL) cannot reach
+         * xclaim.session_reset() and rotate the token the loop records.
+         */
+        xclaim_ensure_owner_token();
+
         for (i = 0; i < nslots; i++)
         {
             XClaimBulkSlot     *slot = &slots[i];
@@ -1124,14 +1135,50 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
                  */
                 if (have_partition_lock)
                 {
+                    XCLAIM_BULK_FLUSH_CAPACITY();
                     LWLockRelease(current_plock);
                     have_partition_lock = false;
-                    current_pid_marker  = (uint32) -1;
                 }
                 result_nulls[oi]  = true;
                 result_values[oi] = false;
                 continue;
             }
+
+            /*
+             * A new partition run starts: release the lock of the previous
+             * run before anything else of this slot, the reentrancy probe
+             * included. A lock taken for one run is never held over the
+             * slots of the next ones, and a run of keys this backend already
+             * holds takes no lock at all. A repeated call over many held
+             * keys and a few new ones would otherwise keep the lock of the
+             * first new key's partition, with interrupts held, until the
+             * end of the array.
+             */
+            if (slot->partition_id != run_pid)
+            {
+                if (have_partition_lock)
+                {
+                    XCLAIM_BULK_FLUSH_CAPACITY();
+                    LWLockRelease(current_plock);
+                    have_partition_lock = false;
+                }
+                run_pid = slot->partition_id;
+            }
+
+            /*
+             * Cancel point: every slot processed with no partition LWLock
+             * held and no shared insert in flight, before its reentrancy
+             * probe. A query cancel here reaches PG_CATCH, which rolls back
+             * the inserts of the call and re-throws. The interrupts can
+             * write messages, and an emit_log_hook can run SQL that takes
+             * this slot's key: the probe below reads the local set after
+             * them, and nothing between the probe and the insert processes
+             * interrupts. Once the lock of a run is taken, the run's later
+             * slots get no cancel point: the run is about 1/num_partitions
+             * of the array.
+             */
+            if (!have_partition_lock)
+                CHECK_FOR_INTERRUPTS();
 
             /*
              * Step 4 reentrancy fast-path. Lookup is O(1) in the local
@@ -1147,58 +1194,51 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
                                               slot->hashvalue,
                                               &existing_local))
             {
-                /* Per-backend stat slot. */
-                pg_atomic_fetch_add_u64(
-                    &XClaimBackendInfos[procno].reentrant_hits_local, 1);
+                reentrant_hits++;
                 result_nulls[oi]  = false;
                 result_values[oi] = true;
                 continue;
             }
 
             /*
-             * Acquire the partition LWLock once per partition. If we are
-             * already holding the lock for this partition (run of slots
-             * with the same partition_id), reuse it. Otherwise release
-             * the previous and take the new.
-             *
-             * Cancel point: CHECK_FOR_INTERRUPTS at a partition
-             * boundary -- AFTER releasing any prior partition lock,
-             * BEFORE acquiring the next one. This is the analog of the
-             * scalar API's Step 4b cancel point: at this exact instant
-             * we hold no LWLock and have no in-flight shared insert
-             * that could be orphaned. A query-cancel here is
-             * safe -- PG_CATCH below will run xclaim_bulk_rollback_inserted
-             * for already-completed slots and re-throw. Without this,
-             * a 750k-key bulk acquire would be uncancellable for the
-             * duration of the loop, defeating statement_timeout and
-             * pg_cancel_backend.
-             *
-             * Placement justification: putting CHECK_FOR_INTERRUPTS
-             * inside a partition run (between two slots with the same
-             * partition_id and the lock continuously held) would still
-             * be safe re. shared state (no shared insert is ever
-             * mid-flight at the top of the loop iteration), but doing
-             * it at partition boundaries minimises the latency of the
-             * "next CFI" by piggybacking on the natural lock-cycle
-             * gap. For a partition run of N slots we still get at
-             * least one CFI per partition transition, which is the
-             * cancel-responsiveness we need.
+             * Take the partition LWLock for the first slot of the run that
+             * needs a shared insert. The lock stays held for the rest of the
+             * run and is released at the next run boundary (above), at a
+             * capacity miss, or after the loop. A lock held here always
+             * belongs to this slot's partition.
              */
-            if (!have_partition_lock || slot->partition_id != current_pid_marker)
+            if (!have_partition_lock)
             {
-                if (have_partition_lock)
+                /*
+                 * Grow the local set for this partition run now, with no
+                 * lock held: a growth under the partition lock rehashes the
+                 * whole set while every backend that needs the partition
+                 * waits. The run is sized by its slots, so keys that turn
+                 * out reentrant, conflicting or repeated cost at most one
+                 * run of extra room, not the whole array. An out-of-memory
+                 * ERROR here reaches PG_CATCH with no partition lock held.
+                 *
+                 * A capacity miss in warn mode releases the lock, and the
+                 * next slot of the same run takes it again. The end of the
+                 * run is known already (reserved_end), so that slot does
+                 * not walk the rest of the run again. The reservation
+                 * itself is repeated, O(1) when the room is there: the
+                 * interrupts and the WARNING of the miss can run SQL that
+                 * takes other keys.
+                 */
+                if (i >= reserved_end)
                 {
-                    LWLockRelease(current_plock);
-                    have_partition_lock = false;
-                    current_pid_marker  = (uint32) -1;
+                    reserved_end = i + 1;
+                    while (reserved_end < nslots &&
+                           !slots[reserved_end].is_null_input &&
+                           slots[reserved_end].partition_id == slot->partition_id)
+                        reserved_end++;
                 }
-
-                CHECK_FOR_INTERRUPTS();
+                xclaim_local_reserve((uint64) (reserved_end - i));
 
                 current_plock = xclaim_partition_lock(slot->hashvalue);
                 LWLockAcquire(current_plock, LW_EXCLUSIVE);
                 have_partition_lock = true;
-                current_pid_marker  = slot->partition_id;
             }
 
             /*
@@ -1223,9 +1263,9 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
                  *     so locks must be released first.
                  *   - WARN: just emits WARNING + returns false.
                  */
+                XCLAIM_BULK_FLUSH_CAPACITY();
                 LWLockRelease(current_plock);
                 have_partition_lock = false;
-                current_pid_marker  = (uint32) -1;
 
                 {
                     bool ok = xclaim_handle_capacity_exhaustion(&slot->key);
@@ -1254,8 +1294,7 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
                     xclaim_local_insert_held(&slot->key,
                                              slot->hashvalue,
                                              slot->partition_id);
-                    pg_atomic_fetch_add_u64(
-                        &XClaimBackendInfos[procno].reentrant_hits_local, 1);
+                    reentrant_hits++;
                     result_nulls[oi]  = false;
                     result_values[oi] = true;
                     continue;
@@ -1273,14 +1312,11 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
                  *   - live_capacity -= 1 immediately. The entry was
                  *     counted before reap (occupied by the dead owner).
                  *     After our overwrite the slot is still occupied,
-                 *     but by US, and total_inserted++ adds it back to
-                 *     the end-of-loop batched flush. Net at happy-path
-                 *     end-of-loop: 0 change. On PG_CATCH (before flush),
-                 *     the slot ends up HASH_REMOVE'd from the inserted[]
-                 *     walk, and live_capacity is already -1 from this site,
-                 *     so the final count correctly reflects "entry gone".
+                 *     but by US, and pending_capacity counts it like a
+                 *     fresh insert, added back before the lock release.
                  *   - inserted[] gets this slot, same as a fresh insert,
-                 *     so PG_CATCH rolls it back uniformly.
+                 *     so PG_CATCH rolls it back uniformly (the cases are
+                 *     listed at the live_capacity accounting above).
                  *
                  * Conflict (not stale): no mutation to new_entry, just
                  * return false for this slot. HASH_ENTER_NULL returning
@@ -1294,8 +1330,7 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
                 }
                 else
                 {
-                    pg_atomic_fetch_add_u64(
-                        &XClaimBackendInfos[procno].conflicts_local, 1);
+                    conflicts++;
                     result_nulls[oi]  = false;
                     result_values[oi] = false;
                     continue;
@@ -1304,11 +1339,12 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
 
             /*
              * Reached on fresh insert (!found) or stale-reap (found &&
-             * stale). Both contribute one occupant to the shared hash
-             * at end-of-loop: fresh insert is 0 immediate / +1 batched,
-             * stale-reap is -1 immediate / +1 batched.
+             * stale). Both add one occupant at the next lock release:
+             * fresh insert is 0 immediate / +1 there, stale-reap is
+             * -1 immediate / +1 there.
              */
             total_inserted++;
+            pending_capacity++;
 
             /* Step 10: populate shared entry's owner triple.
              * Use a distinct local name to avoid shadowing the outer
@@ -1346,16 +1382,7 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
 
             result_nulls[oi]  = false;
             result_values[oi] = true;
-
-            /*
-             * Bump total_acquires on the per-backend slot + run watermark
-             * check. The watermark check ignores its argument (it reads
-             * live_capacity from its own atomic), so we pass 0 to skip an
-             * unnecessary atomic load on the per-slot hot path.
-             */
-            pg_atomic_fetch_add_u64(
-                &XClaimBackendInfos[procno].total_acquires_local, 1);
-            xclaim_check_capacity_watermark(0);
+            acquires++;
         }   /* for each slot */
 
         /*
@@ -1366,32 +1393,9 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
          */
         if (have_partition_lock)
         {
+            XCLAIM_BULK_FLUSH_CAPACITY();
             LWLockRelease(current_plock);
             have_partition_lock = false;
-        }
-
-        /*
-         * Batched live_capacity flush. ONE atomic add for the whole
-         * bulk-acquire call, regardless of slot count. Concurrent
-         * readers (xclaim.stats(), watermark check) see the live_capacity
-         * climb in a single jump at end-of-batch. The slight delay vs
-         * per-slot increments has no operational impact (watermark
-         * suppression is timestamp-driven, not edge-triggered).
-         */
-        if (total_inserted > 0)
-        {
-            pg_atomic_fetch_add_u64(&XClaimCtl->live_capacity,
-                                    (uint64) total_inserted);
-
-            /*
-             * Final watermark check after the batched flush. The per-slot
-             * checks inside the inner loop above read live_capacity from
-             * its atomic, and that atomic is only updated by THIS call --
-             * so without a post-flush check, a bulk acquire that crosses
-             * the 80/90/95% bands in a single batch never fires a log.
-             * One additional call per bulk acquire is negligible.
-             */
-            xclaim_check_capacity_watermark(0);
         }
 
         /*
@@ -1424,25 +1428,56 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
          * in another backend. The xact callback would also eventually
          * fire on the PG_RE_THROW below, but by then the ghost would
          * already have allowed a duplicate acquire.
-         */
-        if (have_partition_lock)
-            LWLockRelease(current_plock);
-        xclaim_bulk_rollback_inserted(inserted, inserted_count);
-
-        /*
-         * Restore the outer-frame WARN-suppression scope on the error
-         * path. The incoming ERROR is the operator's signal -- no tail
-         * summary required (the ERROR already names the failure mode).
-         * Restore rather than clear so a re-entrant inner call doesn't
-         * truncate the outer call's WARN state.
+         *
+         * errfinish() zeroed InterruptHoldoffCount before the jump here,
+         * while a held partition LWLock still counts its
+         * HOLD_INTERRUPTS(). Restore it, as LWLockReleaseAll() does, so
+         * the RESUME_INTERRUPTS() of LWLockRelease() does not wrap the
+         * counter and leave the backend deaf to cancel, timeouts and
+         * terminate.
+         *
+         * The rows removed here include every row this call already
+         * added to live_capacity, so the catch subtracts
+         * `flushed_capacity` (see the live_capacity accounting above).
+         *
+         * The outer-frame WARN-suppression scope is restored first, so the
+         * try_many-in-progress state never outlives this call, whatever
+         * the rollback does. The incoming ERROR is the operator's signal --
+         * no tail summary required. Restore rather than clear so a
+         * re-entrant inner call doesn't truncate the outer call's WARN
+         * state.
          */
         xclaim_bulk_warn_context_active    = saved_warn_active;
         xclaim_bulk_warn_emitted_this_call = saved_warn_emitted;
         xclaim_bulk_warn_suppressed_count  = saved_warn_suppressed;
 
+        if (have_partition_lock)
+        {
+            HOLD_INTERRUPTS();
+            LWLockRelease(current_plock);
+        }
+        xclaim_bulk_rollback_inserted(inserted, inserted_count);
+        if (flushed_capacity > 0)
+            pg_atomic_fetch_sub_u64(&XClaimCtl->live_capacity,
+                                    (uint64) flushed_capacity);
+
         PG_RE_THROW();
     }
     PG_END_TRY();
+
+    /*
+     * Per-backend stat deltas of this call, one atomic add each (the slot
+     * has a single writer, the backend itself).
+     */
+    if (acquires > 0)
+        pg_atomic_fetch_add_u64(&XClaimBackendInfos[procno].total_acquires_local,
+                                acquires);
+    if (reentrant_hits > 0)
+        pg_atomic_fetch_add_u64(&XClaimBackendInfos[procno].reentrant_hits_local,
+                                reentrant_hits);
+    if (conflicts > 0)
+        pg_atomic_fetch_add_u64(&XClaimBackendInfos[procno].conflicts_local,
+                                conflicts);
 
     /*
      * Normal-exit tail summary. If the bulk call hit capacity on more
@@ -1486,6 +1521,21 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
     }
 
     /*
+     * The other messages of the call go out last: after every partition
+     * lock is released, outside PG_TRY, and after the WARN-suppression
+     * scope above is restored, so an ERROR raised while one is written (a
+     * cancel processed at the end of errfinish) leaves no state of this
+     * call behind. The claims are taken and counted, and the top-level
+     * transaction end releases them (a subtransaction that catches the
+     * ERROR keeps them until then). live_capacity moved by this call only at the
+     * lock releases, so one watermark check here sees every band the call
+     * crossed.
+     */
+    xclaim_local_emit_peak_warning();
+    if (total_inserted > 0)
+        xclaim_check_capacity_watermark(0);
+
+    /*
      * Free the rollback tracker now that the bulk call has succeeded.
      * Worst-case footprint is sizeof(XClaimBulkInserted) * nslots, up
      * to ~615 MB at the ~26.8M-slot limit. Reclaiming it eagerly drops
@@ -1495,6 +1545,74 @@ xclaim_try_many_internal(XClaimBulkSlot *slots, int nslots,
      * the memory context anyway.
      */
     pfree((void *) inserted);
+}
+
+/*
+ * xclaim_try_many_result
+ *      Builds the boolean[] result of xclaim.try_many in the shape of the
+ *      input array `arr`, from `nelems` flat results.
+ *
+ * deconstruct_array linearises a multi-dimensional input into a flat
+ * element vector and the elements are processed in that linear order, so
+ * feeding ARR_NDIM/ARR_DIMS/ARR_LBOUND back into construct_md_array
+ * reconstructs a result whose i-th flat position corresponds 1:1 with the
+ * i-th flat input position. ARRAY[[1,2],[3,4]] comes back as a 2x2 array,
+ * aligned with the input for downstream queries.
+ *
+ * The SQL entry points free every per-call buffer once it is no longer
+ * needed (the element vectors, the slots, the result flags, the datums
+ * here, a detoasted copy of the input). PostgreSQL would reclaim them at
+ * ExprContext reset, but a plpgsql FOR loop or complex aggregate that
+ * invokes xclaim.try_many on large arrays many times before the context
+ * tears down would accumulate multi-GB peaks. Freeing keeps the per-call
+ * high-water-mark to roughly the response array itself.
+ */
+static ArrayType *
+xclaim_try_many_result(ArrayType *arr, int nelems,
+                       const bool *result_values, bool *result_nulls)
+{
+    int16       bool_len;
+    bool        bool_byval;
+    char        bool_align;
+    Datum      *result_datums;
+    ArrayType  *result_arr;
+    int         i;
+
+    get_typlenbyvalalign(BOOLOID, &bool_len, &bool_byval, &bool_align);
+    result_datums = (Datum *) palloc(sizeof(Datum) * nelems);
+    for (i = 0; i < nelems; i++)
+        result_datums[i] = BoolGetDatum(result_values[i]);
+
+    result_arr = construct_md_array(result_datums, result_nulls,
+                                    ARR_NDIM(arr), ARR_DIMS(arr), ARR_LBOUND(arr),
+                                    BOOLOID, bool_len, bool_byval, bool_align);
+    pfree(result_datums);
+    return result_arr;
+}
+
+/*
+ * xclaim_try_many_disabled_result
+ *      Result of xclaim.try_many while pg_xclaim.enabled = off: every element
+ *      true, nothing hashed or acquired, disabled_calls counts one per
+ *      element.
+ */
+static ArrayType *
+xclaim_try_many_disabled_result(ArrayType *arr, int nelems)
+{
+    bool       *result_values;
+    bool       *result_nulls;
+    ArrayType  *result_arr;
+
+    pg_atomic_fetch_add_u64(&XClaimCtl->disabled_calls, (uint64) nelems);
+
+    result_values = (bool *) palloc(sizeof(bool) * nelems);
+    result_nulls  = (bool *) palloc0(sizeof(bool) * nelems);
+    memset(result_values, true, sizeof(bool) * nelems);
+
+    result_arr = xclaim_try_many_result(arr, nelems, result_values, result_nulls);
+    pfree(result_values);
+    pfree(result_nulls);
+    return result_arr;
 }
 
 /*
@@ -1514,7 +1632,6 @@ xclaim_try_many_solo(PG_FUNCTION_ARGS)
     XClaimBulkSlot *slots;
     bool           *result_values;
     bool           *result_nulls;
-    Datum          *result_datums;
     ArrayType      *result_arr;
     int16           elmlen;
     bool            elmbyval;
@@ -1595,6 +1712,15 @@ xclaim_try_many_solo(PG_FUNCTION_ARGS)
                              "single-key acquisition.")));
     }
 
+    if (!xclaim_enabled)
+    {
+        pfree(elements);
+        pfree(element_nulls);
+        result_arr = xclaim_try_many_disabled_result(arr, nelems);
+        PG_FREE_IF_COPY(arr, 0);
+        PG_RETURN_ARRAYTYPE_P(result_arr);
+    }
+
     slots         = (XClaimBulkSlot *) palloc0(sizeof(XClaimBulkSlot) * nelems);
     result_values = (bool *) palloc0(sizeof(bool) * nelems);
     result_nulls  = (bool *) palloc0(sizeof(bool) * nelems);
@@ -1633,52 +1759,17 @@ xclaim_try_many_solo(PG_FUNCTION_ARGS)
         }
     }
 
+    /* The keys are in the slots now. */
+    pfree(elements);
+    pfree(element_nulls);
+
     xclaim_try_many_internal(slots, nelems, result_values, result_nulls);
 
-    /* Construct boolean[] result, preserving the NULL bitmap. */
-    {
-        int16   bool_len;
-        bool    bool_byval;
-        char    bool_align;
-
-        get_typlenbyvalalign(BOOLOID, &bool_len, &bool_byval, &bool_align);
-        result_datums = (Datum *) palloc(sizeof(Datum) * nelems);
-        for (i = 0; i < nelems; i++)
-            result_datums[i] = BoolGetDatum(result_values[i]);
-
-        /*
-         * Preserve the input array's shape (ndim / dims / lbounds).
-         * deconstruct_array linearises a multi-dimensional input into a
-         * flat element vector and we process elements in that linear
-         * order, so feeding ARR_NDIM/ARR_DIMS/ARR_LBOUND back into
-         * construct_md_array reconstructs a result whose i-th flat
-         * position corresponds 1:1 with the i-th flat input position.
-         * Without this, ARRAY[[1,2],[3,4]] would come back as a 1-D
-         * 4-element array, breaking downstream queries that rely on
-         * dimensional alignment with the input.
-         */
-        result_arr = construct_md_array(result_datums, result_nulls,
-                                        ARR_NDIM(arr),
-                                        ARR_DIMS(arr),
-                                        ARR_LBOUND(arr),
-                                        BOOLOID, bool_len, bool_byval, bool_align);
-
-        /*
-         * Defense-in-depth pfree for gigabyte-scale per-call
-         * allocations. PostgreSQL would reclaim these at ExprContext
-         * reset, but a plpgsql FOR loop or complex aggregate that
-         * invokes xclaim.try_many on large arrays many times before
-         * the context tears down can accumulate multiple multi-GB
-         * peaks, triggering OOM on resource-constrained backends.
-         * Freeing immediately keeps the per-call high-water-mark to
-         * roughly the response array itself. Order does not matter --
-         * all five allocations live in CurrentMemoryContext.
-         */
-        pfree(result_datums);
-    }
+    result_arr = xclaim_try_many_result(arr, nelems, result_values, result_nulls);
     pfree(slots);
     pfree(result_values);
     pfree(result_nulls);
+    PG_FREE_IF_COPY(arr, 0);
 
     PG_RETURN_ARRAYTYPE_P(result_arr);
 }
@@ -1701,7 +1792,6 @@ xclaim_try_many_pair(PG_FUNCTION_ARGS)
     XClaimBulkSlot *slots;
     bool           *result_values;
     bool           *result_nulls;
-    Datum          *result_datums;
     ArrayType      *result_arr;
     int16           elmlen;
     bool            elmbyval;
@@ -1755,6 +1845,15 @@ xclaim_try_many_pair(PG_FUNCTION_ARGS)
                              "single-key acquisition.")));
     }
 
+    if (!xclaim_enabled)
+    {
+        pfree(elements);
+        pfree(element_nulls);
+        result_arr = xclaim_try_many_disabled_result(arr, nelems);
+        PG_FREE_IF_COPY(arr, 1);
+        PG_RETURN_ARRAYTYPE_P(result_arr);
+    }
+
     slots         = (XClaimBulkSlot *) palloc0(sizeof(XClaimBulkSlot) * nelems);
     result_values = (bool *) palloc0(sizeof(bool) * nelems);
     result_nulls  = (bool *) palloc0(sizeof(bool) * nelems);
@@ -1770,7 +1869,7 @@ xclaim_try_many_pair(PG_FUNCTION_ARGS)
             int32 objid = DatumGetInt32(elements[i]);
             slots[i].key.dbid = MyDatabaseId;
             slots[i].key.form = XCLAIM_FORM_PAIR;
-            slots[i].key.k1   = ((int64) (uint32) classid << 32) | (uint32) objid;
+            slots[i].key.k1   = (int64) (((uint64) (uint32) classid << 32) | (uint32) objid);
 
             /* See xclaim_try_many_solo for the cache-locality rationale. */
             slots[i].hashvalue    = xclaim_compute_hash(&slots[i].key);
@@ -1778,31 +1877,17 @@ xclaim_try_many_pair(PG_FUNCTION_ARGS)
         }
     }
 
+    /* The keys are in the slots now. */
+    pfree(elements);
+    pfree(element_nulls);
+
     xclaim_try_many_internal(slots, nelems, result_values, result_nulls);
 
-    {
-        int16   bool_len;
-        bool    bool_byval;
-        char    bool_align;
-
-        get_typlenbyvalalign(BOOLOID, &bool_len, &bool_byval, &bool_align);
-        result_datums = (Datum *) palloc(sizeof(Datum) * nelems);
-        for (i = 0; i < nelems; i++)
-            result_datums[i] = BoolGetDatum(result_values[i]);
-
-        /* See xclaim_try_many_solo for the shape-preservation rationale. */
-        result_arr = construct_md_array(result_datums, result_nulls,
-                                        ARR_NDIM(arr),
-                                        ARR_DIMS(arr),
-                                        ARR_LBOUND(arr),
-                                        BOOLOID, bool_len, bool_byval, bool_align);
-
-        /* See xclaim_try_many_solo for the OOM-defense rationale. */
-        pfree(result_datums);
-    }
+    result_arr = xclaim_try_many_result(arr, nelems, result_values, result_nulls);
     pfree(slots);
     pfree(result_values);
     pfree(result_nulls);
+    PG_FREE_IF_COPY(arr, 1);
 
     PG_RETURN_ARRAYTYPE_P(result_arr);
 }

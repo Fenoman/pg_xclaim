@@ -14,9 +14,15 @@
 #   scripts/smoke_gate_no_preload.sh                    # auto-discover PG 17
 #   scripts/smoke_gate_no_preload.sh /path/to/pg_config # explicit
 #
+# The server runs with lc_messages=C, so severity tags and messages are in
+# English whatever the cluster locale is. Every step checks the exit status
+# of psql: 0 is success, 1 or 3 an SQL error, 2 a lost connection (the
+# backend crashed).
+#
 # Exit:
 #   0  PASS  -- LOAD ok, xclaim.try raises SQLSTATE 55000 (object_not_in_prerequisite_state)
-#   1  FAIL  -- LOAD failed, FATAL observed, or xclaim.try succeeded
+#   1  FAIL  -- start, CREATE EXTENSION or LOAD failed, FATAL/PANIC logged,
+#               xclaim.try succeeded, lost its connection or raised another error
 
 set -euo pipefail
 
@@ -63,49 +69,52 @@ echo "smoke_gate_no_preload: PG_CONFIG=$PG_CONFIG_BIN  PORT=$PORT  DATADIR=$DATA
 # without one exits with FATAL "postmaster became multithreaded during
 # startup".
 LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
-"$PGCTL" start -D "$DATADIR" -w -l "$DATADIR/server.log" -o "-p $PORT" >/dev/null
+"$PGCTL" start -D "$DATADIR" -w -l "$DATADIR/server.log" \
+    -o "-p $PORT -c lc_messages=C" >/dev/null || {
+    echo "FAIL: server did not start without preload" >&2
+    cat "$DATADIR/server.log" >&2
+    exit 1
+}
 
-if grep -qE 'FATAL|PANIC' "$DATADIR/server.log"; then
+if grep -qE '(FATAL|PANIC):' "$DATADIR/server.log"; then
     echo "FAIL: FATAL during start without preload (should start clean)" >&2
-    grep -E 'FATAL|PANIC' "$DATADIR/server.log" >&2 | head -10
+    grep -E '(FATAL|PANIC):' "$DATADIR/server.log" | head -10 >&2
     exit 1
 fi
 
 # Step 0: CREATE EXTENSION (installs SQL objects, .so loaded lazily on first call).
 # Without this the schema "xclaim" doesn't exist and we'd get 3F000 instead of 55000.
-CE_OUT="$("$PSQL" -h "$DATADIR" -p "$PORT" -U postgres -d postgres \
+if ! CE_OUT="$("$PSQL" -h "$DATADIR" -p "$PORT" -U postgres -d postgres \
     -X -At -v ON_ERROR_STOP=1 \
-    -c "CREATE EXTENSION IF NOT EXISTS pg_xclaim;" 2>&1 || true)"
-if grep -qE '^ERROR|^FATAL' <<<"$CE_OUT"; then
-    echo "FAIL: CREATE EXTENSION raised an error: $CE_OUT" >&2
+    -c "CREATE EXTENSION IF NOT EXISTS pg_xclaim;" 2>&1)"; then
+    echo "FAIL: CREATE EXTENSION failed: $CE_OUT" >&2
     exit 1
 fi
 
-# Step 1: LOAD must succeed silently (no FATAL/ERROR).
-LOAD_OUT="$("$PSQL" -h "$DATADIR" -p "$PORT" -U postgres -d postgres \
-    -X -At -c "LOAD 'pg_xclaim';" 2>&1 || true)"
-if grep -qE '^ERROR|^FATAL' <<<"$LOAD_OUT"; then
-    echo "FAIL: LOAD 'pg_xclaim' raised an error: $LOAD_OUT" >&2
+# Step 1: LOAD must succeed.
+if ! LOAD_OUT="$("$PSQL" -h "$DATADIR" -p "$PORT" -U postgres -d postgres \
+    -X -At -v ON_ERROR_STOP=1 -c "LOAD 'pg_xclaim';" 2>&1)"; then
+    echo "FAIL: LOAD 'pg_xclaim' failed: $LOAD_OUT" >&2
     exit 1
 fi
 
 # Step 2: xclaim.try must raise SQLSTATE 55000 (object_not_in_prerequisite_state).
-# psql returns the SQLSTATE via \errverbose / VERBOSITY=verbose.
-TRY_OUT="$(PGOPTIONS='--client-min-messages=warning' \
+# VERBOSITY=verbose prints the SQLSTATE after the severity tag. psql exits
+# with 1 on the SQL error, 0 would mean xclaim.try succeeded and 2 that the
+# backend crashed.
+if TRY_OUT="$(PGOPTIONS='--client-min-messages=warning' \
     "$PSQL" -h "$DATADIR" -p "$PORT" -U postgres -d postgres \
-    -X -At -v ON_ERROR_STOP=0 \
-    -c "\set VERBOSITY verbose" \
-    -c "SELECT xclaim.try(1, 1);" 2>&1 || true)"
-
-if grep -q '55000' <<<"$TRY_OUT"; then
-    echo "PASS: xclaim.try raised SQLSTATE 55000 (object_not_in_prerequisite_state)"
-elif grep -qE 'OBJECT_NOT_IN_PREREQUISITE_STATE|object_not_in_prerequisite_state' <<<"$TRY_OUT"; then
-    echo "PASS: xclaim.try raised object_not_in_prerequisite_state (textual)"
-elif grep -qiE 'pg_xclaim must be loaded via shared_preload_libraries' <<<"$TRY_OUT"; then
-    # English text or Russian translation -- match on errmsg as final fallback
-    echo "PASS: xclaim.try raised expected XCLAIM_REQUIRE_INIT message"
+    -X -At -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
+    -c "SELECT xclaim.try(1, 1);" 2>&1)"; then
+    TRY_RC=0
 else
-    echo "FAIL: xclaim.try did not raise the expected XCLAIM_REQUIRE_INIT error." >&2
+    TRY_RC=$?
+fi
+
+if (( TRY_RC == 1 )) && grep -qE '^ERROR:  55000:' <<<"$TRY_OUT"; then
+    echo "PASS: xclaim.try raised SQLSTATE 55000 (object_not_in_prerequisite_state)"
+else
+    echo "FAIL: xclaim.try did not raise the expected XCLAIM_REQUIRE_INIT error (psql exit status $TRY_RC)." >&2
     echo "--- output ---" >&2
     echo "$TRY_OUT" >&2
     exit 1

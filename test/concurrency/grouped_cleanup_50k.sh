@@ -46,6 +46,34 @@ PASS=0
 FAIL=0
 CSV_ROWS=()
 
+# Measured transactions.
+#
+# measured_psql runs a SQL file with ON_ERROR_STOP and keeps the exit status
+# in MEASURED_RC and the output in MEASURED_OUT, so the caller takes the end
+# timestamp right after psql. The C locale keeps the \timing label "Time:"
+# (under ru_RU it is "Время:").
+#
+# check_measured requires exit status 0 and the line acquired=KEY_COUNT,
+# printed inside the measured transaction: a transaction that failed or took
+# fewer claims has no cleanup cost worth timing.
+measured_psql() {  # sql file
+    MEASURED_RC=0
+    MEASURED_OUT="$(LC_ALL=C LC_MESSAGES=C pg_xclaim_psql -X -A -t \
+        -v ON_ERROR_STOP=1 -f "$1" 2>&1)" || MEASURED_RC=$?
+}
+check_measured() {  # label
+    local got
+    got="$(sed -n 's/^acquired=//p' <<<"$MEASURED_OUT" | head -1)"
+    if (( MEASURED_RC == 0 )) && [[ "$got" == "$KEY_COUNT" ]]; then
+        return 0
+    fi
+    echo "  FAIL: $1: psql exit $MEASURED_RC, acquired '${got:-none}' (expected $KEY_COUNT), output follows:" >&2
+    printf '%s\n' "$MEASURED_OUT" | sed 's/^/    /' >&2
+    FAIL=$(( FAIL + 1 ))
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "$1" "FAIL" "acquired" "${got:-none}" "psql exit $MEASURED_RC")")
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # Test 1: acquire 50000 keys
 # ---------------------------------------------------------------------------
@@ -107,12 +135,8 @@ if [[ "$TXN_DEBUG" == "$KEY_COUNT" ]]; then
     echo "  PASS: debug shows $KEY_COUNT claims in transaction"
     PASS=$(( PASS + 1 ))
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "debug_in_txn" "PASS" "debug_count" "$TXN_DEBUG" "all claims visible")")
-elif (( TXN_DEBUG > 0 )); then
-    echo "  PASS: debug shows $TXN_DEBUG claims (some reentrant hits possible)"
-    PASS=$(( PASS + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "debug_in_txn" "PASS" "debug_count" "$TXN_DEBUG" "non-zero claims")")
 else
-    echo "  FAIL: debug shows $TXN_DEBUG in transaction (expected ~$KEY_COUNT)" >&2
+    echo "  FAIL: debug shows $TXN_DEBUG in transaction (expected $KEY_COUNT)" >&2
     FAIL=$(( FAIL + 1 ))
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "debug_in_txn" "FAIL" "debug_count" "$TXN_DEBUG" "expected $KEY_COUNT")")
 fi
@@ -135,15 +159,17 @@ COMMIT_SQL_FILE="$(mktemp /tmp/xclaim_commit_test.XXXXXX.sql)"
 XCLAIM_TMPFILES+=("$COMMIT_SQL_FILE")
 cat > "$COMMIT_SQL_FILE" <<SQLEOF
 BEGIN;
-SELECT count(v) FROM unnest(
+SELECT 'acquired=' || count(v) FROM unnest(
     xclaim.try_many(1, ARRAY(SELECT generate_series(100001, $((100000 + KEY_COUNT)))::int4))
 ) v WHERE v;
 COMMIT;
 SQLEOF
 
-pg_xclaim_psql -X -A -t -f "$COMMIT_SQL_FILE" >/dev/null 2>/dev/null
+measured_psql "$COMMIT_SQL_FILE"
 T_END="$(xclaim_now_ms)"
 rm -f "$COMMIT_SQL_FILE"
+TOTAL_OK=true
+check_measured "commit_latency_total" || TOTAL_OK=false
 
 TOTAL_MS=$(( T_END - T_START ))
 echo "  Total (acquire + COMMIT): ${TOTAL_MS}ms"
@@ -155,14 +181,15 @@ ACQ_SQL_FILE="$(mktemp /tmp/xclaim_acq_only.XXXXXX.sql)"
 XCLAIM_TMPFILES+=("$ACQ_SQL_FILE")
 cat > "$ACQ_SQL_FILE" <<SQLEOF2
 BEGIN;
-SELECT count(v) FROM unnest(
+SELECT 'acquired=' || count(v) FROM unnest(
     xclaim.try_many(1, ARRAY(SELECT generate_series(200001, $((200000 + KEY_COUNT)))::int4))
 ) v WHERE v;
 ROLLBACK;
 SQLEOF2
-pg_xclaim_psql -X -A -t -f "$ACQ_SQL_FILE" >/dev/null 2>/dev/null
+measured_psql "$ACQ_SQL_FILE"
 T_ACQ_END="$(xclaim_now_ms)"
 rm -f "$ACQ_SQL_FILE"
+check_measured "rollback_reference" || true
 
 ACQUIRE_ONLY_MS=$(( T_ACQ_END - T_ACQ_START ))
 # COMMIT overhead = total - acquire_with_rollback (rollback also triggers cleanup)
@@ -173,20 +200,20 @@ COMMIT_ESTIMATE_MS=$(( TOTAL_MS - ACQUIRE_ONLY_MS > 0 ? TOTAL_MS - ACQUIRE_ONLY_
 echo "  Acquire+ROLLBACK reference: ${ACQUIRE_ONLY_MS}ms"
 echo "  Commit-path delta estimate: ${COMMIT_ESTIMATE_MS}ms"
 
-# Soft check on the total commit path: at 5x LATENCY_BUDGET_MS or more it only warns.
-# We use TOTAL_MS as conservative upper bound (includes both acquire and commit).
-# Even the TOTAL including all SQL overhead should be well under budget for
-# a 128-partition grouped cleanup at 50k entries.
-
-if (( TOTAL_MS < LATENCY_BUDGET_MS * 5 )); then
-    # Within 5x budget overall is a reasonable bound given acquire overhead
+# Ceiling on the whole acquire + COMMIT transaction, connection included:
+# 5x LATENCY_BUDGET_MS. TOTAL_MS is a conservative upper bound of the commit
+# path, and even with all SQL overhead it stays well under the ceiling for a
+# 128-partition grouped cleanup at 50k entries.
+if ! $TOTAL_OK; then
+    : # check_measured has counted the FAIL
+elif (( TOTAL_MS < LATENCY_BUDGET_MS * 5 )); then
     echo "  PASS: total acquire+COMMIT=${TOTAL_MS}ms (within 5x budget ceiling)"
     PASS=$(( PASS + 1 ))
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "commit_latency_total" "PASS" "total_ms" "$TOTAL_MS" "within ceiling")")
 else
-    echo "  WARN: total acquire+COMMIT=${TOTAL_MS}ms exceeds ceiling, likely acquire overhead"
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "commit_latency_total" "PASS" "total_ms" "$TOTAL_MS" "warn: high latency")")
-    PASS=$(( PASS + 1 ))
+    echo "  FAIL: total acquire+COMMIT=${TOTAL_MS}ms exceeds the $(( LATENCY_BUDGET_MS * 5 ))ms ceiling (5x budget)" >&2
+    FAIL=$(( FAIL + 1 ))
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "commit_latency_total" "FAIL" "total_ms" "$TOTAL_MS" "exceeds 5x budget")")
 fi
 
 # STRICT assertion: use psql \timing to measure COMMIT step only
@@ -196,19 +223,20 @@ XCLAIM_TMPFILES+=("$TIMING_SQL_FILE")
 cat > "$TIMING_SQL_FILE" <<SQLEOF3
 \timing on
 BEGIN;
-SELECT count(v) FROM unnest(
+SELECT 'acquired=' || count(v) FROM unnest(
     xclaim.try_many(1, ARRAY(SELECT generate_series(300001, $((300000 + KEY_COUNT)))::int4))
 ) v WHERE v;
 COMMIT;
 SQLEOF3
 
-# Force the C locale on this invocation only: psql's \timing prints the
-# label in the active locale ("Time:" in C, "Время:" under ru_RU), and the
-# parser below greps for "Time:". LC_ALL/LC_MESSAGES=C make it deterministic
-# regardless of the temp cluster's ru_RU.UTF-8 setup, and the wall-clock
-# fallback still covers any unexpected format.
-TIMING_OUTPUT="$(LC_ALL=C LC_MESSAGES=C pg_xclaim_psql -X -A -t -f "$TIMING_SQL_FILE" 2>&1)"
+# measured_psql forces the C locale on this invocation only, so the parser
+# below finds "Time:" regardless of the temp cluster's ru_RU.UTF-8 setup.
+# The wall-clock fallback covers any other unexpected format.
+measured_psql "$TIMING_SQL_FILE"
 rm -f "$TIMING_SQL_FILE"
+TIMING_OK=true
+check_measured "commit_latency_hard_gate" || TIMING_OK=false
+TIMING_OUTPUT="$MEASURED_OUT"
 
 # Extract COMMIT timing line
 COMMIT_TIMING="$(echo "$TIMING_OUTPUT" | grep -i "^Time:" | tail -1 || echo "")"
@@ -216,7 +244,9 @@ echo "  psql \\timing COMMIT line: $COMMIT_TIMING"
 
 # Parse ms value
 COMMIT_MS_PSQL=""
-if [[ -n "$COMMIT_TIMING" ]]; then
+if ! $TIMING_OK; then
+    COMMIT_MS_PSQL="none (measured transaction failed)"
+elif [[ -n "$COMMIT_TIMING" ]]; then
     COMMIT_MS_PSQL="$(echo "$COMMIT_TIMING" | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "")"
     if [[ -n "$COMMIT_MS_PSQL" ]]; then
         COMMIT_MS_INT="$(echo "$COMMIT_MS_PSQL" | cut -d. -f1)"
@@ -237,19 +267,25 @@ fi
 if [[ -z "$COMMIT_MS_PSQL" ]]; then
     echo "  INFO: could not parse \\timing output, using wall-clock fallback"
     # Wall-clock fallback: measure the whole acquire+COMMIT step
-    T_C_START="$(xclaim_now_ms)"
-    pg_xclaim_psql -X -A -t >/dev/null 2>/dev/null <<SQLCOMMIT
+    WALL_SQL_FILE="$(mktemp /tmp/xclaim_wall.XXXXXX.sql)"
+    XCLAIM_TMPFILES+=("$WALL_SQL_FILE")
+    cat > "$WALL_SQL_FILE" <<SQLCOMMIT
 BEGIN;
-SELECT count(v) FROM unnest(
+SELECT 'acquired=' || count(v) FROM unnest(
     xclaim.try_many(1, ARRAY(SELECT generate_series(400001, $((400000 + KEY_COUNT)))::int4))
 ) v WHERE v;
 COMMIT;
 SQLCOMMIT
+    T_C_START="$(xclaim_now_ms)"
+    measured_psql "$WALL_SQL_FILE"
     T_C_END="$(xclaim_now_ms)"
+    rm -f "$WALL_SQL_FILE"
     WALL_MS=$(( T_C_END - T_C_START ))
     echo "  Wall-clock for acquire+COMMIT: ${WALL_MS}ms"
 
-    if (( WALL_MS < LATENCY_BUDGET_MS * 3 )); then
+    if ! check_measured "commit_latency_hard_gate"; then
+        : # check_measured has counted the FAIL
+    elif (( WALL_MS < LATENCY_BUDGET_MS * 3 )); then
         echo "  PASS: wall-clock ${WALL_MS}ms within 3x budget (acquire dominates)"
         PASS=$(( PASS + 1 ))
         CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "commit_latency_hard_gate" "PASS" "wall_ms" "$WALL_MS" "wall-clock fallback")")

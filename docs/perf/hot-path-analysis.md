@@ -46,14 +46,18 @@ PostgresMain
                 │   ├── XCLAIM_REQUIRE_INIT     [recovery + preload gate]
                 │   ├── memset(&key, 0, sizeof(XClaimKey))   [HASH_BLOBS req]
                 │   └── xclaim_try_internal     [алгоритм из 12 шагов]
-                │       ├── xclaim_ensure_owner_token        [lazy, один раз на бэкенд]
+                │       ├── CHECK_FOR_INTERRUPTS            [единственная точка отмены]
+                │       ├── xclaim_ensure_owner_token        [lazy, новый токен после session_reset]
                 │       ├── xclaim_compute_hash             [один hash ключа для local и shared]
                 │       │   └── get_hash_value -> tag_hash -> hash_bytes
                 │       ├── xclaim_local_lookup_with_hash    [быстрый путь повторного входа]
                 │       │   └── xcl_local_lookup_hash (simplehash, hash передан, не пересчитывается)
                 │       │       └── memcmp (16-байтный ключ)
+                │       ├── xclaim_local_reserve(1)          [рост набора до блокировки]
+                │       ├── xclaim_local_add                 [запись в набор до блокировки,
+                │       │                                     без учета]
                 │       ├── xclaim_partition_lock           [hashvalue & mask]
-                │       ├── LWLockAcquire(plock, EXCLUSIVE) ─┐
+                │       ├── PG_TRY { LWLockAcquire(plock, EXCLUSIVE) } ─┐
                 │       ├── hash_search_with_hash_value     │ critical
                 │       │   (HASH_ENTER_NULL - комбини-     │ section
                 │       │    рованный lookup-or-insert,     │
@@ -65,17 +69,22 @@ PostgresMain
                 │       │   └── xclaim_get_pgproc_by_procno │
                 │       │       └── GetPGProcByNumber       [PG core macro,
                 │       │                                    storage/proc.h]
+                │       ├── [fresh] pg_atomic_fetch_add_u64 │
+                │       │   (live_capacity)                 │
                 │       ├── populate XClaimEntry owner      │
                 │       │   triple (procno+lxid+token)      │ - пишет fresh
                 │       │                                   │   slot ИЛИ
                 │       │                                   │   перезаписывает
                 │       │                                   │   stale-reap'd
                 │       │                                   │   slot in place
-                │       ├── PG_TRY {                        │
-                │       │   xclaim_local_insert_held }      │
                 │       └── LWLockRelease(plock)            ─┘
-                │       ├── pg_atomic_fetch_add_u64(live_capacity)
+                │       ├── xclaim_local_note_held          [счетчик, пик, список ключей,
+                │       │                                    подсказка 75%]
+                │       │   (при конфликте и промахе по емкости вместо него
+                │       │    xclaim_local_drop)
                 │       ├── pg_atomic_fetch_add_u64(per-backend total_acquires_local)
+                │       ├── CAS peak_per_backend
+                │       ├── xclaim_local_emit_peak_warning  [сообщения после счетчиков]
                 │       └── xclaim_check_capacity_watermark
                 │           └── pg_atomic_read_u64(live_capacity)
 ```
@@ -87,6 +96,11 @@ CommitTransactionCommand / AbortTransaction
 └── CallXactCallbacks(XACT_EVENT_COMMIT | _ABORT)
     └── xclaim_xact_callback
         └── xclaim_local_cleanup_held
+            ├── [claim'ов не больше 1/64 бакетов, все в списке ключей]
+            │   xclaim_local_cleanup_by_list: лукап по ключам из списка,
+            │   qsort по partition_id, освобождение по партициям,
+            │   удаление ключей по одному, без обхода массива
+            └── [иначе] полный путь:
             ├── xclaim_local_gather_pointers     [O(N) walk simplehash]
             ├── counting sort by partition_id    [O(N + num_partitions)]
             └── для каждой партиции (<= num_partitions циклов):
@@ -447,9 +461,11 @@ Stat-счетчики при этом per-backend: каждый бэкенд п�
    `hashvalue` идет в лукап local-set, в `hash_search_with_hash_value`
    и во вставку в local-set, а очистка берет `hashvalue`, сохраненный
    в записи local-set. Кроме того, `hash_bytes` зовет сам simplehash:
-   вставка пересчитывает хеши записей в занятых bucket'ах, мимо которых
-   идет поиск места, а рост - хеши всех записей (`SH_STORE_HASH` не
-   задан). В профиле `hash_bytes` - отдельный leaf: 1.4% в scalar,
+   в профилированной сборке `SH_STORE_HASH` не задан, и вставка
+   пересчитывает хеши записей в занятых bucket'ах, мимо которых идет
+   поиск места, а рост - хеши всех записей. Текущий код задает
+   `SH_STORE_HASH`: хеш хранится в записи, и simplehash его не
+   пересчитывает. В профиле `hash_bytes` - отдельный leaf: 1.4% в scalar,
    1.6% в cleanup, а в bulk он ниже порога top-15 (2.1%). Ни в одном
    SVG он не встречается под `xclaim_local_cleanup_held`.
 

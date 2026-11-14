@@ -4,11 +4,14 @@
 #
 # Scenarios:
 #   1. 4 sessions concurrently try_many on overlapping ranges: each session
-#      tries keys 1..10000. Each key has exactly one winner. Verify no duplicate
-#      wins (total true results across all sessions = 10000 unique keys).
+#      tries keys 1..10000 and records the keys it won in a table. No session
+#      commits before all of them have reported, so every key has exactly one
+#      winner: the table holds each key 1..10000 exactly once and every
+#      session exits successfully.
 #
 #   2. Catastrophic rollback: a cluster with max_claims=64 is started separately.
-#      try_many 100 keys -> ERROR. After rollback, debug() shows 0 entries.
+#      try_many 100 keys -> ERROR with SQLSTATE 53400. After rollback, debug()
+#      shows 0 entries.
 #
 #   3. Reentrant bulk: same session try_many with already-held keys -> all true,
 #      no double entries in debug().
@@ -37,7 +40,13 @@ ALL_DATADIRS=("$MAIN_PGDATA")
 # abort, not only on the success path.
 XCLAIM_TMPFILES=()
 
+# Sessions of Test 1 (index -> psql pid).
+SESSION_PIDS=()
+
 cleanup_all() {
+    for pid in "${SESSION_PIDS[@]:-}"; do
+        [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+    done
     for dd in "${ALL_DATADIRS[@]:-}"; do
         if [[ -n "$dd" ]] && [[ -d "$dd" ]]; then
             "$PGBIN/pg_ctl" stop -D "$dd" -m immediate >/dev/null 2>&1 || true
@@ -55,78 +64,155 @@ FAIL=0
 CSV_ROWS=()
 
 # ---------------------------------------------------------------------------
-# Test 1: concurrent try_many on overlapping ranges -- no duplicate winners
+# Sessions the test feeds statement by statement: psql number I reads from
+# its own FIFO on file descriptor 20 + I, so all of them stay inside their
+# transactions until the test sends COMMIT. Same pattern as xclaim_holder_*
+# in _lib.sh, which keeps a single session only.
+#   bulk_session_open I       start psql I (ON_ERROR_STOP, lc_messages=C)
+#   bulk_session_sql I SQL    send one statement
+#   bulk_session_wait I REGEX wait up to 60 s until the output matches REGEX,
+#                             return 1 at once if psql has exited without it
+#   bulk_session_close I      close the input, return the exit status of psql
+# ---------------------------------------------------------------------------
+#
+# psql closes the write ends of the other sessions' FIFOs it inherits:
+# otherwise an earlier session would never see EOF on close.
+bulk_session_open() {
+    local i="$1" fifo="$WORK_DIR/session_$1.in"
+    mkfifo "$fifo"
+    (
+        for j in $(seq 1 "$N_SESSIONS"); do
+            eval "exec $(( 20 + j ))>&-"
+        done
+        export PGOPTIONS='-c lc_messages=C'
+        exec "$PGBIN/psql" -h "$MAIN_PGHOST" -p "$MAIN_PGPORT" \
+            -U postgres -d postgres -X -A -t -q -v ON_ERROR_STOP=1
+    ) <"$fifo" >"$WORK_DIR/session_$i.out" 2>&1 &
+    SESSION_PIDS[i]=$!
+    eval "exec $(( 20 + i ))>\"\$fifo\""
+}
+
+# The write runs in a subshell: if psql has already exited (ON_ERROR_STOP),
+# SIGPIPE ends the subshell, not the test.
+bulk_session_sql() {
+    ( printf '%s\n' "$2" >&$(( 20 + $1 )) ) 2>/dev/null || true
+}
+
+bulk_session_wait() {
+    local i="$1" re="$2" out="$WORK_DIR/session_$1.out" n
+    for n in $(seq 1 600); do
+        grep -qE "$re" "$out" 2>/dev/null && return 0
+        if ! kill -0 "${SESSION_PIDS[i]}" 2>/dev/null; then
+            grep -qE "$re" "$out" 2>/dev/null
+            return
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+bulk_session_close() {
+    local i="$1" pid="${SESSION_PIDS[$1]}" rc=0 n
+    eval "exec $(( 20 + i ))>&-"
+    for n in $(seq 1 300); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        SESSION_PIDS[i]=""
+        return 1
+    fi
+    wait "$pid" || rc=$?
+    SESSION_PIDS[i]=""
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Test 1: concurrent try_many on overlapping ranges -- one winner per key
 # ---------------------------------------------------------------------------
 echo "--- Test 1: $N_SESSIONS concurrent sessions on 1..$KEY_RANGE ---"
 
 WORK_DIR="$(mktemp -d)"
 XCLAIM_TMPFILES+=("$WORK_DIR")
-BGPIDS=()
 
-# Start barrier. Each worker spins waiting for $START_FLAG to appear, so
-# all N sessions enter the try_many call window at roughly the same
-# instant. Without this barrier the first launched psql can finish
-# before later ones connect on fast hardware, defeating the "concurrent
-# on overlapping range" intent and masking duplicate-winner regressions.
-START_FLAG="$WORK_DIR/start"
+# Each session inserts the keys it won. No primary key: a key won twice
+# shows up as a duplicate row instead of an insert error.
+pg_xclaim_psql -X -q -v ON_ERROR_STOP=1 \
+    -c "CREATE UNLOGGED TABLE bulk_wins (session int4 NOT NULL, k int4 NOT NULL);"
 
-for _i in $(seq 1 $N_SESSIONS); do
-    OUT="$WORK_DIR/session_${_i}.out"
-    (
-        while [[ ! -f "$START_FLAG" ]]; do
-            sleep 0.01
-        done
-        # pg_sleep(2) inside the xact forces all N sessions to hold their
-        # acquired keys simultaneously. Without it, fast sessions commit
-        # and release before slower ones run, letting later sessions
-        # legitimately re-acquire the same keys -- total_wins would exceed
-        # KEY_RANGE without actually proving any mutex violation.
-        # With the sleep, the 4 windows fully overlap, so exactly one
-        # session can win each key. Total_wins == KEY_RANGE is the
-        # invariant assertion.
-        "$PGBIN/psql" -h "$MAIN_PGHOST" -p "$MAIN_PGPORT" \
-            -U postgres -d postgres \
-            -X -A -t \
-            -c "BEGIN; SELECT count(v) FROM unnest(xclaim.try_many(1, ARRAY(SELECT generate_series(1, $KEY_RANGE)::int4))) v WHERE v; SELECT pg_sleep(2); COMMIT;" \
-            >"$OUT" 2>&1
-    ) &
-    BGPIDS+=($!)
+# Determinism. Every session connects first, then all of them get the
+# try_many statement at once, and none of them commits before every session
+# has reported its wins. A COMMIT before that would release keys that a
+# later session could legitimately take again.
+T1_OK=true
+for i in $(seq 1 $N_SESSIONS); do
+    bulk_session_open "$i"
+    bulk_session_sql "$i" "SELECT 'connected';"
+done
+for i in $(seq 1 $N_SESSIONS); do
+    if ! bulk_session_wait "$i" '^connected$'; then
+        echo "  FAIL: session $i did not connect" >&2
+        T1_OK=false
+    fi
 done
 
-# Let the workers start and reach the barrier loop, then release it.
-sleep 0.3
-: > "$START_FLAG"
-
-for _pid in "${BGPIDS[@]}"; do
-    wait "$_pid" 2>/dev/null || true
+for i in $(seq 1 $N_SESSIONS); do
+    bulk_session_sql "$i" "BEGIN;"
+    bulk_session_sql "$i" "INSERT INTO bulk_wins SELECT $i, t.k FROM (SELECT ARRAY(SELECT generate_series(1, $KEY_RANGE)::int4) AS a) keys, unnest(keys.a, xclaim.try_many(1, keys.a)) AS t(k, won) WHERE t.won;"
+    bulk_session_sql "$i" "SELECT 'wins=' || count(*) FROM bulk_wins WHERE session = $i;"
 done
 
 TOTAL_WINS=0
-for _i in $(seq 1 $N_SESSIONS); do
-    OUT="$WORK_DIR/session_${_i}.out"
-    WIN_COUNT="0"
-    if [[ -f "$OUT" ]]; then
-        WIN_COUNT="$(grep -E '^[0-9]+$' "$OUT" | head -1 | tr -d ' ' || echo "0")"
+for i in $(seq 1 $N_SESSIONS); do
+    if bulk_session_wait "$i" '^wins=[0-9]+$'; then
+        WIN_COUNT="$(sed -n 's/^wins=//p' "$WORK_DIR/session_$i.out")"
+    else
+        WIN_COUNT="none"
+        T1_OK=false
     fi
-    echo "  Session $_i wins: $WIN_COUNT"
-    TOTAL_WINS=$(( TOTAL_WINS + WIN_COUNT ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "session_${_i}_wins" "PASS" "wins" "$WIN_COUNT" "")")
+    echo "  Session $i wins: $WIN_COUNT"
+    [[ "$WIN_COUNT" =~ ^[0-9]+$ ]] && TOTAL_WINS=$(( TOTAL_WINS + WIN_COUNT ))
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "session_${i}_wins" "INFO" "wins" "$WIN_COUNT" "")")
 done
 
-echo "  Total wins across $N_SESSIONS sessions: $TOTAL_WINS (expected $KEY_RANGE)"
+for i in $(seq 1 $N_SESSIONS); do
+    bulk_session_sql "$i" "COMMIT;"
+done
+for i in $(seq 1 $N_SESSIONS); do
+    if bulk_session_close "$i"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    if (( rc != 0 )); then
+        echo "  FAIL: session $i psql exit status $rc, output follows:" >&2
+        sed 's/^/    /' "$WORK_DIR/session_$i.out" >&2
+        T1_OK=false
+    fi
+done
 
-if [[ "$TOTAL_WINS" == "$KEY_RANGE" ]]; then
-    echo "  PASS: exactly $KEY_RANGE winners -- no duplicates"
+# Exactly one winner per key: KEY_RANGE rows, KEY_RANGE distinct keys, all
+# within 1..KEY_RANGE, so every key appears exactly once.
+if ! COVERAGE="$(pg_xclaim_psql -X -A -t -v ON_ERROR_STOP=1 \
+        -c "SELECT count(*) || '|' || count(DISTINCT k) || '|' || coalesce(min(k), 0) || '|' || coalesce(max(k), 0) FROM bulk_wins;" 2>&1)"; then
+    echo "  FAIL: coverage query failed: $COVERAGE" >&2
+    COVERAGE="error"
+    T1_OK=false
+fi
+echo "  Total wins across $N_SESSIONS sessions: $TOTAL_WINS (expected $KEY_RANGE)"
+echo "  Won keys rows|distinct|min|max: $COVERAGE (expected $KEY_RANGE|$KEY_RANGE|1|$KEY_RANGE)"
+
+if $T1_OK && [[ "$TOTAL_WINS" == "$KEY_RANGE" ]] \
+        && [[ "$COVERAGE" == "$KEY_RANGE|$KEY_RANGE|1|$KEY_RANGE" ]]; then
+    echo "  PASS: every key 1..$KEY_RANGE won exactly once, all sessions exited 0"
     PASS=$(( PASS + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "no_duplicate_wins" "PASS" "total_wins" "$TOTAL_WINS" "unique winners = $KEY_RANGE")")
-elif (( TOTAL_WINS <= KEY_RANGE && TOTAL_WINS > 0 )); then
-    echo "  PASS: $TOTAL_WINS <= $KEY_RANGE (no double-wins)"
-    PASS=$(( PASS + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "no_duplicate_wins" "PASS" "total_wins" "$TOTAL_WINS" "within bounds")")
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "one_winner_per_key" "PASS" "total_wins" "$TOTAL_WINS" "unique winners = $KEY_RANGE")")
 else
-    echo "  FAIL: $TOTAL_WINS > $KEY_RANGE means duplicate wins!" >&2
+    echo "  FAIL: wins=$TOTAL_WINS coverage=$COVERAGE sessions_ok=$T1_OK" >&2
     FAIL=$(( FAIL + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "no_duplicate_wins" "FAIL" "total_wins" "$TOTAL_WINS" "DUPLICATE WINS")")
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "one_winner_per_key" "FAIL" "total_wins" "$TOTAL_WINS" "coverage $COVERAGE")")
 fi
 
 rm -rf "$WORK_DIR"
@@ -166,27 +252,36 @@ LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
 "$PGBIN/psql" -h "$CAP_DATA" -p "$CAP_PORT" -U postgres -d postgres \
     -c "CREATE EXTENSION IF NOT EXISTS pg_xclaim;" >/dev/null 2>&1
 
-CAP_RESULT="$("$PGBIN/psql" -h "$CAP_DATA" -p "$CAP_PORT" \
-    -U postgres -d postgres -X -A -t 2>&1 <<'SQLCAP'
+# 100 unique keys against max_claims = 64 must raise SQLSTATE 53400
+# (configuration_limit_exceeded). lc_messages=C and VERBOSITY=verbose print
+# it as "ERROR:  53400: ...". Without ON_ERROR_STOP psql runs the ROLLBACK
+# after the error and exits 0: 2 would mean the backend crashed.
+if CAP_RESULT="$(PGOPTIONS='-c lc_messages=C' "$PGBIN/psql" -h "$CAP_DATA" -p "$CAP_PORT" \
+    -U postgres -d postgres -X -A -t -v VERBOSITY=verbose 2>&1 <<'SQLCAP'
 BEGIN;
-SELECT count(v) FROM unnest(
+SELECT 'wins=' || count(v) FROM unnest(
     xclaim.try_many(1, ARRAY(SELECT generate_series(1, 100)::int4))
 ) v WHERE v;
 ROLLBACK;
 SQLCAP
-)" || true
+)"; then
+    CAP_RC=0
+else
+    CAP_RC=$?
+fi
 
-echo "  Cap=64 test output (first 3 lines):"
+echo "  Cap=64 test output (psql exit status $CAP_RC):"
 echo "$CAP_RESULT" | head -3 | sed 's/^/    /'
 
-if echo "$CAP_RESULT" | grep -qiE "configuration_limit_exceeded|capacity|limit"; then
-    echo "  PASS: capacity error raised as expected"
+if (( CAP_RC == 0 )) && grep -qE '^ERROR:  53400:' <<<"$CAP_RESULT" \
+        && ! grep -qE '^wins=' <<<"$CAP_RESULT"; then
+    echo "  PASS: capacity error raised with SQLSTATE 53400"
     PASS=$(( PASS + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "capacity_error_raised" "PASS" "result" "error" "ERRCODE_CONFIGURATION_LIMIT_EXCEEDED")")
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "capacity_error_raised" "PASS" "sqlstate" "53400" "ERRCODE_CONFIGURATION_LIMIT_EXCEEDED")")
 else
-    echo "  WARN: no capacity error (acceptable if max_claims >= 100 dynamically)"
-    PASS=$(( PASS + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "capacity_error_raised" "PASS" "result" "warn" "capacity may not have been exhausted")")
+    echo "  FAIL: expected ERROR 53400 from try_many of 100 keys at max_claims=64" >&2
+    FAIL=$(( FAIL + 1 ))
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "capacity_error_raised" "FAIL" "psql_rc" "$CAP_RC" "no SQLSTATE 53400")")
 fi
 
 DEBUG_CAP="$("$PGBIN/psql" -h "$CAP_DATA" -p "$CAP_PORT" \

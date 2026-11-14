@@ -16,9 +16,8 @@
 #           and another session cannot take the key until the parent ends.
 #   Test 2: BEGIN AUTONOMOUS in SQL is refused with the same message.
 #
-# Servers without autonomous transactions (PostgreSQL, Postgres Pro
-# Standard, Tantor SE) exit with 77, which run_concurrency_suite.sh reports
-# as skipped.
+# Servers without the Enterprise pg_current_atx_nest_level API exit with 77.
+# This includes Tantor SE, whose autonomous SQL uses a separate backend.
 #
 # HARD INVARIANTS: set -euo pipefail, /tmp cluster, ru_RU.UTF-8, trap cleanup
 set -euo pipefail
@@ -50,7 +49,7 @@ fail() {  # test, metric, value, notes
 }
 
 if [[ "$(q "SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'pg_current_atx_nest_level');")" != "t" ]]; then
-    echo "  SKIP: the server has no autonomous transactions"
+    echo "  SKIP: the server has no Enterprise autonomous-transaction API"
     exit 77
 fi
 

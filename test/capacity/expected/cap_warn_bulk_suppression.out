@@ -29,8 +29,8 @@ FROM (
         ARRAY(SELECT generate_series(1, 100)::int4))) AS acquired
 ) sub;
 WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: capacity watermark crossed -- 100% (64 / 64 claims)
 WARNING:  pg_xclaim: 35 additional slot(s) hit max_claims (64) in this bulk call; per-slot WARNINGs suppressed
+WARNING:  pg_xclaim: capacity watermark crossed -- 100% (64 / 64 claims)
  acquired_count | rejected_count 
 ----------------+----------------
              64 |             36

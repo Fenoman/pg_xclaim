@@ -126,8 +126,10 @@ run_for_major() {
     pushd "$ROOT_DIR" >/dev/null
 
     # Clean build with strict flags (-Wall -Wextra -Werror in PG_CFLAGS).
+    # pg_config path and job count go in as positional parameters, so a path
+    # with spaces stays one argument.
     run_step "$v" "build" \
-        bash -c "make PG_CONFIG=$pgc clean && make PG_CONFIG=$pgc -j$MAKE_JOBS" \
+        bash -c 'make PG_CONFIG="$1" clean && make PG_CONFIG="$1" -j"$2"' _ "$pgc" "$MAKE_JOBS" \
         || { popd >/dev/null; return 1; }
 
     # Install (sudo on Linux, plain on macOS).

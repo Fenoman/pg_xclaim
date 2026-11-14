@@ -21,6 +21,20 @@
  *      XClaimBackendInfos[procno], the value the stale-owner reaper
  *      compares with a row's owner_token.
  *
+ *   xclaim_test_call_with_lwlocks_held(fn regprocedure, key int8) RETURNS bool
+ *      Calls fn(key) while every slot of the backend's held-LWLock array is
+ *      in use (MAX_SIMUL_LWLOCKS of lwlock.c: 200 in PostgreSQL, more in
+ *      some forks), so an LWLockAcquire inside it raises "too many LWLocks
+ *      taken". Returns true when the call raised an ERROR, which it catches.
+ *
+ *   xclaim_test_hooks.call_on_warning (int, user-settable)
+ *   xclaim_test_hooks.call_on_log (int, user-settable)
+ *      The OID of a function without arguments. The module's emit_log_hook
+ *      calls it once, on the next WARNING or on the next LOG message (LOG
+ *      or LOG_SERVER_ONLY, the level of pg_log_backend_memory_contexts),
+ *      and resets the setting. An ERROR it raises propagates from the
+ *      message.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -29,8 +43,11 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/ipc.h"
+#include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "utils/elog.h"
 #include "utils/guc.h"
+#include "utils/memutils.h"
 
 #include "pg_xclaim_internal.h"
 
@@ -38,8 +55,53 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(xclaim_test_published_token);
 PG_FUNCTION_INFO_V1(xclaim_test_set_published_token);
+PG_FUNCTION_INFO_V1(xclaim_test_call_with_lwlocks_held);
 
 static bool fail_abort_at_exit = false;
+static int  call_on_warning = 0;
+static int  call_on_log = 0;
+static emit_log_hook_type prev_emit_log_hook = NULL;
+
+/*
+ * EmitErrorReport() runs the hook in ErrorContext. The function runs in
+ * the memory context of the running transaction instead, as SQL does
+ * (an EXCEPTION block of a PL/pgSQL function copies its error data out of
+ * ErrorContext). Outside a transaction the call is skipped.
+ */
+static void
+xclaim_test_call_from_hook(Oid fn)
+{
+    MemoryContext oldcxt;
+
+    if (!IsTransactionState())
+        return;
+    oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+    (void) OidFunctionCall0(fn);
+    MemoryContextSwitchTo(oldcxt);
+}
+
+static void
+xclaim_test_emit_log_hook(ErrorData *edata)
+{
+    if (prev_emit_log_hook)
+        prev_emit_log_hook(edata);
+
+    if (call_on_warning != 0 && edata->elevel == WARNING)
+    {
+        Oid         fn = (Oid) call_on_warning;
+
+        call_on_warning = 0;
+        xclaim_test_call_from_hook(fn);
+    }
+    if (call_on_log != 0 &&
+        (edata->elevel == LOG || edata->elevel == LOG_SERVER_ONLY))
+    {
+        Oid         fn = (Oid) call_on_log;
+
+        call_on_log = 0;
+        xclaim_test_call_from_hook(fn);
+    }
+}
 
 static void
 xclaim_test_xact_callback(XactEvent event, void *arg)
@@ -60,8 +122,26 @@ _PG_init(void)
                              PGC_USERSET,
                              0,
                              NULL, NULL, NULL);
+    DefineCustomIntVariable("xclaim_test_hooks.call_on_warning",
+                            "OID of a function the emit_log_hook calls once, on the next WARNING.",
+                            NULL,
+                            &call_on_warning,
+                            0, 0, INT_MAX,
+                            PGC_USERSET,
+                            0,
+                            NULL, NULL, NULL);
+    DefineCustomIntVariable("xclaim_test_hooks.call_on_log",
+                            "OID of a function the emit_log_hook calls once, on the next LOG message.",
+                            NULL,
+                            &call_on_log,
+                            0, 0, INT_MAX,
+                            PGC_USERSET,
+                            0,
+                            NULL, NULL, NULL);
     MarkGUCPrefixReserved("xclaim_test_hooks");
     RegisterXactCallback(xclaim_test_xact_callback, NULL);
+    prev_emit_log_hook = emit_log_hook;
+    emit_log_hook = xclaim_test_emit_log_hook;
 }
 
 /*
@@ -109,4 +189,80 @@ xclaim_test_set_published_token(PG_FUNCTION_ARGS)
 
     pg_atomic_write_u64(&infos[procno].current_token, (uint64) token);
     PG_RETURN_VOID();
+}
+
+Datum
+xclaim_test_call_with_lwlocks_held(PG_FUNCTION_ARGS)
+{
+    Oid             fn = PG_GETARG_OID(0);
+    int64           key = PG_GETARG_INT64(1);
+    FmgrInfo        finfo;
+    LWLock         *lock;
+    MemoryContext   oldcxt = CurrentMemoryContext;
+    uint32          saved_holdoff = InterruptHoldoffCount;
+    volatile bool   caught = false;
+    volatile int    held = 0;
+    int             n;
+
+    fmgr_info(fn, &finfo);
+
+    /*
+     * A backend-local LWLock taken in shared mode never waits, and every
+     * acquisition takes a slot of the backend's held-lock array. The array
+     * has MAX_SIMUL_LWLOCKS slots, which lwlock.c does not export: 200 in
+     * PostgreSQL, more in some forks. The lock is taken until LWLockAcquire
+     * raises its ERROR, before taking the lock, with every slot in use.
+     */
+    lock = MemoryContextAllocZero(TopMemoryContext, sizeof(LWLock));
+    LWLockInitialize(lock, LWTRANCHE_FIRST_USER_DEFINED);
+    PG_TRY();
+    {
+        for (;;)
+        {
+            LWLockAcquire(lock, LW_SHARED);
+            held++;
+        }
+    }
+    PG_CATCH();
+    {
+        MemoryContextSwitchTo(oldcxt);
+        FlushErrorState();
+    }
+    PG_END_TRY();
+    /*
+     * errfinish() zeroed the interrupt holdoff count. The caller's count
+     * comes back, and each held lock holds interrupts once more, as
+     * LWLockAcquire left it.
+     */
+    InterruptHoldoffCount = saved_holdoff + held;
+    if (held == 0)
+    {
+        pfree(lock);
+        elog(ERROR, "xclaim_test_call_with_lwlocks_held: no LWLock taken");
+    }
+
+    PG_TRY();
+    {
+        (void) FunctionCall1(&finfo, Int64GetDatum(key));
+    }
+    PG_CATCH();
+    {
+        MemoryContextSwitchTo(oldcxt);
+        FlushErrorState();
+        caught = true;
+    }
+    PG_END_TRY();
+
+    /*
+     * An ERROR of the call zeroed the interrupt holdoff count again. Only
+     * this function's locks are released, and each release resumes
+     * interrupts once, down to the caller's count.
+     */
+    if (caught)
+        InterruptHoldoffCount = saved_holdoff + held;
+    for (n = 0; n < held; n++)
+        LWLockRelease(lock);
+    pfree(lock);
+
+    PG_RETURN_BOOL(caught);
 }

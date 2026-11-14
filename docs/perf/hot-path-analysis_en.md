@@ -46,14 +46,18 @@ PostgresMain
                 │   ├── XCLAIM_REQUIRE_INIT     [recovery + preload gate]
                 │   ├── memset(&key, 0, sizeof(XClaimKey))   [HASH_BLOBS req]
                 │   └── xclaim_try_internal     [12-step algorithm]
-                │       ├── xclaim_ensure_owner_token        [lazy, once per backend]
+                │       ├── CHECK_FOR_INTERRUPTS            [the only cancel point]
+                │       ├── xclaim_ensure_owner_token        [lazy, a new token after session_reset]
                 │       ├── xclaim_compute_hash             [one key hash for local + shared]
                 │       │   └── get_hash_value -> tag_hash -> hash_bytes
                 │       ├── xclaim_local_lookup_with_hash    [reentrancy fast-path]
                 │       │   └── xcl_local_lookup_hash (simplehash, hash is passed, not recomputed)
                 │       │       └── memcmp (16-byte key)
+                │       ├── xclaim_local_reserve(1)          [set growth before the lock]
+                │       ├── xclaim_local_add                 [local entry before the lock,
+                │       │                                     not counted yet]
                 │       ├── xclaim_partition_lock           [hashvalue & mask]
-                │       ├── LWLockAcquire(plock, EXCLUSIVE) ─┐
+                │       ├── PG_TRY { LWLockAcquire(plock, EXCLUSIVE) } ─┐
                 │       ├── hash_search_with_hash_value     │ critical
                 │       │   (HASH_ENTER_NULL - combined     │ section
                 │       │    lookup-or-insert, *found       │
@@ -64,17 +68,22 @@ PostgresMain
                 │       │   └── xclaim_get_pgproc_by_procno │
                 │       │       └── GetPGProcByNumber       [PG core macro,
                 │       │                                    storage/proc.h]
+                │       ├── [fresh] pg_atomic_fetch_add_u64 │
+                │       │   (live_capacity)                 │
                 │       ├── populate XClaimEntry owner      │
                 │       │   triple (procno+lxid+token)      │ - writes fresh
                 │       │                                   │   slot OR
                 │       │                                   │   overwrites a
                 │       │                                   │   stale-reap'd
                 │       │                                   │   slot in place
-                │       ├── PG_TRY {                        │
-                │       │   xclaim_local_insert_held }      │
                 │       └── LWLockRelease(plock)            ─┘
-                │       ├── pg_atomic_fetch_add_u64(live_capacity)
+                │       ├── xclaim_local_note_held          [count, peak, held-key list,
+                │       │                                    75% hint]
+                │       │   (xclaim_local_drop instead on a conflict or a
+                │       │    capacity miss)
                 │       ├── pg_atomic_fetch_add_u64(per-backend total_acquires_local)
+                │       ├── CAS peak_per_backend
+                │       ├── xclaim_local_emit_peak_warning  [messages after the counters]
                 │       └── xclaim_check_capacity_watermark
                 │           └── pg_atomic_read_u64(live_capacity)
 ```
@@ -86,6 +95,11 @@ CommitTransactionCommand / AbortTransaction
 └── CallXactCallbacks(XACT_EVENT_COMMIT | _ABORT)
     └── xclaim_xact_callback
         └── xclaim_local_cleanup_held
+            ├── [claims at most 1/64 of the buckets, all in the held-key list]
+            │   xclaim_local_cleanup_by_list: lookup of the listed keys,
+            │   qsort by partition_id, release per partition, delete of
+            │   the keys one by one, no walk of the array
+            └── [otherwise] the full path:
             ├── xclaim_local_gather_pointers     [O(N) walk simplehash]
             ├── counting sort by partition_id    [O(N + num_partitions)]
             └── for each partition (<= num_partitions cycles):
@@ -454,10 +468,12 @@ The profile confirms three core promises and cannot check item 2:
    The same `hashvalue` feeds the local-set lookup,
    `hash_search_with_hash_value` and the local-set insert, and the
    cleanup reads the `hashvalue` saved in each local-set entry.
-   Besides that, simplehash itself calls `hash_bytes`: an insert
-   recomputes the hashes of the entries in the occupied buckets it
-   passes while looking for a slot, and a grow recomputes the hashes
-   of all entries (`SH_STORE_HASH` is not defined). In the profile
+   Besides that, simplehash itself calls `hash_bytes` in the profiled
+   build, where `SH_STORE_HASH` is not defined: an insert recomputes
+   the hashes of the entries in the occupied buckets it passes while
+   looking for a slot, and a grow recomputes the hashes of all
+   entries. The current code defines `SH_STORE_HASH`: the hash lives in
+   the entry and simplehash does not recompute it. In the profile
    `hash_bytes` is a leaf of its own: 1.4% in scalar, 1.6% in cleanup,
    and below the top-15 floor (2.1%) in bulk. No SVG shows it under
    `xclaim_local_cleanup_held`.

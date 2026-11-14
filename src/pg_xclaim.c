@@ -129,8 +129,14 @@ is_power_of_two(int v)
  * check_max_claims
  *      HARD invariant: dynahash preallocates 32 freelists for partitioned
  *      tables (dynahash.c:127-148). Smaller values do not behave as
- *      HASH_FIXED_SIZE documents. Reject any setting below 32 at GUC
- *      parse time.
+ *      HASH_FIXED_SIZE documents. The GUC range rejects any setting below
+ *      32.
+ *
+ * A value that fails a check hook or the range, set in postgresql.conf
+ * before the library loads, is reported by PostgreSQL as a WARNING and
+ * the default is used, as for any extension GUC: the server starts.
+ * The "pg_xclaim: shared memory initialized" LOG line at startup shows
+ * the max_claims and num_partitions in effect.
  */
 static bool
 check_max_claims(int *newval, void **extra, GucSource source)
@@ -219,8 +225,9 @@ xclaim_define_gucs(void)
 
     DefineCustomIntVariable("pg_xclaim.expected_claims_per_backend",
                             "Pre-grow size for the per-backend local hash set.",
-                            "Avoids rehash during the 500-750k acquisition burst "
-                            "typical of the calculation workload.",
+                            "The set grows past it as a backend takes more claims. "
+                            "Raise it to the peak claims of a backend to avoid "
+                            "that growth.",
                             &xclaim_expected_claims_per_backend,
                             16384,          /* default */
                             1,              /* min */
@@ -236,7 +243,10 @@ xclaim_define_gucs(void)
                              "xclaim.try_many take no claims and return true for "
                              "every non-NULL key, and xclaim.stats().disabled_calls "
                              "counts one per xclaim.try call and one per array "
-                             "element of xclaim.try_many.",
+                             "element of xclaim.try_many. Claims taken before the "
+                             "switch stay held until their transaction ends, and "
+                             "xclaim.count(), xclaim.debug() and xclaim.debug_snapshot() "
+                             "keep reporting them.",
                              &xclaim_enabled,
                              true,          /* default */
                              PGC_SUSET,
@@ -407,6 +417,17 @@ _PG_init(void)
      */
     RegisterXactCallback(xclaim_xact_callback, NULL);
 
+/*
+ * Postgres Pro Enterprise has autonomous transactions, marked by
+ * XACT_EVENT_START. Building there without the refusal below would leave
+ * them free to release the parent's claims, so a server whose headers
+ * declare XACT_EVENT_START but not atx_mark_extension_as_incompatible (the
+ * Makefile probes miscadmin.h) stops the build.
+ */
+#if defined(XCLAIM_HAVE_XACT_EVENT_START) && !defined(XCLAIM_HAVE_ATX_MARK_EXTENSION_AS_INCOMPATIBLE)
+#error "XACT_EVENT_START without atx_mark_extension_as_incompatible: check where the server headers declare it and extend the Makefile probe"
+#endif
+
 #ifdef XCLAIM_HAVE_ATX_MARK_EXTENSION_AS_INCOMPATIBLE
     /*
      * Autonomous transactions of Postgres Pro Enterprise are refused.
@@ -470,7 +491,7 @@ PG_FUNCTION_INFO_V1(xclaim_try_solo);
  *      `pg_try_advisory_xact_lock(int4, int4)` for legacy migration.
  *
  *      Key construction:
- *          k1 = ((int64)(uint32) classid << 32) | (uint32) objid
+ *          k1 = (int64) (((uint64)(uint32) classid << 32) | (uint32) objid)
  *      The cast-through-uint32 prevents sign-extension when negative
  *      classid or objid values are supplied -- callers may legitimately
  *      pass any int4, including INT_MIN.
@@ -509,7 +530,7 @@ xclaim_try_pair(PG_FUNCTION_ARGS)
     memset(&lk, 0, sizeof(lk));
     lk.dbid = MyDatabaseId;
     lk.form = XCLAIM_FORM_PAIR;
-    lk.k1   = ((int64) (uint32) classid << 32) | (uint32) objid;
+    lk.k1   = (int64) (((uint64) (uint32) classid << 32) | (uint32) objid);
 
     PG_RETURN_BOOL(xclaim_try_internal(&lk));
 }

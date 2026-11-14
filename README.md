@@ -142,7 +142,7 @@ sudo make PG_CONFIG=/opt/homebrew/opt/postgresql@17/bin/pg_config install
 # отработает раньше всех (PG вызывает xact-callback'и в LIFO-порядке).
 shared_preload_libraries = 'citus,timescaledb,pg_xclaim'
 
-pg_xclaim.max_claims                  = 4194304    # 4M (default, ~360 MB shmem)
+pg_xclaim.max_claims                  = 4194304    # 4M (default, ~291 MB shmem)
 pg_xclaim.num_partitions              = 128
 pg_xclaim.expected_claims_per_backend = 16384
 pg_xclaim.enabled                     = true
@@ -162,6 +162,26 @@ pg_xclaim.on_capacity_exhaustion      = error
 > только бэкенд впервые подходит к пределу. Это готовый сигнал "пора
 > поднять GUC". Подробнее в `docs/runbook.md` §3.
 >
+> Поднятый GUC - это набор такого размера в каждом бэкенде на все время
+> его жизни. С умолчанием набор растет только в бэкенде, которому это
+> нужно. У `xclaim.try` рост идет до захвата блокировки партиции.
+> `xclaim.try_many` наращивает набор до блокировки на границе каждой
+> серии ключей одной партиции, но внутри серии ключи начинают пробы с
+> 1/`num_partitions` бакетов, и набор растет из-за длинных проб уже с
+> заполнения ~0.1, под блокировкой партиции (известное ограничение, см.
+> `docs/runbook.md` §3). После 64 транзакций подряд, каждая из которых
+> взяла хотя бы один claim и не больше, чем помещается в исходный массив,
+> набор, выросший в 4 раза и больше, возвращается к исходному размеру и
+> отдает память. `xclaim.try_many`, которому нужна половина исходного
+> массива или больше, этот отсчет прерывает, только пока набор меньше
+> четырех размеров, нужных вызову. Такой вызов до первой блокировки дает
+> набору вдвое больше места, чем нужно claim'ам транзакции, но не больше
+> наибольшего размера, с которого набор сжимался. Под блокировкой набор
+> растет, только когда бэкенд раньше не наращивал его до нужного размера
+> (при ключах, которые хеш разносит по партициям равномерно). Поднимать GUC стоит, когда
+> этот первый рост заметен: например, за пулером, который часто
+> пересоздает бэкенды.
+>
 > Формула общего бюджета памяти. Каждый удерживаемый claim занимает
 > 48-байтную `XClaimLocalEntry`. С учетом округления simplehash до
 > степени двойки и load factor ~75% эффективная стоимость - ~63 байта
@@ -177,7 +197,7 @@ pg_xclaim.on_capacity_exhaustion      = error
 >
 > Пример. При `max_connections=200` и `expected_claims_per_backend=750000`
 > это ~10 GB суммарно в TopMemoryContext'ах бэкендов
-> (~50.3 MB x 200), плюс ~360 MB shmem dynahash из
+> (~50.3 MB x 200), плюс ~291 MB shmem dynahash из
 > `max_claims=4194304`. Это нужно учитывать при расчете RAM кластера:
 > pre-grow per-backend - самая большая статья расхода в общем бюджете.
 
@@ -207,14 +227,14 @@ CREATE EXTENSION pg_xclaim;
 |---------|------------|
 | `xclaim.try(int4, int4) RETURNS boolean` | Двухаргументная функция, сигнатура совпадает с `pg_try_advisory_xact_lock(int4, int4)` для удобной миграции старого кода. |
 | `xclaim.try(int8) RETURNS boolean` | Одноаргументная функция, сигнатура совпадает с `pg_try_advisory_xact_lock(bigint)`. Отдельное пространство ключей. |
-| `xclaim.try_many(int4, int4[]) RETURNS boolean[]` | Пакетный вариант, пред-сортирует по партиции (<= `num_partitions` циклов LWLock на весь массив). |
+| `xclaim.try_many(int4, int4[]) RETURNS boolean[]` | Пакетный вариант, пред-сортирует по партиции (<= `num_partitions` циклов LWLock на весь массив, в режиме `warn` каждый промах по емкости добавляет цикл). |
 | `xclaim.try_many(int8[]) RETURNS boolean[]` | Пакетный вариант одноаргументной формы. |
 | `xclaim.count() RETURNS int8` | Число claim'ов, удерживаемых текущей top-level транзакцией. |
 | `xclaim.stats() RETURNS TABLE(...)` | Снимок атомарных счетчиков + метрики емкости. Доступ `pg_monitor`. |
-| `xclaim.debug_snapshot() RETURNS TABLE(...)` | Детальный снимок shared-state под shared-lock'ами всех партиций. Доступ `pg_monitor`, требует `pg_xclaim.num_partitions <= 192`. |
-| `xclaim.debug() RETURNS TABLE(...)` | Полный консистентный снимок по всем партициям. **Только superuser.** |
+| `xclaim.debug_snapshot() RETURNS TABLE(...)` | Консистентный снимок всех claim'ов. Под shared-lock'ами всех партиций только копирует записи, результат строится после их снятия: захваты ждут только копирования. Доступ `pg_monitor`, требует `pg_xclaim.num_partitions <= 192`. |
+| `xclaim.debug() RETURNS TABLE(...)` | Тот же снимок, что у `debug_snapshot()`. **Только superuser.** |
 | `xclaim.debug_inject_stale(int4, int4) RETURNS void` | **Только для тестов.** Инъектор stale-записи (имитация владельца, не пережившего crash). **Только superuser**, `REVOKE`-нут от `PUBLIC`. В production не вызывается. |
-| `xclaim.session_reset() RETURNS void` | Опциональный хук для аварийной очистки. Принудительно очищает локальное состояние и ротирует owner_token. **При штатной работе не нужен:** claim'ы освобождаются автоматически через xact-callback на каждом COMMIT/ABORT. Нужен только сессии, которая держит claims вне транзакции (`xclaim.count() > 0` в autocommit). Штатная работа такого состояния не дает, см. раздел 6 в `docs/runbook.md`. Не ставьте в `server_reset_query` пулера - это лишний RTT. |
+| `xclaim.session_reset() RETURNS void` | Опциональный хук для аварийной очистки. Принудительно очищает локальное состояние, отдает аллокатору выросший локальный набор и ротирует owner_token. Отказывает внутри транзакционного блока, в параллельном воркере, внутри `xclaim.try_many` и пока текущая транзакция держит claim'ы. **При штатной работе не нужен:** claim'ы освобождаются автоматически через xact-callback на каждом COMMIT/ABORT. Нужен только сессии, которая держит claims вне транзакции (`xclaim.count() > 0` в autocommit). Claim'ы работающей транзакции не снимает: внутри явного `BEGIN`, в функции, DO-блоке или в одном операторе с `xclaim.try` дает ERROR. Штатная работа такого состояния не дает, см. раздел 6 в `docs/runbook.md`. Не ставьте в `server_reset_query` пулера - это лишний RTT. |
 
 ### Паритет атрибутов функций с `pg_try_advisory_xact_lock`
 
@@ -305,11 +325,11 @@ workload рассчитывает на освобождение per-savepoint - 
 
 | GUC | Тип | По умолчанию | Описание |
 |-----|-----|--------------|----------|
-| `pg_xclaim.max_claims` | int4 | 4194304 | Емкость shared dynahash. Требует перезапуска. Footprint масштабируется линейно от `max_claims`. Sizing по умолчанию - ~360 MB, удвоение `max_claims` -> удвоение footprint. |
+| `pg_xclaim.max_claims` | int4 | 4194304 | Емкость shared dynahash. Требует перезапуска. Footprint масштабируется линейно от `max_claims`. Sizing по умолчанию - ~291 MB, удвоение `max_claims` -> удвоение footprint. |
 | `pg_xclaim.num_partitions` | int4 | 128 | Количество защищенных LWLock'ом партиций. Требует перезапуска. |
-| `pg_xclaim.expected_claims_per_backend` | int4 | 16384 | Заранее наращивает локальный `simplehash` до этого размера, чтобы избежать rehash'ей под нагрузкой. Требует перезапуска. |
-| `pg_xclaim.enabled` | bool | true | Активный "выключатель". Off = `xclaim.try` безусловно возвращает `true`. `PGC_SUSET`. |
-| `pg_xclaim.capacity_warn_pct` | int4 | 80 | Порог watermark для лога (LOG-строка на 80/90/95%). |
+| `pg_xclaim.expected_claims_per_backend` | int4 | 16384 | Начальный размер локального `simplehash`: пока claim'ов бэкенда меньше, набор не растет по порогу заполнения (по длинной пробе может вырасти раньше). Требует перезапуска. |
+| `pg_xclaim.enabled` | bool | true | Активный "выключатель". Off = `xclaim.try` и `xclaim.try_many` безусловно возвращают `true` и ничего не захватывают, `disabled_calls` растет на вызов `try` и на элемент `try_many`. Claim'ы, взятые до выключения, держатся до конца своих транзакций, и `count()`, `debug()`, `debug_snapshot()` их показывают. `PGC_SUSET`. |
+| `pg_xclaim.capacity_warn_pct` | int4 | 80 | Порог watermark для лога (LOG на 80% и 90%, WARNING на 95%). |
 | `pg_xclaim.on_capacity_exhaustion` | enum | error | `error` (по умолчанию, ERRCODE 53400) / `warn` (log + return false). |
 
 См. [`docs/runbook.md`](docs/runbook.md) - рекомендации по настройке.
@@ -417,10 +437,10 @@ shmem. Поэтому здесь приводится не одно "выигр�
 и порядок величины - считайте под свой `max_connections` и пик claim'ов.
 
 pg_xclaim **добавляет** фиксированный shmem-пул (`max_claims`, default
-~360 MB) и per-backend локальную память:
+~291 MB) и per-backend локальную память:
 
 ```
-shmem (общий пул)         ~ выбранный max_claims (default 4M -> ~360 MB)
+shmem (общий пул)         ~ выбранный max_claims (default 4M -> ~291 MB)
 per-backend local         ~ 50.3 MB при 750k claim'ов
                           ~ 6.3 MB при 100k claim'ов
 cluster-wide local        ~ per-backend x число активных бэкендов
@@ -430,7 +450,7 @@ cluster-wide local        ~ per-backend x число активных бэкен
 100k claim'ов в одной транзакции x 200 параллельных бэкендов - это
 20M одновременных claim'ов в общем пуле. Дефолтных 4M хватает на ~41
 такой бэкенд, поэтому нужен `pg_xclaim.max_claims` не меньше 20M,
-например 25165824 (24M, ~2.2 GB shmem). Локальная память -
+например 25165824 (24M, ~1.8 GB shmem). Локальная память -
 ~6.3 MB x 200 = ~1.26 GB. Взамен снимается локальная память
 advisory-блокировок (~34 MB/бэкенд при 100k удерживаемых locks:
 LOCALLOCK hash и массивы владельцев блокировок) и убирается
@@ -442,7 +462,7 @@ LOCALLOCK hash и массивы владельцев блокировок) и �
 числа идентичны между версиями). Полная разбивка с pre-grown floor и
 ростом simplehash - в [`docs/runbook.md` §9](docs/runbook.md#9-планирование-емкости).
 Под легкой нагрузкой (10-100 locks на транзакцию) переход **только
-добавит** ~360 MB shmem без видимой экономии - эта нагрузка изначально
+добавит** ~291 MB shmem без видимой экономии - эта нагрузка изначально
 не нуждается в pg_xclaim.
 
 ### Сравнение с альтернативами
@@ -566,7 +586,8 @@ overlap unsorted claim-table'ы (B и D) ловят по 7 deadlock'ов за
 - **`PREPARE TRANSACTION` отвергается** (SQLSTATE `0A000`,
   `ERRCODE_FEATURE_NOT_SUPPORTED`). Это явное расхождение с advisory:
   advisory-локи **переживают** `PREPARE`, claim'ы pg_xclaim - нет. См.
-  `docs/runbook.md`.
+  `docs/runbook.md`. Отказ действует и на `PREPARE` от менеджера
+  распределенных транзакций, например на worker Citus с удерживаемыми claim'ами.
 - **Try-only API:** нет блокирующего захвата, нет очереди ожидания, нет
   детектора deadlock'ов. Порядок захвата в retry-цикле - ответственность
   вызывающего. Deadlock-детектор PostgreSQL claim'ы pg_xclaim не видит.
@@ -576,17 +597,16 @@ overlap unsorted claim-table'ы (B и D) ловят по 7 deadlock'ов за
 - **Время жизни в подтранзакциях** отличается от advisory: claim
   переживает `ROLLBACK TO SAVEPOINT`, освобождается только top-level
   COMMIT/ABORT (см. раздел выше).
-- **Не больше 134217727 claim'ов в одном бэкенде.** При большем числе
-  очистка в конце транзакции падает (PostgreSQL не выделяет больше 1 ГБ
-  за раз), и кластер уходит в PANIC. Для этого нужен
-  `max_claims >= 134217728`, с дефолтом 4M предел недостижим. См.
-  `docs/runbook.md` §9.
 - **Автономные транзакции Postgres Pro Enterprise** отклоняются, пока
   pg_xclaim стоит в `shared_preload_libraries`: `BEGIN AUTONOMOUS` и
   автономный блок PL/pgSQL получают ошибку `pg_xclaim extension is
   incompatible with autonomous transactions`. COMMIT или ABORT автономной
   транзакции завершили бы ее родителя для pg_xclaim, и родитель потерял бы
   свои claim'ы.
+- **Автономные функции Tantor SE:** claim из SQL-оператора принадлежит
+  автономному бэкенду и освобождается при завершении его транзакции.
+  Вызов в выражении PL/pgSQL исполняется в бэкенде родителя и удерживает
+  claim до завершения родительской транзакции.
 - **Windows** не тестировался и не поддерживается.
 - **Transaction-pooling** (pgbouncer/odyssey в режиме `transaction`):
   claim'ы привязаны к транзакции и освобождаются на ее границе, поэтому не
@@ -610,6 +630,13 @@ REVOKE EXECUTE ON FUNCTION xclaim.try(int4, int4)        FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION xclaim.try_many(int8[])       FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION xclaim.try_many(int4, int4[]) FROM PUBLIC;
 ```
+
+Ключи, намеренно подобранные под одну партицию, также могут удерживать ее
+LWLock на весь длинный прогон `try_many` или очистку транзакции. Другие
+захваты в этой партиции ждут освобождения блокировки. Пока она удерживается,
+прерывания, включая `statement_timeout`, откладываются. Режим емкости `warn`
+не ограничивает эту задержку. Ограничивайте `EXECUTE` для недоверенных ролей,
+как показано выше.
 
 Полная модель угроз и порядок раскрытия уязвимостей -
 [`.github/SECURITY.md`](.github/SECURITY.md).

@@ -69,20 +69,22 @@ for i in $(seq 1 $N_BACKENDS); do
     OUT="$WORK_DIR/backend_${i}.out"
     START_KEY=$(( (i - 1) * KEYS_PER_BACKEND + 1 ))
     END_KEY=$(( i * KEYS_PER_BACKEND ))
-    # LC_MESSAGES=C forces psql/server diagnostics to English so the
-    # "^(ERROR|FATAL|PANIC):" scan below is deterministic regardless of the
-    # temp cluster's ru_RU.UTF-8 locale.
-    LC_MESSAGES=C "$PGBIN/psql" -h "$PGHOST" -p "$PGPORT" \
+    # lc_messages=C (via PGOPTIONS, the server translates its diagnostics,
+    # not psql) keeps the "^(ERROR|FATAL|PANIC):" scan below independent of
+    # the temp cluster's ru_RU.UTF-8 locale. ON_ERROR_STOP makes an error
+    # visible in the exit status of psql as well.
+    PGOPTIONS='-c lc_messages=C' "$PGBIN/psql" -h "$PGHOST" -p "$PGPORT" \
         -U postgres -d postgres \
-        -X -A -t \
+        -X -A -t -v ON_ERROR_STOP=1 \
         -c "BEGIN; SELECT count(v) FROM unnest(xclaim.try_many($SCOPE, ARRAY(SELECT generate_series($START_KEY, $END_KEY)::int4))) v WHERE v; COMMIT;" \
         >"$OUT" 2>&1 &
     BGPIDS+=($!)
 done
 
-# Wait for all backends to complete
+# Wait for all backends to complete and keep each exit status.
+BG_RCS=()
 for pid in "${BGPIDS[@]}"; do
-    wait "$pid" 2>/dev/null || true
+    if wait "$pid"; then BG_RCS+=(0); else BG_RCS+=($?); fi
 done
 
 T_STRESS_END="$(xclaim_now_ms)"
@@ -111,11 +113,12 @@ for i in $(seq 1 $N_BACKENDS); do
         if grep -qE "^(ERROR|FATAL|PANIC):" "$OUT" 2>/dev/null; then
             ERROR_LINES="$(grep -cE "^(ERROR|FATAL|PANIC):" "$OUT" 2>/dev/null || echo "0")"
         fi
-        echo "  Backend $i: wins=$WIN_COUNT errors=$ERROR_LINES"
+        BG_RC="${BG_RCS[i - 1]}"
+        echo "  Backend $i: wins=$WIN_COUNT errors=$ERROR_LINES psql_rc=$BG_RC"
 
-        if [[ "$ERROR_LINES" != "0" ]]; then
-            echo "  FAIL: backend $i had errors" >&2
-            grep -E "^(ERROR|FATAL|PANIC):" "$OUT" | head -3 | sed 's/^/    /' >&2
+        if [[ "$ERROR_LINES" != "0" ]] || [[ "$BG_RC" != "0" ]]; then
+            echo "  FAIL: backend $i had errors (psql exit status $BG_RC)" >&2
+            grep -E "^(ERROR|FATAL|PANIC):|connection" "$OUT" | head -3 | sed 's/^/    /' >&2 || true
             ALL_OK=false
             CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "backend_${i}_errors" "FAIL" "errors" "$ERROR_LINES" "backend errored")")
         else
@@ -172,17 +175,16 @@ fi
 # Stats: capacity_errors and cleanup_misses must be 0
 # ---------------------------------------------------------------------------
 echo "--- Checking stats for correctness ---"
-STATS_AFTER="$(pg_xclaim_psql -X -A -t \
-    -c "SELECT capacity_errors, cleanup_misses, disabled_calls FROM xclaim.stats();" \
-    2>/dev/null | tr -d ' ' || echo "0|0|0")"
-echo "  Stats after: $STATS_AFTER"
+# A failed query yields "error", which fails both checks below.
+if ! STATS_AFTER="$(pg_xclaim_psql -X -A -t -v ON_ERROR_STOP=1 \
+        -c "SELECT capacity_errors, cleanup_misses, disabled_calls FROM xclaim.stats();" 2>&1)"; then
+    echo "  FAIL: xclaim.stats() query failed: $STATS_AFTER" >&2
+    STATS_AFTER="error|error|error"
+fi
+echo "  Stats after (capacity_errors|cleanup_misses|disabled_calls): $STATS_AFTER"
 
-CAP_ERRORS="$(pg_xclaim_psql -X -A -t \
-    -c "SELECT capacity_errors FROM xclaim.stats();" \
-    2>/dev/null | tr -d ' ' || echo "0")"
-CLEANUP_MISSES="$(pg_xclaim_psql -X -A -t \
-    -c "SELECT cleanup_misses FROM xclaim.stats();" \
-    2>/dev/null | tr -d ' ' || echo "0")"
+CAP_ERRORS="$(cut -d'|' -f1 <<<"$STATS_AFTER")"
+CLEANUP_MISSES="$(cut -d'|' -f2 <<<"$STATS_AFTER")"
 
 if [[ "$CAP_ERRORS" == "0" ]]; then
     echo "  PASS: no capacity_errors"
@@ -199,9 +201,9 @@ if [[ "$CLEANUP_MISSES" == "0" ]]; then
     PASS=$(( PASS + 1 ))
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "no_cleanup_misses" "PASS" "cleanup_misses" "0" "")")
 else
-    echo "  WARN: cleanup_misses=$CLEANUP_MISSES (non-fatal but suspicious)"
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "no_cleanup_misses" "PASS" "cleanup_misses" "$CLEANUP_MISSES" "warn")")
-    PASS=$(( PASS + 1 ))
+    echo "  FAIL: cleanup_misses=$CLEANUP_MISSES (expected 0)" >&2
+    FAIL=$(( FAIL + 1 ))
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "no_cleanup_misses" "FAIL" "cleanup_misses" "$CLEANUP_MISSES" "expected 0")")
 fi
 
 # ---------------------------------------------------------------------------

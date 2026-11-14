@@ -83,6 +83,12 @@ unrelated sessions running but lets the exhausting role deny claims to
 others. Privilege restriction is the primary mitigation. The `warn`
 fallback only softens the blast radius.
 
+Keys deliberately chosen to hash to one partition can also hold its LWLock
+through a long `try_many` run or transaction cleanup. Other claims in that
+partition wait for the lock, and interrupts such as `statement_timeout`
+are deferred while it is held. Capacity mode `warn` does not bound this
+delay. Restricting `EXECUTE` also limits access to this workload.
+
 ## Disclosure policy
 
 Coordinated disclosure. After a fix is ready, a GitHub Security

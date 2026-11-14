@@ -11,9 +11,15 @@
  *   filter to the canonical end-of-transaction events:
  *
  *     XACT_EVENT_COMMIT          -- normal COMMIT
- *     XACT_EVENT_PARALLEL_COMMIT -- parallel-leader COMMIT
+ *     XACT_EVENT_PARALLEL_COMMIT -- COMMIT of a parallel worker
  *     XACT_EVENT_ABORT           -- normal ROLLBACK / ERROR-driven abort
- *     XACT_EVENT_PARALLEL_ABORT  -- parallel-leader abort
+ *     XACT_EVENT_PARALLEL_ABORT  -- abort of a parallel worker
+ *
+ *   A parallel worker gets the PARALLEL_ events (CommitTransaction and
+ *   AbortTransaction branch on is_parallel_worker), the leader gets
+ *   COMMIT / ABORT. A worker never takes claims (the SQL functions are
+ *   PARALLEL RESTRICTED and the C entry points reject IsParallelWorker()),
+ *   so its cleanup finds an empty local set.
  *
  *   We do NOT clean on PRE_COMMIT / PRE_PREPARE / PREPARE. Cleanup is
  *   deliberately tied to the post-outcome COMMIT/ABORT callbacks so we

@@ -6,10 +6,14 @@
 #   Backend A holds (1, 900) in an open transaction and disconnects with
 #   xclaim_test_hooks.fail_abort_at_exit on. The hooks module, preloaded
 #   after pg_xclaim, fails the abort at exit, the ERROR becomes FATAL and
-#   pg_xclaim's xact callback does not run, so the claim reaches the exit
-#   callback. Right after A is gone, and before any backend asks for the
+#   pg_xclaim's xact callback does not run, so the claim reaches the exit callback.
+#
+#   Check. Right after A is gone, and before any backend asks for the
 #   key, the row must be gone and reaped_stale unchanged: the lazy reaper
 #   would otherwise hide a missing release on the next conflicting claim.
+#
+#   Assertions. A server built with assertions skips this injection. Core asserts on
+#   the incomplete abort before shared-memory exit callbacks can run.
 #
 # Test 2: the exit callback publishes owner_token 0 for the exiting backend.
 #   Backend B holds (1, 901), so its token is published in its slot. After
@@ -40,6 +44,7 @@ xclaim_banner "$SCRIPT"
 
 PASS=0
 FAIL=0
+SKIP=0
 CSV_ROWS=()
 
 q() { pg_xclaim_psql -X -A -t -q -c "$1"; }
@@ -68,47 +73,53 @@ server_down() {  # test
 # ---------------------------------------------------------------------------
 echo "--- Test 1: exit releases a claim the xact callback left behind ---"
 
-REAPED_BEFORE="$(q "SELECT reaped_stale FROM xclaim.stats();")"
+if [[ "$(q "SHOW debug_assertions;")" == "on" ]]; then
+    echo "  SKIP: core assertions reject the injected abort failure before the exit callback"
+    SKIP=$((SKIP+1))
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "exit_releases_left_behind" "SKIP" "debug_assertions" "on" "core asserts before shared-memory exit callbacks")")
+else
+    REAPED_BEFORE="$(q "SELECT reaped_stale FROM xclaim.stats();")"
 
-A_OUT="$(pg_xclaim_psql -X -A -t -q -v ON_ERROR_STOP=1 2>&1 <<'SQL'
+    A_OUT="$(pg_xclaim_psql -X -A -t -q -v ON_ERROR_STOP=1 2>&1 <<'SQL'
 SET xclaim_test_hooks.fail_abort_at_exit = on;
 BEGIN;
 SELECT 'try=' || xclaim.try(1, 900);
 SELECT 'pid=' || pg_backend_pid();
 SQL
-)"
-A_TRY="$(sed -n 's/^try=//p' <<<"$A_OUT")"
-A_PID="$(sed -n 's/^pid=//p' <<<"$A_OUT")"
-echo "  A: try(1, 900) = $A_TRY, pid = $A_PID, disconnected with the transaction open"
+    )"
+    A_TRY="$(sed -n 's/^try=//p' <<<"$A_OUT")"
+    A_PID="$(sed -n 's/^pid=//p' <<<"$A_OUT")"
+    echo "  A: try(1, 900) = $A_TRY, pid = $A_PID, disconnected with the transaction open"
 
-if [[ "$A_TRY" != "true" ]] || [[ -z "$A_PID" ]]; then
-    fail "exit_releases_left_behind" "setup" "try=$A_TRY pid=$A_PID" "backend A must hold (1, 900)"
-elif ! xclaim_wait_backend_gone "$A_PID"; then
-    fail "exit_releases_left_behind" "setup" "pid $A_PID alive" "backend A must exit within 10s"
-elif ! server_alive; then
-    server_down "exit_releases_left_behind"
-else
-    # The abort at exit must really have failed, otherwise pg_xclaim's xact
-    # callback released the claim and the exit callback had nothing to do.
-    SKIPPED="$(grep -c "xclaim_test_hooks: failing the abort at backend exit" "$PGDATA/server.log" || true)"
-    if [[ "$SKIPPED" -ge 1 ]]; then
-        pass "abort_at_exit_failed" "log_lines" "$SKIPPED" "the hooks module failed the abort at A's exit"
+    if [[ "$A_TRY" != "true" ]] || [[ -z "$A_PID" ]]; then
+        fail "exit_releases_left_behind" "setup" "try=$A_TRY pid=$A_PID" "backend A must hold (1, 900)"
+    elif ! xclaim_wait_backend_gone "$A_PID"; then
+        fail "exit_releases_left_behind" "setup" "pid $A_PID alive" "backend A must exit within 10s"
+    elif ! server_alive; then
+        server_down "exit_releases_left_behind"
     else
-        fail "abort_at_exit_failed" "log_lines" "$SKIPPED" "the hooks module must fail the abort at A's exit"
-    fi
+        # The abort at exit must really have failed, otherwise pg_xclaim's xact
+        # callback released the claim and the exit callback had nothing to do.
+        SKIPPED="$(grep -c "xclaim_test_hooks: failing the abort at backend exit" "$PGDATA/server.log" || true)"
+        if [[ "$SKIPPED" -ge 1 ]]; then
+            pass "abort_at_exit_failed" "log_lines" "$SKIPPED" "the hooks module failed the abort at A's exit"
+        else
+            fail "abort_at_exit_failed" "log_lines" "$SKIPPED" "the hooks module must fail the abort at A's exit"
+        fi
 
-    ROWS="$(q "SELECT count(*) FROM xclaim.debug() WHERE key = 900;")"
-    REAPED_AFTER="$(q "SELECT reaped_stale FROM xclaim.stats();")"
-    echo "  after A exited: rows for key 900 = $ROWS, reaped_stale $REAPED_BEFORE -> $REAPED_AFTER"
-    if [[ "$ROWS" == "0" ]]; then
-        pass "exit_releases_left_behind" "rows" "$ROWS" "A's claim was released at exit"
-    else
-        fail "exit_releases_left_behind" "rows" "$ROWS" "A's claim must be released at exit"
-    fi
-    if [[ "$REAPED_AFTER" == "$REAPED_BEFORE" ]]; then
-        pass "no_reap_needed" "reaped_stale" "$REAPED_AFTER" "no stale-owner reap was involved"
-    else
-        fail "no_reap_needed" "reaped_stale" "$REAPED_AFTER" "reaped_stale must stay at $REAPED_BEFORE"
+        ROWS="$(q "SELECT count(*) FROM xclaim.debug() WHERE key = 900;")"
+        REAPED_AFTER="$(q "SELECT reaped_stale FROM xclaim.stats();")"
+        echo "  after A exited: rows for key 900 = $ROWS, reaped_stale $REAPED_BEFORE -> $REAPED_AFTER"
+        if [[ "$ROWS" == "0" ]]; then
+            pass "exit_releases_left_behind" "rows" "$ROWS" "A's claim was released at exit"
+        else
+            fail "exit_releases_left_behind" "rows" "$ROWS" "A's claim must be released at exit"
+        fi
+        if [[ "$REAPED_AFTER" == "$REAPED_BEFORE" ]]; then
+            pass "no_reap_needed" "reaped_stale" "$REAPED_AFTER" "no stale-owner reap was involved"
+        else
+            fail "no_reap_needed" "reaped_stale" "$REAPED_AFTER" "reaped_stale must stay at $REAPED_BEFORE"
+        fi
     fi
 fi
 
@@ -167,5 +178,5 @@ echo "=== CSV SUMMARY ==="
 echo "TIMESTAMP,SCRIPT,TEST,RESULT,METRIC_NAME,METRIC_VALUE,NOTES"
 for row in "${CSV_ROWS[@]}"; do echo "$row"; done
 echo ""
-echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
+echo "=== RESULT: PASS=$PASS FAIL=$FAIL SKIP=$SKIP ==="
 (( FAIL > 0 )) && exit 1 || exit 0

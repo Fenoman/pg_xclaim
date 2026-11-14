@@ -21,11 +21,13 @@
 #   2. Setting shared_preload_libraries='pg_stat_statements,pg_xclaim'
 #      AND vice versa to verify both chain orders.
 #   3. Booting `postgres --single` (preload runs, hooks fire).
-#   4. Detecting hang via timeout and FATAL/PANIC via log grep.
+#   4. Detecting a hang via timeout, a crash or FATAL via the exit status,
+#      and ERROR/FATAL/PANIC via a scan of the log in lc_messages=C.
 #
 # Exit:
 #   0  PASS  -- both orders boot cleanly
-#   1  FAIL  -- timeout (deadlock) OR FATAL/PANIC during boot
+#   1  FAIL  -- timeout (deadlock), non-zero exit status, or ERROR/FATAL/PANIC
+#               logged during boot
 #   2  bad usage / missing pg_config
 
 set -euo pipefail
@@ -94,14 +96,18 @@ run_one() {
 
     local smoke_log="$datadir/smoke.log"
 
-    # `postgres --single` runs preload + _PG_init + shmem_startup + hooks
-    # then idles on stdin. \q exits cleanly. If the chain self-deadlocks,
-    # a 30s alarm kills the process and the gate reports failure. The
-    # alarm comes from perl (`perl -e 'alarm 30; exec @ARGV'`) because
-    # macOS lacks GNU timeout(1).
+    # `postgres --single` runs preload + _PG_init + shmem_startup + hooks,
+    # then reads commands from stdin. Empty stdin makes it shut down right
+    # away. If the chain self-deadlocks, a 30s alarm kills the process and
+    # the gate reports failure. The alarm comes from perl
+    # (`perl -e 'alarm 30; exec @ARGV'`) because macOS lacks GNU timeout(1).
+    # lc_messages=C keeps the severity tags in English whatever the cluster
+    # locale is, the environment keeps ru_RU.UTF-8.
     set +e
+    LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
     perl -e 'alarm 30; exec @ARGV or die "exec failed: $!"' \
-        "$POSTGRES" --single -D "$datadir" postgres <<<'\q' >"$smoke_log" 2>&1
+        "$POSTGRES" --single -D "$datadir" -c lc_messages=C postgres \
+        </dev/null >"$smoke_log" 2>&1
     local rc=$?
     set -e
 
@@ -112,9 +118,9 @@ run_one() {
         return 1
     fi
 
-    if grep -qE 'FATAL|PANIC' "$smoke_log"; then
-        echo "FAIL [$label]: FATAL/PANIC during preload" >&2
-        grep -E 'FATAL|PANIC' "$smoke_log" >&2 | head -20
+    if grep -qE '(ERROR|FATAL|PANIC):' "$smoke_log"; then
+        echo "FAIL [$label]: ERROR/FATAL/PANIC during preload" >&2
+        grep -E '(ERROR|FATAL|PANIC):' "$smoke_log" | head -20 >&2
         echo "--- smoke.log ---" >&2
         cat "$smoke_log" >&2
         return 1

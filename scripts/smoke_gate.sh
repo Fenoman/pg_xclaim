@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # scripts/smoke_gate.sh -- pre-deploy smoke gate.
 #
-# Verifies that `_PG_init` does not panic when the freshly-built `.so` is
-# preloaded. Uses `postgres --single` bootstrap mode, which executes
-# preload (and runs init) but accepts no client work. Exit 0 means the
-# server initialized cleanly. Non-zero means a FATAL/PANIC was emitted
-# during shared_preload_libraries processing.
+# Verifies that `_PG_init` does not crash when the freshly-built `.so` is
+# preloaded. Uses `postgres --single`, which executes preload (and runs
+# init) but accepts no client work. Exit 0 means the server initialized
+# and shut down cleanly. Non-zero means the postgres process exited with a
+# non-zero status (a signal included) or logged ERROR/FATAL/PANIC during
+# shared_preload_libraries processing.
 #
 # Mandatory before any production postgresql.conf change: without this
 # gate, a buggy `_PG_init` will brick the next normal start and require
@@ -17,8 +18,8 @@
 #   PG_CONFIG_BIN=/path scripts/smoke_gate.sh       # via env
 #
 # Exit:
-#   0  PASS  -- no FATAL/PANIC observed
-#   1  FAIL  -- FATAL or PANIC found in smoke.log
+#   0  PASS  -- postgres exited 0, no ERROR/FATAL/PANIC in smoke.log
+#   1  FAIL  -- non-zero exit status of postgres, or ERROR/FATAL/PANIC logged
 #   2  bad usage / missing pg_config
 
 set -euo pipefail
@@ -72,16 +73,42 @@ echo "smoke_gate: DATADIR=$DATADIR"
     echo "pg_xclaim.num_partitions = 128"
 } >> "$DATADIR/postgresql.conf"
 
-# `postgres --single` bootstrap mode: runs preload + _PG_init, then idles
-# on stdin. We feed `\q` to make it exit cleanly. If init faults, FATAL is
-# emitted to stderr (captured by tee).
+# `postgres --single` runs preload and `_PG_init`, then reads commands
+# from stdin. Empty stdin makes it shut down right away.
+#
+# How a failure shows.
+#   The exit status of the postgres process is the primary signal. A crash
+#   in `_PG_init` (SIGSEGV, abort) prints nothing and leaves a status above
+#   128, FATAL exits with 1.
+#
+# Why lc_messages=C.
+#   The cluster locale is ru_RU.UTF-8, so the server would translate its
+#   severity tags. lc_messages=C keeps them in English and makes the scan
+#   below independent of translations. The process environment keeps
+#   ru_RU.UTF-8, as every postgres start in this project does.
 SMOKE_LOG="$DATADIR/smoke.log"
-echo '\q' | "$POSTGRES" --single -D "$DATADIR" postgres 2>&1 | tee "$SMOKE_LOG" >/dev/null || true
+if LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
+    "$POSTGRES" --single -D "$DATADIR" -c lc_messages=C postgres \
+    </dev/null >"$SMOKE_LOG" 2>&1; then
+    rc=0
+else
+    rc=$?
+fi
 
-# Detect any FATAL/PANIC emitted during init.
-if grep -qE 'FATAL|PANIC' "$SMOKE_LOG"; then
-    echo "SMOKE GATE FAILED: FATAL/PANIC detected during _PG_init" >&2
-    grep -E 'FATAL|PANIC' "$SMOKE_LOG" >&2 | head -20
+if (( rc != 0 )); then
+    if (( rc > 128 )); then
+        echo "SMOKE GATE FAILED: postgres --single killed by signal $(( rc - 128 ))" >&2
+    else
+        echo "SMOKE GATE FAILED: postgres --single exited with status $rc" >&2
+    fi
+    echo "--- full smoke.log ---" >&2
+    cat "$SMOKE_LOG" >&2
+    exit 1
+fi
+
+if grep -qE '(ERROR|FATAL|PANIC):' "$SMOKE_LOG"; then
+    echo "SMOKE GATE FAILED: ERROR/FATAL/PANIC logged during _PG_init" >&2
+    grep -E '(ERROR|FATAL|PANIC):' "$SMOKE_LOG" | head -20 >&2
     echo "--- full smoke.log ---" >&2
     cat "$SMOKE_LOG" >&2
     exit 1

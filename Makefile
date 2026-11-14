@@ -1,7 +1,7 @@
 # pg_xclaim - PostgreSQL extension for high-cardinality xact-claims
 #
 # Build:
-#   make PG_CONFIG=/opt/homebrew/Cellar/postgresql@17/17.9/bin/pg_config
+#   make PG_CONFIG=/opt/homebrew/opt/postgresql@17/bin/pg_config
 #
 # Default discovers `pg_config` from PATH. ABI-compatible PostgreSQL
 # forks are built via local PG_CONFIG override.
@@ -54,7 +54,10 @@ REGRESS = \
 	debug_inject_stale_hardening \
 	enabled_off_contract \
 	ensure_scope_first_claim \
-	extension_version
+	extension_version \
+	session_reset_running_xact \
+	error_keeps_interrupts \
+	pair_key_negative
 
 # Suppress default PGXS installcheck -- we define our own below that uses
 # --temp-instance so shared_preload_libraries can be applied.
@@ -119,7 +122,11 @@ REGRESS_BINARY := $(PGXS_SRCDIR)/test/regress/pg_regress
 # during startup", so LANG carries the temp-cluster locale.
 REGRESS_RUN := LANG=ru_RU.UTF-8 $(REGRESS_BINARY) --bindir=$(BINDIR)
 
-# Temporary instance directories under /tmp.
+# Temporary instance directories under /tmp: each call makes its own with
+# mktemp from these prefixes and removes it afterwards. pg_regress removes an
+# existing --temp-instance directory without checking for a running
+# postmaster, so a fixed path would let two checkouts of the same user that
+# run the same target at once destroy each other's cluster.
 REGRESS_TMPDIR     := /tmp/pg_xclaim_$(USER)_regress
 REGRESS_CAP_TMPDIR := /tmp/pg_xclaim_$(USER)_capacity
 REGRESS_NP_TMPDIR  := /tmp/pg_xclaim_$(USER)_nonpreload
@@ -140,17 +147,20 @@ REGRESS_LW_TMPDIR  := /tmp/pg_xclaim_$(USER)_lwlocks
 # -------------------------------------------------------------------------
 # installcheck: main regression suite with shared_preload_libraries='pg_xclaim'.
 # Uses --temp-instance so the cluster is started fresh with test/regress.conf.
-# Temp cluster lives under /tmp, and pg_regress cleans it up automatically.
+# The temp cluster lives in a directory of its own under /tmp, removed after
+# the run.
 # -------------------------------------------------------------------------
 .PHONY: installcheck
 installcheck:
 	mkdir -p test/results
 	mkdir -p test/expected
+	set -eu; tmp=$$(mktemp -d $(REGRESS_TMPDIR).XXXXXX); \
+	trap 'rm -rf "$$tmp"' EXIT; \
 	$(REGRESS_RUN) \
 		--inputdir=test \
 		--outputdir=test \
 		--expecteddir=test/expected \
-		--temp-instance=$(REGRESS_TMPDIR) \
+		--temp-instance=$$tmp/instance \
 		--temp-config=$(CURDIR)/test/regress.conf \
 		--load-extension=pg_xclaim \
 		$(REGRESS)
@@ -164,14 +174,17 @@ installcheck:
 installcheck-capacity:
 	mkdir -p test/capacity/results
 	mkdir -p test/capacity/expected
+	set -eu; tmp=$$(mktemp -d $(REGRESS_CAP_TMPDIR).XXXXXX); \
+	trap 'rm -rf "$$tmp"' EXIT; \
 	$(REGRESS_RUN) \
 		--inputdir=test/capacity \
 		--outputdir=test/capacity \
 		--expecteddir=test/capacity/expected \
-		--temp-instance=$(REGRESS_CAP_TMPDIR) \
+		--temp-instance=$$tmp/instance \
 		--temp-config=$(CURDIR)/test/capacity.conf \
 		--load-extension=pg_xclaim \
-		cap_error cap_warn cap_bulk_rollback cap_bulk_subtxn_rollback cap_warn_bulk_suppression
+		cap_error cap_warn cap_bulk_rollback cap_bulk_subtxn_rollback cap_warn_bulk_suppression \
+		cap_warn_bulk_linear cap_first_call_memory
 
 # -------------------------------------------------------------------------
 # installcheck-nonpreload: temp cluster WITHOUT pg_xclaim preloaded.
@@ -182,11 +195,13 @@ installcheck-capacity:
 installcheck-nonpreload:
 	mkdir -p test/nonpreload/results
 	mkdir -p test/nonpreload/expected
+	set -eu; tmp=$$(mktemp -d $(REGRESS_NP_TMPDIR).XXXXXX); \
+	trap 'rm -rf "$$tmp"' EXIT; \
 	$(REGRESS_RUN) \
 		--inputdir=test/nonpreload \
 		--outputdir=test/nonpreload \
 		--expecteddir=test/nonpreload/expected \
-		--temp-instance=$(REGRESS_NP_TMPDIR) \
+		--temp-instance=$$tmp/instance \
 		--temp-config=$(CURDIR)/test/nonpreload.conf \
 		nonpreload_smoke
 
@@ -203,11 +218,13 @@ installcheck-nonpreload:
 installcheck-lwlocks:
 	mkdir -p test/lwlocks/results
 	mkdir -p test/lwlocks/expected
+	set -eu; tmp=$$(mktemp -d $(REGRESS_LW_TMPDIR).XXXXXX); \
+	trap 'rm -rf "$$tmp"' EXIT; \
 	$(REGRESS_RUN) \
 		--inputdir=test/lwlocks \
 		--outputdir=test/lwlocks \
 		--expecteddir=test/lwlocks/expected \
-		--temp-instance=$(REGRESS_LW_TMPDIR) \
+		--temp-instance=$$tmp/instance \
 		--temp-config=$(CURDIR)/test/lwlocks.conf \
 		--load-extension=pg_xclaim \
 		lwlocks_guard

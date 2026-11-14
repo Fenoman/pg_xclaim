@@ -166,7 +166,7 @@ partition counts use `xclaim.stats()` and the server log.
 ```mermaid
 flowchart TD
     A[capacity_errors > 0] --> B{cluster restart possible?}
-    B -- "no, peak load now" --> C["ALTER SYSTEM SET pg_xclaim.on_capacity_exhaustion = warn; SELECT pg_reload_conf()"]
+    B -- "no, peak load now" --> C["ALTER SYSTEM SET pg_xclaim.on_capacity_exhaustion = warn, then SELECT pg_reload_conf() as a separate command"]
     C --> C1[A refused claim returns false, the caller's retry path triggers, mutual exclusion holds]
     B -- "yes, scheduled" --> D{capacity_pct still 100%?}
     D -- "yes" --> E[Bump max_claims and restart in next window]
@@ -198,7 +198,7 @@ SELECT pg_reload_conf();
 **Option C -- raise capacity (next maintenance window):**
 ```conf
 # postgresql.conf
-pg_xclaim.max_claims = 8388608   # 8M (was 4M), ~720MB shmem
+pg_xclaim.max_claims = 8388608   # 8M (was 4M), ~582MB shmem
 ```
 Then `pg_ctl restart -D "$PGDATA" -m fast`.
 
@@ -314,8 +314,10 @@ and 90% bands are logged at `LOG` level, and the 95% band escalates to
 `WARNING`. The lowest band is controlled by the
 `pg_xclaim.capacity_warn_pct` GUC (default 80). Hardcoded bands
 strictly below the configured `capacity_warn_pct` never fire. The
-percentage in the line is an integer. Further warnings are suppressed
-for 60 seconds.
+percentage in the line is an integer. A backend repeats the same band
+at most once per 60 seconds and writes a climb into a higher band at
+once. A check that sees the capacity below the lowest band resets this,
+and the next crossing is written at once.
 
 ### Action
 
@@ -323,7 +325,7 @@ for 60 seconds.
 |-----------|----------|------------------------------------------------------------|
 | 80%       | warn     | Plan a `max_claims` bump in the next maintenance window.   |
 | 90%       | page     | Page oncall and consider switching to `warn` mode (treat exhaustion as conflict). |
-| 95%       | page     | Turn off pg_xclaim and raise `max_claims`. |
+| 95%       | page     | Find the transactions that hold claims (`xclaim.debug_snapshot()` by `owner_pid`, `pg_stat_activity`). If not done at 90%, switch to `on_capacity_exhaustion = warn` (treat exhaustion as conflict). Plan a `max_claims` raise with a restart. Do not set `pg_xclaim.enabled = off` on live traffic (§4). |
 
 ```sql
 -- Inspect what's filling capacity:
@@ -352,11 +354,13 @@ HINT:  Raise pg_xclaim.expected_claims_per_backend to your observed
 ### What it means
 
 A backend has, for the first time in its session, accumulated 75% of
-`expected_claims_per_backend`. This is an early-warning signal -- it
-fires well before any grow: the actual rehash happens when the
-backend-local `simplehash` bucket-array fill reaches 0.9 (fillfactor).
-The 75% mark leaves headroom to raise the GUC before a rehash lands
-on the acquire hot path.
+`expected_claims_per_backend`. This is an early-warning signal: the
+growth by the fill threshold happens when the backend-local
+`simplehash` bucket-array fill reaches 0.9 (fillfactor), and the 75%
+mark leaves headroom to raise the GUC before a rehash lands on the
+acquire hot path. The set grows earlier on a long probe, and
+`xclaim.try_many` writes this line after its loop, so a growth can come
+before it (`docs/runbook_en.md` §3).
 
 This is not an error and not a page-worthy event. The extension
 keeps working correctly, it just pays rehash latency on the next
@@ -417,9 +421,9 @@ After any P0/P1/P2 incident:
 1. Confirm `xclaim.stats()` clean:
    ```sql
    SELECT * FROM xclaim.stats();
-   -- expected: capacity_errors = 0
-   --           cleanup_misses  = 0
-   --           reaped_stale rate stable
+   -- expected: capacity_errors and cleanup_misses do not grow over the
+   --           check window (the counters are cumulative, only a restart
+   --           resets them), reaped_stale rate stable
    ```
 2. Re-enable acquisition if disabled:
    ```sql

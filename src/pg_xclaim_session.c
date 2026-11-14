@@ -35,24 +35,30 @@
  *   Idempotent and cheap when no claims are held (the common case).
  *
  * Behaviour:
- *   1. Sentinel check: a non-empty local set holds claims that outlived
- *      the transaction that took them, or claims taken earlier in the
- *      same statement -- log at DEBUG1 and proceed. The cleanup runs
- *      regardless.
+ *   1. Refusal: inside an explicit transaction block, from a message
+ *      hook inside an xclaim.try_many loop, and whenever the local set
+ *      holds a claim of the running transaction (taken earlier in the
+ *      same statement, function or DO block).
+ *      Sentinel check: a non-empty local set holds claims that outlived
+ *      the transaction that took them. The count is kept, the cleanup
+ *      runs regardless, and the DEBUG1 line naming it is written after
+ *      step 5.
  *   2. Force-cleanup of any shared rows owned by THIS backend, using
  *      the same group-by-partition path as the xact callback. This
  *      avoids a full-shmem-scan (O(max_claims) per session_reset is
  *      unacceptable at max_claims=4M).
  *   3. The local set is empty once step 2 returns -- cleanup_held
  *      tears down each held entry as part of the group-by-partition
- *      drain.
+ *      drain. A set enlarged by an earlier burst gets an array of its
+ *      first size (xclaim_local_shrink), with no ERROR.
  *   4. Rotate the owner_token: drop our cached token AND zero our
  *      published-slot token. The next acquisition issues a fresh
  *      token from XClaimCtl->next_token. A shared row with the old
  *      token that the local set does not track (only a defect can
  *      leave one) becomes visible to the stale-owner reaper as a token
  *      mismatch on the next conflict.
- *   5. Increment XClaimCtl->session_resets stat.
+ *   5. Re-arm the one-shot 75% hint and increment
+ *      XClaimCtl->session_resets.
  *
  * The function is declared `LANGUAGE c VOLATILE PARALLEL RESTRICTED`
  * (NOT UNSAFE -- session_reset is allowed in any non-worker context).
@@ -113,8 +119,12 @@ xclaim_session_reset(PG_FUNCTION_ARGS)
      * which is exactly the case `enabled = off` cannot cover.
      *
      * IsTransactionBlock() returns true only inside an explicit
-     * `BEGIN ... COMMIT` / `BEGIN ... ROLLBACK`. A bare `SELECT
-     * xclaim.session_reset()` in autocommit mode passes through.
+     * `BEGIN ... COMMIT` / `BEGIN ... ROLLBACK`. An autocommit statement
+     * is an implicit transaction that can take claims too: a function or
+     * DO block that calls xclaim.try and then session_reset, or
+     * `SELECT xclaim.try(1), xclaim.session_reset()`. The second check
+     * refuses whenever the set holds a claim of the running transaction,
+     * so session_reset releases only claims left by earlier transactions.
      */
     if (IsTransactionBlock())
         ereport(ERROR,
@@ -122,21 +132,31 @@ xclaim_session_reset(PG_FUNCTION_ARGS)
                  errmsg("pg_xclaim: xclaim.session_reset cannot be called inside an explicit transaction block"),
                  errhint("Call it from an autocommit statement, or COMMIT/ROLLBACK first.")));
 
+    if (xclaim_try_many_in_progress())
+        ereport(ERROR,
+                (errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+                 errmsg("pg_xclaim: xclaim.session_reset cannot be called during xclaim.try_many")));
+
+    if (xclaim_local_holds_current_xact())
+        ereport(ERROR,
+                (errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+                 errmsg("pg_xclaim: xclaim.session_reset cannot release claims of the running transaction"),
+                 errhint("The transaction releases them when it ends. Call xclaim.session_reset() from a separate statement.")));
+
     /*
      * Sentinel: the xact callback empties the local set at every
      * transaction end, so entries from an earlier transaction mean its
      * callback did not release them. A sibling extension's failing
      * xact callback does not cause this: PostgreSQL then aborts the
      * transaction and calls every xact callback again with
-     * XACT_EVENT_ABORT, ours included. Log at DEBUG1 -- not WARNING,
-     * because this function is supposed to silently clean up exactly
-     * this case.
+     * XACT_EVENT_ABORT, ours included. The DEBUG1 line (not WARNING:
+     * this function is supposed to silently clean up exactly this case)
+     * is written last, after the reset: a message can reach an
+     * emit_log_hook that runs SQL, and a claim it takes between the
+     * refusal checks above and the cleanup below would be released at
+     * once.
      */
     held_at_entry = xclaim_local_count();
-    if (held_at_entry != 0)
-        ereport(DEBUG1,
-                (errmsg("pg_xclaim: session_reset releases %llu held claims",
-                        (unsigned long long) held_at_entry)));
 
     /*
      * Force-cleanup. Reuses the group-by-partition cleanup path (same
@@ -148,6 +168,14 @@ xclaim_session_reset(PG_FUNCTION_ARGS)
      * idempotent no-op and returns immediately.
      */
     xclaim_local_cleanup_held();
+
+    /*
+     * Give a set enlarged by an earlier burst back to the allocator: the
+     * session asked for a clean state. The shrink raises no ERROR, so the
+     * token rotation below always runs. When the smaller array does not
+     * fit, the set keeps the one it has.
+     */
+    xclaim_local_shrink(true);
 
     /*
      * Rotate the owner_token. After this returns, XClaimMyOwnerToken == 0
@@ -172,6 +200,11 @@ xclaim_session_reset(PG_FUNCTION_ARGS)
 
     /* Stats. */
     pg_atomic_fetch_add_u64(&XClaimCtl->session_resets, 1);
+
+    if (held_at_entry != 0)
+        ereport(DEBUG1,
+                (errmsg("pg_xclaim: session_reset released %llu held claims",
+                        (unsigned long long) held_at_entry)));
 
     PG_RETURN_VOID();
 }

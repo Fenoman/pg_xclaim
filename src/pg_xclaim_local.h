@@ -26,8 +26,19 @@
  *         xclaim_local_lookup_with_hash(key, hashvalue, &out)
  *           bulk/precomputed-hash fast path that forwards to simplehash's
  *           `_hash` variant.
+ *         xclaim_local_add(key, hashvalue, partition_id)
+ *           xclaim.try: entry in the set before the partition LWLock
+ *         xclaim_local_note_held(key, hashvalue)
+ *           records an added entry as held after the shared insert
+ *         xclaim_local_drop(entry)
+ *           deletes an added entry that was not recorded
  *         xclaim_local_insert_held(key, hashvalue, partition_id)
+ *           add + note_held, xclaim.try_many under the partition LWLock
  *         xclaim_local_remove(key)
+ *           rollback of a recorded entry (xclaim.try_many PG_CATCH)
+ *   * Sizing:
+ *         xclaim_local_reserve(additional), xclaim_local_shrink(force),
+ *         xclaim_local_prepare_bulk(nkeys)
  *   * Identity match:
  *         xclaim_shared_matches_saved_owner(shared, saved)
  *           cleanup path -- uses the SAVED triple (procno + lxid + token)
@@ -98,6 +109,11 @@
 /*   * Saved-acquisition-time identity (procno + lxid + token) is the   */
 /*     SOLE source of truth for cleanup ownership.                      */
 /*   * `status` is mandated by the simplehash.h template (SH_STATUS).  */
+/*   * `held` and `status` sit next to `saved_procno`, before the       */
+/*     8-byte members. LocalTransactionId is 4 bytes on PostgreSQL and  */
+/*     Postgres Pro Standard, 8 bytes on Tantor SE and Postgres Pro     */
+/*     Enterprise, and with this order the entry takes 48 bytes on      */
+/*     both (the StaticAssertDecl below).                               */
 /* -------------------------------------------------------------------- */
 typedef struct XClaimLocalEntry
 {
@@ -105,11 +121,14 @@ typedef struct XClaimLocalEntry
     uint32              hashvalue;      /* precomputed get_hash_value(...)  */
     uint32              partition_id;   /* precomputed hashvalue & mask     */
     int32               saved_procno;   /* CAPTURED at acquisition time     */
+    uint8               held;           /* held / visited by list cleanup   */
+    char                status;         /* SH_STATUS slot (mandated)        */
     LocalTransactionId  saved_lxid;     /* CAPTURED at acquisition time     */
     uint64              saved_token;    /* CAPTURED at acquisition time     */
-    uint8               held;           /* 1 = held, other values invalid   */
-    char                status;         /* SH_STATUS slot (mandated)        */
 } XClaimLocalEntry;
+
+StaticAssertDecl(sizeof(XClaimLocalEntry) == 48,
+                 "XClaimLocalEntry size changed, check the per-backend memory figures in README.md");
 
 /* -------------------------------------------------------------------- */
 /* Lazy initialisation entry points (idempotent, callable from every    */
@@ -118,6 +137,53 @@ typedef struct XClaimLocalEntry
 
 extern void xclaim_local_init(void);
 extern void xclaim_ensure_owner_token(void);
+
+/*
+ * xclaim_local_reserve
+ *      Shrinks an empty set after a burst (xclaim_local_shrink), then grows
+ *      the local set so that `additional` more inserts stay below its grow
+ *      threshold. A key that probes too far can still grow the set inside
+ *      an insert, below the threshold. Call before taking a partition
+ *      LWLock. May ERROR (out of memory) with the set unchanged.
+ *
+ * xclaim_local_emit_peak_warning
+ *      Writes the one-shot 75%-of-expected_claims_per_backend LOG that
+ *      xclaim_local_note_held() marked. Call after the partition LWLock is
+ *      released.
+ */
+extern void xclaim_local_reserve(uint64 additional);
+
+/*
+ * xclaim_local_shrink
+ *      Gives the empty local set a bucket array of its first size after a
+ *      burst: after XCLAIM_SHRINK_AFTER small cleanups and from
+ *      XCLAIM_SHRINK_FACTOR times the first size, or with `force`
+ *      (xclaim.session_reset()) whenever the set is larger. No-op while
+ *      claims are held. Raises no ERROR: when the smaller array does not
+ *      fit, the set keeps the arrays it has.
+ */
+extern void xclaim_local_shrink(bool force);
+
+/*
+ * xclaim_local_prepare_bulk
+ *      Before the first partition LWLock of an xclaim.try_many of `nkeys`
+ *      keys that, with the claims held, take half of the first bucket
+ *      array or more. A set less than XCLAIM_SHRINK_FACTOR times the size
+ *      the call needs restarts the streak of small cleanups, a larger one
+ *      shrinks here once the streak is complete. A set shrunk after a
+ *      burst grows toward twice the room the claims need, up to the
+ *      largest size it shrank from. May ERROR (out of memory) with the set
+ *      at its size before the growth.
+ */
+extern void xclaim_local_prepare_bulk(uint64 nkeys);
+extern void xclaim_local_emit_peak_warning(void);
+
+/*
+ * xclaim_local_holds_current_xact
+ *      True when the local set holds a claim taken by the running top-level
+ *      transaction. Walks the whole set: for xclaim.session_reset() only.
+ */
+extern bool xclaim_local_holds_current_xact(void);
 
 /* -------------------------------------------------------------------- */
 /* Owner identity helpers used by acquisition (Step 11) and cleanup.    */
@@ -193,24 +259,41 @@ extern bool xclaim_local_lookup_with_hash(const XClaimKey *key,
                                           XClaimLocalEntry **out);
 
 /*
- * xclaim_local_insert_held
- *      Insert a freshly-acquired entry. PRECONDITION: caller has already
- *      verified the key is NOT present (via xclaim_local_lookup) AND
- *      xclaim_ensure_owner_token() has run. Allocates inside
- *      XClaimLocalContext via the simplehash machinery, and status is
- *      initialised by simplehash.
+ * xclaim_local_add
+ *      Put an entry for `key` into the set. PRECONDITION: caller has
+ *      already verified the key is NOT present (via xclaim_local_lookup)
+ *      AND xclaim_ensure_owner_token() has run. Allocates inside
+ *      XClaimLocalContext via the simplehash machinery (a growth can
+ *      raise an out-of-memory ERROR), and status is initialised by
+ *      simplehash. Changes no count: see xclaim_local_note_held.
  *
- *      Updates per-backend count and peak watermark.
+ * xclaim_local_note_held
+ *      Record an added entry as held, once its shared row is taken:
+ *      live count, peak, held-key list and the 75% hint. Allocates
+ *      nothing and raises no ERROR.
+ *
+ * xclaim_local_insert_held
+ *      xclaim_local_add followed by xclaim_local_note_held.
+ *
+ * xclaim_local_drop
+ *      Delete the entry that xclaim_local_add returned and
+ *      xclaim_local_note_held did not record, before any other insert into
+ *      or delete from the set. Raises no ERROR.
  */
+extern XClaimLocalEntry *xclaim_local_add(const XClaimKey *key,
+                                          uint32 hashvalue,
+                                          uint32 partition_id);
+extern void xclaim_local_note_held(const XClaimKey *key, uint32 hashvalue);
 extern void xclaim_local_insert_held(const XClaimKey *key,
                                      uint32 hashvalue,
                                      uint32 partition_id);
+extern void xclaim_local_drop(XClaimLocalEntry *entry);
 
 /*
  * xclaim_local_remove
- *      Remove a single entry by key. Used by cleanup when the shared
- *      entry has been HASH_REMOVE'd. No-op if not present (idempotency
- *      for COMMIT-before-ABORT-before-proc-exit cleanup races).
+ *      Remove a single recorded entry by key and decrement the live count.
+ *      Used by the xclaim.try_many rollback after the shared row is
+ *      HASH_REMOVE'd. No-op if not present.
  *
  *      Does NOT free underlying memory -- simplehash uses inline
  *      storage and the per-row chunks are reclaimed at backend exit
@@ -278,9 +361,10 @@ extern uint64 xclaim_local_my_owner_token(void);
  *      partition with at least one held local entry: acquire the
  *      partition LWLock ONCE, HASH_REMOVE every matching shared entry
  *      (verified via xclaim_shared_matches_saved_owner using the saved
- *      owner identity), release the lock. The local simplehash is
- *      truncated in place via xcl_local_reset once every partition has
- *      been drained.
+ *      owner identity), release the lock. The local entries go away
+ *      by key when a short transaction's keys are in the held-key list,
+ *      otherwise the set is truncated in place via xcl_local_reset once
+ *      every partition has been drained.
  *
  *      Idempotent: if local_count() == 0 the function returns
  *      immediately (no allocation, no lock traffic). Repeated calls

@@ -1,0 +1,32 @@
+-- test/capacity/sql/cap_warn_bulk_linear.sql
+-- xclaim.try_many in warn mode on a full table takes time linear in the
+-- array length. Every slot misses, the miss releases the partition
+-- LWLock, and the next slot of the same partition run takes it again.
+-- The end of the run is found once, so those slots do not walk the rest
+-- of the run again (the reservation itself is O(1) when the room is
+-- there).
+--
+-- 400,000 keys over num_partitions = 4 make runs of about 100,000. The
+-- call takes well under a second. A walk of the rest of the run per slot
+-- would make about 2 * 10^10 steps, far past the statement_timeout.
+--
+-- Cluster started with test/capacity.conf: max_claims=64.
+
+\set VERBOSITY terse
+\set ON_ERROR_STOP on
+
+CREATE EXTENSION IF NOT EXISTS pg_xclaim;
+
+SET pg_xclaim.on_capacity_exhaustion = 'warn';
+
+BEGIN;
+-- Fill the shared table.
+SELECT count(*) FILTER (WHERE t) AS taken
+FROM unnest(xclaim.try_many(ARRAY(SELECT g::int8 FROM generate_series(1, 64) g))) t;
+
+SET LOCAL statement_timeout = '5s';
+SELECT count(*) FILTER (WHERE NOT t) AS missed
+FROM unnest(xclaim.try_many(ARRAY(SELECT g::int8 FROM generate_series(1000001, 1400000) g))) t;
+ROLLBACK;
+
+SELECT xclaim.count() AS after_rollback;

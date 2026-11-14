@@ -113,8 +113,11 @@ test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql"
 test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql"
 ```
 
-For a multi-major matrix (16/17/18), repeat the `make` + `make install`
-sequence with each target's `pg_config` path.
+For a multi-major matrix (16/17/18), repeat the `make clean` + `make` +
+`make install` sequence with each target's `pg_config` path. Without
+`make clean` the object files of the previous major stay, `make` does not
+rebuild them, and the next major's directory gets a `pg_xclaim.so` built for
+another major, which the server rejects at load (`PG_MODULE_MAGIC`).
 
 To update an installed extension: install the new build with the same
 `make install`, restart the server (the library is loaded through
@@ -184,10 +187,19 @@ Beyond `xclaim.stats()` there is also a server-log signal. The
 extension emits a single `LOG` line per session when a backend's
 live claim count first crosses 75% of
 `pg_xclaim.expected_claims_per_backend`. This is an early-warning
-signal -- it fires well before any grow: the actual rehash happens
-when the simplehash bucket-array fill reaches 0.9 (fillfactor). The
-75% mark leaves headroom to raise the GUC before a rehash lands on
-the hot path. Example log line:
+signal: the growth by the fill threshold happens when the simplehash
+bucket-array fill reaches 0.9 (fillfactor), and the 75% mark leaves
+headroom to raise the GUC before a rehash lands on the hot path. The
+set grows earlier when a key lands too far from its bucket (a long
+probe): from a fill of about 0.65 in large sets. Inside a run of keys
+of one partition in `xclaim.try_many` the keys start their probes from
+1/`num_partitions` of the buckets, and such a growth starts from a
+fill of about 0.1, runs under the partition lock and can come before
+the 75% line. This is how, above all, a set grows that the backend has
+not grown to the needed size before: after a shrink (§9) a large
+`xclaim.try_many` gives the set, before its first lock, twice the room
+the claims of the transaction need, up to the largest size the set
+shrank from. Example log line:
 
 ```
 LOG:  pg_xclaim: per-backend live claims (12345) crossed 75% of
@@ -227,9 +239,11 @@ least 50%.
 
 The extension emits a message when `capacity_pct` first crosses one of
 three bands: 80%, 90%, 95% (the lowest band is controlled by the
-`pg_xclaim.capacity_warn_pct` GUC, default 80). Further warnings are
-suppressed for 60s. The 80% and 90% bands are logged at `LOG` level,
-and the 95% band escalates to `WARNING`.
+`pg_xclaim.capacity_warn_pct` GUC, default 80). A backend repeats the
+same band at most once per 60s and writes a climb into a higher band at
+once. A check that sees the capacity below the lowest band resets this,
+and the next crossing is written at once. The 80% and 90% bands are logged at `LOG` level, and the 95% band
+escalates to `WARNING`.
 
 Hardcoded bands below the configured `capacity_warn_pct` are skipped:
 the ladder respects `capacity_warn_pct`, and bands strictly below the
@@ -258,13 +272,15 @@ SELECT pg_reload_conf();
 
 Effects:
 
-- New `xclaim.try` calls always return `true` - no acquisition
-  happens.
+- New `xclaim.try` and `xclaim.try_many` calls always return `true` -
+  no acquisition happens.
 - Existing held entries continue to release through the xact callback
   as transactions end and through the backend-exit callback
-  (`on_shmem_exit`).
-- `xclaim.stats().disabled_calls` increments per call - monitoring
-  will show the kill switch is engaged.
+  (`on_shmem_exit`). Until then `xclaim.count()`, `xclaim.debug()` and
+  `xclaim.debug_snapshot()` show them.
+- `xclaim.stats().disabled_calls` grows per `xclaim.try` call and per
+  `xclaim.try_many` array element - monitoring will show the kill switch
+  is engaged. Monitoring calls (`count`, `stats`, `debug*`) do not count.
 
 > **CRITICAL.** While disabled, **locks do not work**: 
 > `xclaim.try(k)` will always return `true`, even if the key is already 
@@ -313,7 +329,9 @@ DBS=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -At -c \
 # only then engage soft rollback: with live traffic the kill switch
 # removes mutual exclusion for every key (§4)
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
-     -c "ALTER SYSTEM SET pg_xclaim.enabled = off; SELECT pg_reload_conf();"
+     -v ON_ERROR_STOP=1 \
+     -c "ALTER SYSTEM SET pg_xclaim.enabled = off" \
+     -c "SELECT pg_reload_conf()"
 
 # Step 2: apply per-site rollback DDL (inverse of the forward rewrite --
 # restores pg_try_advisory_xact_lock(...) calls in target functions)
@@ -418,9 +436,10 @@ GROUP BY 1, 2, 3 ORDER BY claims DESC;
   `pg_stat_activity` are not read at the same instant, so a backend
   that has just ended its transaction can show up once. Rows that
   repeat with the same `owner_pid` and `owner_lxid` are the signal.
-- `debug_snapshot()` holds shared locks on all partitions for the scan
-  and refuses to run when `pg_xclaim.num_partitions > 192`. Do not put
-  this query into routine monitoring, `xclaim.stats()` is for that.
+- `debug_snapshot()` holds shared locks on all partitions while it
+  copies the entries (about 0.13 s per million rows on 2 vCPU), and
+  refuses to run when `pg_xclaim.num_partitions > 192`. Do not put this
+  query into routine monitoring, `xclaim.stats()` is for that.
 - The query does not show backends inside a transaction (`active`,
   `idle in transaction`): their claims are legitimate, and the end of
   that transaction releases any extra ones.
@@ -462,9 +481,9 @@ is the default in `pg_doorman`, `odyssey`, and `PgBouncer`.
 | GUC | Default | Where to set | When to change |
 |-----|---------|--------------|----------------|
 | `shared_preload_libraries` | -- | `postgresql.conf` (postmaster) | `pg_xclaim` must be last in the list. Restart required. |
-| `pg_xclaim.max_claims` | 4194304 (4M) | `postgresql.conf` (postmaster) | Bump if `capacity_pct > 80%` observed under load. Doubling `max_claims` roughly doubles pg_xclaim's shmem (4M ~360 MB, 24M ~2.2 GB, 32M ~2.8 GB, see Capacity planning). Restart required. |
+| `pg_xclaim.max_claims` | 4194304 (4M) | `postgresql.conf` (postmaster) | Bump if `capacity_pct > 80%` observed under load. Doubling `max_claims` roughly doubles pg_xclaim's shmem (4M ~291 MB, 24M ~1.77 GB, 32M ~2.27 GB, see Capacity planning). Restart required. |
 | `pg_xclaim.num_partitions` | 128 | `postgresql.conf` (postmaster) | Rarely changed. Increase only if `LWLock: xclaim_partition` p99 dominates wait events. Restart required. |
-| `pg_xclaim.expected_claims_per_backend` | 16384 | `postgresql.conf` (postmaster) | Pre-grows the per-backend local `simplehash` to this size so the 750k single-backend burst does not rehash on the hot path. The extension emits a server log line `crossed 75% of pg_xclaim.expected_claims_per_backend` the first time a backend's live-claim count crosses 75% of the GUC - that's the signal to raise the GUC to your observed peak. **Must be <= `pg_xclaim.max_claims`**, otherwise the cluster fails to start (see §10.6). Restart required. |
+| `pg_xclaim.expected_claims_per_backend` | 16384 | `postgresql.conf` (postmaster) | First size of the per-backend local `simplehash`. Raised to the peak load (for example 750k claims on one backend), it keeps growth by the fill threshold off the hot path. A long probe can still grow the set earlier (§3). The extension emits a server log line `crossed 75% of pg_xclaim.expected_claims_per_backend` the first time a backend's live-claim count crosses 75% of the GUC - that's the signal to raise the GUC to your observed peak. **Must be <= `pg_xclaim.max_claims`**, otherwise the cluster fails to start (see §10.6). Restart required. |
 | `pg_xclaim.enabled` | on | `ALTER SYSTEM` (PGC_SUSET) | Set `off` to disable acquisition without restart -- the kill switch. |
 | `pg_xclaim.capacity_warn_pct` | 80 | `ALTER SYSTEM` | Lower to receive earlier warning logs, or raise to silence noise. |
 | `pg_xclaim.on_capacity_exhaustion` | error | `ALTER SYSTEM` (PGC_SUSET) | Switch to `warn` to treat exhaustion as logical conflict (callers' retry path triggers). `error` is otherwise correct -- forces sizing discipline. |
@@ -500,7 +519,9 @@ every key, and with live traffic the application starts processing
 duplicates (section 4).
 
 1. Stop user traffic, then run
-   `ALTER SYSTEM SET pg_xclaim.enabled = off; SELECT pg_reload_conf();`
+   `ALTER SYSTEM SET pg_xclaim.enabled = off`, then `SELECT pg_reload_conf()`
+   as a separate command (`ALTER SYSTEM` does not run in one string with
+   another command)
    -- callers see `true` unconditionally, no acquisition runs.
 2. Apply the per-site rollback DDL (re-introduces
    `pg_try_advisory_xact_lock` at known-safe call sites). This is the
@@ -534,10 +555,13 @@ SELECT count(*) FROM xclaim.debug_snapshot();
 -- expected: > 0 during peak workload
 -- WARNING:
 --   * debug_snapshot() acquires SHARED locks on ALL partitions
---     simultaneously (128 by default) while scanning memory. Any 
---     concurrent attempts to acquire new locks will wait until the 
---     scan finishes. On a busy cluster, this causes a **noticeable stall**, 
---     which lasts longer as memory usage grows. 
+--     simultaneously (128 by default) while it copies the entries:
+--     about 0.13 s per million rows on 2 vCPU. Any concurrent attempts
+--     to acquire new locks wait until the copy finishes. On a busy
+--     cluster, this causes a **noticeable stall**, which lasts longer
+--     as more claims are held. The copy takes 48 bytes of backend
+--     memory per row, plus 1/8 and 64 rows of headroom: about 54 MB
+--     for a million rows.
 --     Do not run this function during peak traffic unless absolutely 
 --     necessary. Use `xclaim.stats()` for routine monitoring and reserve 
 --     `debug_snapshot()` for incident diagnosis or maintenance windows.
@@ -581,16 +605,16 @@ The pre-migration baseline reference lives in
 
 The shared-memory footprint of `pg_xclaim` scales almost linearly with
 `max_claims`: the dynahash bucket array is rounded up to a power of
-two, so 24M takes 2241 MB against 2160 MB for strictly linear growth.
+two, so 24M takes 1811 MB against 1746 MB for strictly linear growth.
 
 | `max_claims` | Approx shmem |
 |--------------|--------------|
-| 1M           | ~90 MB       |
-| 4M (default) | ~360 MB      |
-| 8M           | ~720 MB      |
-| 16M          | ~1.4 GB      |
-| 24M          | ~2.2 GB      |
-| 32M          | ~2.8 GB      |
+| 1M           | ~73 MB       |
+| 4M (default) | ~291 MB      |
+| 8M           | ~582 MB      |
+| 16M          | ~1.14 GB      |
+| 24M          | ~1.77 GB      |
+| 32M          | ~2.27 GB      |
 
 Plus per-partition LWLock overhead (`num_partitions=128` default, ~few KB).
 
@@ -623,19 +647,44 @@ it's backend-local code):
 
 Effective cost per held claim is ~63 bytes (including simplehash
 overhead at ~75% load factor). The local-set entry
-(`XClaimLocalEntry`) is 48 bytes after alignment (see
-`src/pg_xclaim_local.h`).
+(`XClaimLocalEntry`) is 48 bytes after alignment on every supported server,
+also with a 64-bit `LocalTransactionId` (Tantor SE, Postgres Pro
+Enterprise), see `src/pg_xclaim_local.h`.
 
-Per-backend limit: at most 134217727 held claims (2^27 - 1). The
-cleanup at transaction end collects pointers to all of the backend's
-claims in one array, 8 bytes per claim, and PostgreSQL refuses single
-allocations above 1 GB (`MaxAllocSize`). At 134217728 claims and more
-the cleanup fails with ERROR: at transaction end that is a PANIC and a
-cluster restart, at backend exit the backend's keys stay taken (on
-PG 16 until its PGPROC slot is reused). Getting there needs
-`max_claims >= 134217728` (about 12 GB of shared memory) and about
-13 GB of local memory in one backend. With the default 4M the limit
-cannot be reached.
+The cleanup at the end of a transaction that took many claims collects
+pointers to them in arrays of 8 bytes per claim. The arrays are allocated
+with `MCXT_ALLOC_HUGE` (above 1 GB from 134217728 claims) and
+`MCXT_ALLOC_NO_OOM`: without the memory, the cleanup walks the set once
+without allocating. A transaction that took at most 1/64 of the set's
+buckets in claims (up to 512 claims in the default set of 32768
+buckets) is cleaned up through the list of its keys and allocates
+nothing. The list holds at least `XCLAIM_HELD_LIST_MIN` (1024) keys,
+and 1/64 of the buckets in a large set. Failed `xclaim.try` calls do
+not enter the list.
+
+After a transaction that enlarged the set, the bucket array stays for the
+next one. When 64 transactions in a row took at least one claim and no
+more than the first set holds, and the set is 4 times its first size or
+more, the next claim gives the set an array of its first size and the
+memory goes back. `xclaim.session_reset()` shrinks the set at once. A
+transaction without claims neither extends nor breaks the count. When
+the first-size array does not fit in memory, the set stays as it is
+without an ERROR, and the count of 64 transactions starts over.
+
+An `xclaim.try_many` that, with the claims already taken, needs half of
+the first array or more prepares the set before its first lock. The
+size the call needs is the smallest of the first size and its doublings
+with twice the room those claims take.
+
+- A set smaller than 4 times the needed size: the call starts the count
+  of 64 transactions over, it needs the set itself.
+- A set of 4 times the needed size or more: the count goes on. Once it
+  reached 64, the call shrinks the empty set itself and grows it to the
+  needed size. A backend that runs `xclaim.try_many` over long candidate
+  lists after a large transaction keeps a set of the size of those
+  calls, not of its earlier peak.
+- The call grows a set shrunk before until it has twice the room the
+  claims need, up to the largest size the set shrank from.
 
 ### 9.1 Comparison vs pre-migration (high-cardinality use case)
 
@@ -655,15 +704,15 @@ With `max_locks_per_transaction = 4096` the server needs 482 MB: the
 lock tables add ~334 MB and hold 4096 x 222 = ~909k locks, not 20M.
 20M advisory locks need `max_locks_per_transaction` of about 91000,
 7942 MB in total. pg_xclaim needs `max_claims` of at least 20M for 20M
-claims, for example 24M, 2389 MB in total.
+claims, for example 24M, 1959 MB in total.
 
 | Component | Before (advisory, `max_locks_per_transaction` ~91000) | After (pg_xclaim, `max_locks_per_transaction = 64`, `max_claims` = 24M) | Δ |
 |-----------|-------------------------------------------------------|---------------------------------------------------------------------------|---|
 | Shared LockManager (lock tables) | ~7.6 GB | 0 (part of the base) | -7.6 GB |
-| Shared `pg_xclaim` dynahash | 0 | ~2.2 GB | +2.2 GB |
+| Shared `pg_xclaim` dynahash | 0 | ~1.8 GB | +1.8 GB |
 | Local LockManager x 200 backends (holding 100k locks: LOCALLOCK hash 16.8 MB + `lockOwners` arrays in TopMemoryContext 16.8 MB) | 33.6 MB x 200 = **6.72 GB** | minimal (no advisory locks taken) | **-6.71 GB** |
 | Local `pg_xclaim` x 200 backends | 0 | 6.3 MB x 200 = **1.26 GB** | +1.26 GB |
-| **Total** | **~14.3 GB** | **~3.5 GB** | **~-10.8 GB** |
+| **Total** | **~14.3 GB** | **~3.0 GB** | **~-11.3 GB** |
 
 Local memory is measured with `pg_backend_memory_contexts` in one
 backend, with the same numbers on PG 16, 17 and 18: 100k
@@ -683,14 +732,14 @@ The effect on the total is small.
 
 **Bottom line.** The saving comes from both shared memory and
 backend-local memory. The lock tables for 20M advisory locks take
-~7.6 GB, while the pg_xclaim dynahash for 24M claims takes ~2.2 GB.
+~7.6 GB, while the pg_xclaim dynahash for 24M claims takes ~1.8 GB.
 The backend's local lock state (**LOCALLOCK hash** and `lockOwners`
 arrays) grows to ~34 MB/backend under a high-cardinality advisory
 workload and eats several GB cluster-wide, while pg_xclaim moves that
 state into its own compact simplehash (~6 MB at 100k claims).
 
 Under a light workload (10-100 locks per transaction), switching to
-pg_xclaim **only adds** ~360 MB of shmem with no visible saving - that
+pg_xclaim **only adds** ~291 MB of shmem with no visible saving - that
 kind of workload does not need pg_xclaim in the first place.
 
 ---
@@ -711,7 +760,8 @@ Cause: `on_capacity_exhaustion=error` (default) and shared dynahash hit
 
 Remediation, in priority order:
 1. Immediate: switch to emergency `warn` mode:
-   `ALTER SYSTEM SET pg_xclaim.on_capacity_exhaustion = warn; SELECT pg_reload_conf();`
+   `ALTER SYSTEM SET pg_xclaim.on_capacity_exhaustion = warn`, then
+   `SELECT pg_reload_conf()` as a separate command
    A refused claim returns false, the caller's retry path triggers, and
    mutual exclusion holds. Scalar `xclaim.try` writes one WARNING line
    per refused call. `xclaim.try_many` writes a WARNING for the first
@@ -784,6 +834,11 @@ SQLSTATE: 0A000  -- feature_not_supported
 Cause: application attempted `PREPARE TRANSACTION` after acquiring
 xclaim claims. xclaim explicitly rejects 2PC on
 `XACT_EVENT_PRE_PREPARE`.
+
+The same refusal applies when `PREPARE` comes from a distributed transaction
+manager, such as Citus on a worker or an XA coordinator. The application
+need not issue the command itself. Check every participating backend that
+can hold claims before migrating such transactions from advisory locks.
 
 This is a hard limitation, and it is not a parallel to PostgreSQL's
 own behaviour: PG core advisory xact locks **are** handled across

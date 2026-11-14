@@ -5,6 +5,11 @@
 #   - Single-backend SCALAR API at 750k cardinality:  total acquire <= 2000ms
 #   - Single-backend BULK   API at 750k cardinality:  total acquire <=  500ms
 #
+# Semantic gate: a timing counts only when the run really took N claims.
+# Each timed transaction reports the number of true results, the local
+# claim count (xclaim.count()) and the shared one (capacity_used of
+# xclaim.stats()), and all three must equal N. capacity_errors must stay 0.
+#
 # Also benchmarks the `pg_try_advisory_xact_lock` baseline at 750k for
 # delta reporting.
 #
@@ -17,12 +22,14 @@
 #   scripts/bench_try_many.sh /path/to/pg_config  # explicit
 #   N=750000 scripts/bench_try_many.sh            # override cardinality
 #   scripts/bench_try_many.sh --soft              # don't exit non-zero on
-#                                                   budget overruns (CI noise)
+#                                                   budget overruns (CI noise),
+#                                                   errors and the semantic
+#                                                   gate still fail
 #
 # Exit:
-#   0   all budgets met (or --soft)
-#   1   one or more budgets exceeded
-#   2   bench infrastructure failure (cluster, psql, etc)
+#   0   all budgets met (or --soft) and the semantic gate passed
+#   1   one or more budgets exceeded, or the semantic gate failed
+#   2   bench infrastructure failure (cluster, psql, an SQL error)
 #
 # HARD INVARIANTS:
 #   - set -euo pipefail
@@ -146,9 +153,9 @@ LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
 # ---------------------------------------------------------------------------
 run_query_ms() {
     # Args: <sql> [allow_fail=0|1]
-    # Emits two lines on stdout:
-    #   line 1: elapsed milliseconds (or empty on failure)
-    #   line 2: trailing scalar result line from psql output
+    # Emits on stdout:
+    #   line 1:  elapsed milliseconds (or empty on an allowed failure)
+    #   line 2+: every non-empty data line of the psql output
     local sql="$1"
     local allow_fail="${2:-0}"
     python3 - "$sql" "$allow_fail" <<EOF
@@ -172,37 +179,58 @@ if r.returncode != 0:
     sys.stderr.write("\n")
     sys.exit(0)
 print(elapsed_ms)
-# Last non-empty data line (skip BEGIN/COMMIT/ROLLBACK echoes from psql -q).
-lines = [l for l in r.stdout.splitlines() if l.strip() and l.strip() not in ("BEGIN", "COMMIT", "ROLLBACK")]
-print(lines[-1] if lines else "")
+# Data lines (skip BEGIN/COMMIT/ROLLBACK echoes from psql -q).
+for l in r.stdout.splitlines():
+    if l.strip() and l.strip() not in ("BEGIN", "COMMIT", "ROLLBACK"):
+        print(l)
 EOF
 }
 
-# Ensures we do all work inside a single transaction so cleanup happens at
-# ROLLBACK. The cardinality guard expects the count to equal $N.
+# Value of the "name=value" line in the output of run_query_ms, empty if absent.
+result_value() {
+    printf '%s\n' "$1" | sed -n "s/^$2=//p"
+}
+
+# All work happens inside a single transaction so cleanup happens at
+# ROLLBACK. Before the ROLLBACK the transaction reports the true results
+# (wins), the local claim count and the shared one: the semantic gate
+# expects each to equal $N.
+CLAIM_COUNTS_SQL="SELECT 'local=' || xclaim.count(); SELECT 'shared=' || capacity_used FROM xclaim.stats();"
 
 # ---------------------------------------------------------------------------
 # Bench 1: SCALAR API -- xclaim.try(1, g) over generate_series(1, N)
 # ---------------------------------------------------------------------------
-SCALAR_SQL="BEGIN; SELECT count(*) FROM generate_series(1, $N) g WHERE xclaim.try(1, g::int); ROLLBACK;"
+SCALAR_SQL="BEGIN; SELECT 'wins=' || count(*) FROM generate_series(1, $N) g WHERE xclaim.try(1, g::int); $CLAIM_COUNTS_SQL ROLLBACK;"
 
 echo ""
 echo "[bench] SCALAR xclaim.try(1, g) x $N ..."
-SCALAR_RESULT="$(run_query_ms "$SCALAR_SQL" || true)"
+if ! SCALAR_RESULT="$(run_query_ms "$SCALAR_SQL")"; then
+    echo "bench: SCALAR query failed" >&2
+    exit 2
+fi
 SCALAR_MS="$(printf '%s\n' "$SCALAR_RESULT" | sed -n '1p')"
-SCALAR_COUNT="$(printf '%s\n' "$SCALAR_RESULT" | sed -n '2p')"
-echo "  -> ${SCALAR_MS}ms  count=$SCALAR_COUNT"
+SCALAR_COUNT="$(result_value "$SCALAR_RESULT" wins)"
+SCALAR_LOCAL="$(result_value "$SCALAR_RESULT" local)"
+SCALAR_SHARED="$(result_value "$SCALAR_RESULT" shared)"
+echo "  -> ${SCALAR_MS}ms  true=$SCALAR_COUNT local=$SCALAR_LOCAL shared=$SCALAR_SHARED"
 
 # ---------------------------------------------------------------------------
 # Bench 2: BULK API -- xclaim.try_many(1, ARRAY(1..N))
+# The true results are counted by removing false and NULL elements from
+# the result array: a C-level pass, so it adds little to the timing.
 # ---------------------------------------------------------------------------
-BULK_SQL="BEGIN; SELECT array_length(xclaim.try_many(1, array_agg(g::int)), 1) FROM generate_series(1, $N) g; ROLLBACK;"
+BULK_SQL="BEGIN; SELECT 'wins=' || cardinality(array_remove(array_remove(xclaim.try_many(1, array_agg(g::int)), false), NULL)) FROM generate_series(1, $N) g; $CLAIM_COUNTS_SQL ROLLBACK;"
 
 echo "[bench] BULK   xclaim.try_many(1, [1..$N]) ..."
-BULK_RESULT="$(run_query_ms "$BULK_SQL" || true)"
+if ! BULK_RESULT="$(run_query_ms "$BULK_SQL")"; then
+    echo "bench: BULK query failed" >&2
+    exit 2
+fi
 BULK_MS="$(printf '%s\n' "$BULK_RESULT" | sed -n '1p')"
-BULK_COUNT="$(printf '%s\n' "$BULK_RESULT" | sed -n '2p')"
-echo "  -> ${BULK_MS}ms  array_length=$BULK_COUNT"
+BULK_COUNT="$(result_value "$BULK_RESULT" wins)"
+BULK_LOCAL="$(result_value "$BULK_RESULT" local)"
+BULK_SHARED="$(result_value "$BULK_RESULT" shared)"
+echo "  -> ${BULK_MS}ms  true=$BULK_COUNT local=$BULK_LOCAL shared=$BULK_SHARED"
 
 # ---------------------------------------------------------------------------
 # Bench 3: BASELINE -- pg_try_advisory_xact_lock(1, g) over generate_series
@@ -218,7 +246,7 @@ ADV_SQL="BEGIN; SELECT count(*) FROM generate_series(1, $N) g WHERE pg_try_advis
 echo "[bench] BASELINE pg_try_advisory_xact_lock x $N (allow-fail) ..."
 ADV_RESULT="$(run_query_ms "$ADV_SQL" 1 || true)"
 ADV_MS="$(printf '%s\n' "$ADV_RESULT" | sed -n '1p')"
-ADV_COUNT="$(printf '%s\n' "$ADV_RESULT" | sed -n '2p')"
+ADV_COUNT="$(printf '%s\n' "$ADV_RESULT" | sed -n '$p')"
 if [[ -z "$ADV_MS" ]]; then
     ADV_MS="n/a"
     ADV_COUNT="oom"
@@ -228,22 +256,48 @@ echo "  -> ${ADV_MS}ms  count=$ADV_COUNT"
 # ---------------------------------------------------------------------------
 # Stats snapshot
 # ---------------------------------------------------------------------------
-STATS="$("$PSQL" -h "$PGSOCKET" -p "$PGPORT" -U postgres -d postgres \
-    -X -At -F '|' -c "SELECT capacity_errors, cleanup_misses, reaped_stale FROM xclaim.stats();" 2>/dev/null || echo "?|?|?")"
+if ! STATS="$("$PSQL" -h "$PGSOCKET" -p "$PGPORT" -U postgres -d postgres \
+    -X -At -F '|' -v ON_ERROR_STOP=1 \
+    -c "SELECT capacity_errors, cleanup_misses, reaped_stale FROM xclaim.stats();" 2>&1)"; then
+    echo "bench: xclaim.stats() query failed: $STATS" >&2
+    exit 2
+fi
 echo "[bench] xclaim.stats() (capacity_errors|cleanup_misses|reaped_stale): $STATS"
+CAPACITY_ERRORS="$(cut -d'|' -f1 <<<"$STATS")"
 
 # ---------------------------------------------------------------------------
 # Verdict + CSV
 # ---------------------------------------------------------------------------
 PASS_SCALAR=0
 PASS_BULK=0
-[[ "${SCALAR_MS:-99999}" =~ ^[0-9]+$ ]] && (( SCALAR_MS <= BUDGET_SCALAR_MS )) && PASS_SCALAR=1
-[[ "${BULK_MS:-99999}"   =~ ^[0-9]+$ ]] && (( BULK_MS   <= BUDGET_BULK_MS   )) && PASS_BULK=1
+[[ "$SCALAR_MS" =~ ^[0-9]+$ ]] && (( SCALAR_MS <= BUDGET_SCALAR_MS )) && PASS_SCALAR=1
+[[ "$BULK_MS"   =~ ^[0-9]+$ ]] && (( BULK_MS   <= BUDGET_BULK_MS   )) && PASS_BULK=1
+
+# Semantic gate: every count equals N and no capacity error happened.
+# Soft mode does not apply here.
+SEMANTIC_OK=1
+for check in "scalar true:$SCALAR_COUNT" "scalar local:$SCALAR_LOCAL" "scalar shared:$SCALAR_SHARED" \
+             "bulk true:$BULK_COUNT" "bulk local:$BULK_LOCAL" "bulk shared:$BULK_SHARED"; do
+    if [[ "${check#*:}" != "$N" ]]; then
+        echo "  FAIL  ${check%%:*} = '${check#*:}' (expected $N)" >&2
+        SEMANTIC_OK=0
+    fi
+done
+if [[ "$CAPACITY_ERRORS" != "0" ]]; then
+    echo "  FAIL  capacity_errors = '$CAPACITY_ERRORS' (expected 0)" >&2
+    SEMANTIC_OK=0
+fi
 
 echo ""
 echo "================================================================"
 echo " VERDICT (perf budget)"
 echo "================================================================"
+if (( SEMANTIC_OK )); then
+    echo "  PASS  semantic gate: $N true results, local and shared claim counts, capacity_errors=0"
+else
+    echo "  FAIL  semantic gate, the timings are not valid" >&2
+    exit 1
+fi
 if (( PASS_SCALAR )); then
     echo "  PASS  scalar 750k = ${SCALAR_MS}ms (budget ${BUDGET_SCALAR_MS}ms)"
 else

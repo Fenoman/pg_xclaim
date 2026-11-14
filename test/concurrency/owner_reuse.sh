@@ -3,9 +3,11 @@
 # Owner identity / backend reuse test.
 #
 # Scenario:
-#   Backend A acquires (1, 800), commits (the xact callback releases the claim)
-#   and exits cleanly (its exit callback invalidates its owner token).
-#   New backend B tries (1, 800) -> true (clean exit means no stale entry).
+#   Backend A acquires (1, 800) -> true, commits (the xact callback releases
+#   the claim) and exits cleanly (its exit callback invalidates its owner
+#   token). Once A's backend is gone, the shared table holds no row for
+#   (1, 800). New backend B tries (1, 800) -> true. The row check comes
+#   before B: B's try would reap a row left with the invalidated token.
 #
 #   Out-of-range owner:
 #   xclaim.debug_inject_stale writes a row with owner_procno = INT32_MAX and
@@ -45,16 +47,37 @@ CSV_ROWS=()
 echo "--- Test 1: clean backend exit releases entry ---"
 
 # Backend A acquires then exits cleanly
-pg_xclaim_psql -X -A -t 2>/dev/null <<'SQLA'
+if ! A_RESULT="$(pg_xclaim_psql -X -A -t -v ON_ERROR_STOP=1 2>&1 <<'SQLA'
+SELECT 'pid=' || pg_backend_pid();
 BEGIN;
-SELECT xclaim.try(1, 800);
+SELECT 'claim=' || xclaim.try(1, 800);
 COMMIT;
 SQLA
+)"; then
+    echo "  FAIL: backend A failed: $A_RESULT" >&2
+fi
 # COMMIT released the claim. psql exits and the exit callback invalidates
 # the owner token.
+A_VAL="$(sed -n 's/^claim=//p' <<<"$A_RESULT")"
+A_PID="$(sed -n 's/^pid=//p' <<<"$A_RESULT")"
+A_GONE=false
+[[ "$A_PID" =~ ^[0-9]+$ ]] && xclaim_wait_backend_gone "$A_PID" && A_GONE=true
+A_ROWS="$(pg_xclaim_psql -X -A -t -q -v ON_ERROR_STOP=1 \
+    -c "SELECT count(*) FROM xclaim.debug() WHERE scope = 1 AND key = 800;")"
+echo "  Backend A: xclaim.try(1,800) = ${A_VAL:-none}, exited: $A_GONE, rows for (1, 800) after its exit: $A_ROWS"
+if [[ "$A_VAL" == "true" ]] && $A_GONE && [[ "$A_ROWS" == "0" ]]; then
+    echo "  PASS: A took the claim, exited and left no row"
+    PASS=$(( PASS + 1 ))
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "clean_exit_a_true" "PASS" "result" "true" "no row after exit")")
+else
+    echo "  FAIL: A must take the claim (true), exit and leave no row for (1, 800)" >&2
+    printf '%s\n' "$A_RESULT" | sed 's/^/    /' >&2
+    FAIL=$(( FAIL + 1 ))
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "clean_exit_a_true" "FAIL" "result" "${A_VAL:-none}" "exited $A_GONE rows $A_ROWS")")
+fi
 
 # New backend B: should succeed
-B_RESULT="$(pg_xclaim_psql -X -A -t 2>/dev/null <<'SQLB'
+B_RESULT="$(pg_xclaim_psql -X -A -t -v ON_ERROR_STOP=1 2>/dev/null <<'SQLB'
 BEGIN;
 SELECT xclaim.try(1, 800);
 ROLLBACK;

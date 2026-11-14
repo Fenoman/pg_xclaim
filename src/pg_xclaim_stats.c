@@ -15,10 +15,10 @@
  *   xclaim.stats             -- 14 columns (counters / gauges), 80/90/95%
  *                               capacity watermark logging with 60s
  *                               suppression. PARALLEL RESTRICTED STABLE.
- *   pg_xclaim.enabled = off  -- count, debug, debug_snapshot return
- *                               zero/empty without reading the shared
- *                               hash, stats still reads its counters,
- *                               and all four bump `disabled_calls`.
+ *   pg_xclaim.enabled = off  -- stops new acquisitions only. count, debug,
+ *                               debug_snapshot and stats keep reporting
+ *                               the claims taken before it, and none of
+ *                               them counts in `disabled_calls`.
  *   xclaim.debug_inject_stale -- superuser-only test helper that seeds
  *                                an XClaimEntry with a guaranteed-stale
  *                                owner triple so the reaper test can
@@ -30,10 +30,11 @@
  *   * watermark logging uses static last-warn timestamp + threshold
  *     comparisons. Within 60s of its last message a backend emits
  *     again only on a climb into a higher band.
- *   * debug_snapshot holds ALL partition LWLocks SHARED for the entire
- *     scan because dynahash has no "scan one partition" iterator.
- *   * debug holds ALL partition LWLocks SHARED for the entire scan and
- *     releases them on PG_CATCH (LWLockReleaseAll for ERROR paths).
+ *   * debug and debug_snapshot hold ALL partition LWLocks SHARED while
+ *     they copy the entries, because dynahash has no "scan one
+ *     partition" iterator, and only copy under them: the tuplestore
+ *     (memory, temporary files, catalog lookups for temp_tablespaces)
+ *     is built after the release.
  *   * Tuplestore SRF MaterializeMode pattern: per-query memory context
  *     for tuplestore allocation, rsinfo ReturnSetInfo validated.
  *
@@ -122,10 +123,11 @@ static int         xclaim_last_watermark_band = 0;
  *      -- the latter sums the per-freelist entry counts of the partitioned
  *      table, while the atomic counter is a single-cache-line read. The
  *      counter is a batched observability figure, not an exact snapshot:
- *      the bulk path adds its fresh inserts in one step after the batch,
- *      and the grouped cleanup subtracts its removals in one step after
- *      the partition sweep, so a concurrent reader can see rows already
- *      inserted or removed while the counter has not moved yet.
+ *      the bulk path adds the fresh inserts of a partition run in one step
+ *      before it releases the run's lock, and the grouped cleanup subtracts
+ *      its removals in one step after the partition sweep, so a concurrent
+ *      reader can see rows already inserted or removed while the counter
+ *      has not moved yet.
  *
  *      Bands are 80/90/95%. The 80% band emits LOG, 90% LOG, 95% WARNING
  *      (95 escalates to WARNING).
@@ -147,7 +149,11 @@ xclaim_capacity_watermark_check(uint64 used)
 
     capacity_used = (int64) pg_atomic_read_u64(&XClaimCtl->live_capacity);
     if (capacity_used <= 0 || xclaim_max_claims <= 0)
+    {
+        /* Below every band: the next crossing logs at once. */
+        xclaim_last_watermark_band = 0;
         return;
+    }
 
     warn_pct = xclaim_capacity_warn_pct;    /* GUC, default 80 */
 
@@ -219,6 +225,11 @@ xclaim_capacity_watermark_check(uint64 used)
      *  - band escalation = capacity is getting worse (informs operator)
      *  - re-emit every 60s = sustained pressure (visible in logs)
      */
+    /* No message under a partition LWLock of this extension. */
+    Assert(!LWLockAnyHeldByMe(&XClaimPartitionLocks[0].lock,
+                              XClaimCtl->num_partitions,
+                              sizeof(LWLockPadded)));
+
     now = GetCurrentTimestamp();
 
     if (band <= xclaim_last_watermark_band &&
@@ -242,7 +253,14 @@ xclaim_capacity_watermark_check(uint64 used)
      * over the server log catches every occurrence regardless of the
      * band/level. Integer percentage (computed at integer precision
      * above) avoids float-jitter in regression tests.
+     *
+     * The marks are set first: the message ends with CHECK_FOR_INTERRUPTS()
+     * in errfinish(), and a cancel processed there must not leave them
+     * behind, or the next claim would write the same line again.
      */
+    xclaim_last_watermark_log  = now;
+    xclaim_last_watermark_band = band;
+
     ereport(level,
             (errmsg("pg_xclaim: capacity watermark crossed -- %d%% (%lld / %d claims)",
                     pct,
@@ -250,9 +268,6 @@ xclaim_capacity_watermark_check(uint64 used)
                     xclaim_max_claims),
              errhint("Raise pg_xclaim.max_claims or investigate "
                      "long-running transactions holding claims.")));
-
-    xclaim_last_watermark_log  = now;
-    xclaim_last_watermark_band = band;
 }
 
 /* -------------------------------------------------------------------- */
@@ -275,8 +290,9 @@ xclaim_check_capacity_watermark(uint64 used)
 /* inherit the leader's local set, so the SQL wrapper keeps execution   */
 /* in the leader backend.                                               */
 /*                                                                      */
-/* enabled=off: return 0 (no claims held under kill switch). The caller */
-/* sees zero for the count, and stats.disabled_calls increments.        */
+/* pg_xclaim.enabled = off stops new acquisitions only. Claims taken    */
+/* before it stay held until their transaction ends, and count() keeps  */
+/* reporting them.                                                      */
 /* -------------------------------------------------------------------- */
 
 PG_FUNCTION_INFO_V1(xclaim_count);
@@ -285,12 +301,6 @@ Datum
 xclaim_count(PG_FUNCTION_ARGS)
 {
     XCLAIM_REQUIRE_INIT();
-
-    if (!xclaim_enabled)
-    {
-        pg_atomic_fetch_add_u64(&XClaimCtl->disabled_calls, 1);
-        PG_RETURN_INT64(0);
-    }
 
     PG_RETURN_INT64((int64) xclaim_local_count());
 }
@@ -371,30 +381,10 @@ xclaim_stats(PG_FUNCTION_ARGS)
                         "that cannot accept type record")));
 
     /*
-     * enabled=off: still produce a single row (gauges and counters are
-     * honest reads from atomics). The caller can detect the
-     * disabled state via disabled_calls > 0 (pre-incremented before the
-     * read here) and capacity_used = whatever was already in shmem (we
-     * don't pretend it is zero -- that would mislead operators).
+     * pg_xclaim.enabled does not change the row: the counters and gauges
+     * are reads of the atomics, and capacity_used keeps counting the
+     * claims taken before the switch until their transactions end.
      */
-    /*
-     * STABLE function with observability side-effect.
-     * SQL declares xclaim.stats() as STABLE. The atomic counter
-     * increment below is an observability bump on shared memory,
-     * NOT a logical row-set mutation -- functionally equivalent to
-     * PG core bumping wait_event counters during a STABLE function
-     * call. The planner may collapse repeated xclaim.stats()
-     * invocations within a single statement. Under such collapse
-     * `disabled_calls` increments by however many physical calls
-     * actually executed, not by the SQL-visible call count. This is
-     * acceptable: the counter's purpose is to detect "did anyone
-     * observe enabled=off?" -- a non-zero value is
-     * sufficient signal regardless of the exact count. Operators
-     * relying on exact counts should use enabled=off + look at
-     * absence of acquisition counters instead.
-     */
-    if (!xclaim_enabled)
-        pg_atomic_fetch_add_u64(&XClaimCtl->disabled_calls, 1);
 
     /* Snapshot all counters atomically (lock-free reads). */
     capacity_max               = (int64) xclaim_max_claims;
@@ -501,7 +491,125 @@ xclaim_stats(PG_FUNCTION_ARGS)
 /* entries with the same numeric k1 are indistinguishable.              */
 /* -------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------- */
+/* Shared-state snapshot for xclaim.debug() and xclaim.debug_snapshot(). */
+/*                                                                      */
+/* Why all partitions. `hash_seq_search` walks ALL buckets of the hash  */
+/* table, not one partition's slice, and dynahash has no "scan one      */
+/* partition" mode. With HASH_PARTITION the partition LWLocks serialise */
+/* per-partition mutators only, so a scan that holds one partition's    */
+/* lock can read a bucket chain another partition's writer is changing. */
+/* The scan holds every partition LWLock SHARED, in ascending order.    */
+/* Other code paths (acquire, cleanup) lock at most ONE partition at a  */
+/* time, so no cross-partition deadlock is possible.                    */
+/*                                                                      */
+/* What runs under the locks. Only the walk and a copy of each entry   */
+/* into an array allocated before the locks. The tuplestore is built    */
+/* after the release: under the locks its writes to temporary files,    */
+/* the catalog lookups for temp_tablespaces and the per-row allocations */
+/* would stop every xclaim.try, xclaim.try_many and transaction end for */
+/* the whole call, and a catalog lock wait there is a wait the deadlock */
+/* detector does not see. The copy array costs sizeof(XClaimEntry) (48 */
+/* bytes) of backend memory per row for the duration of the call, sized */
+/* for capacity_used plus 1/8 and 64 rows of headroom (about 54 MB for  */
+/* a million rows).                                                     */
+/*                                                                      */
+/* Errors. Nothing under the locks raises an ERROR in normal operation. */
+/* If one does, the transaction or subtransaction abort releases the    */
+/* locks (LWLockReleaseAll) and dynahash drops the open scan            */
+/* (AtEOXact_HashTables / AtEOSubXact_HashTables).                      */
+/*                                                                      */
+/* MAX_SIMUL_LWLOCKS. PostgreSQL limits each backend to 200 LWLocks     */
+/* held at once. The default num_partitions = 128 fits, and above 192   */
+/* (a margin for the LWLocks core takes during the call) the functions  */
+/* refuse with ERRCODE_FEATURE_NOT_SUPPORTED.                           */
+/* -------------------------------------------------------------------- */
+
 #define XCLAIM_DEBUG_COLS 8
+#define XCLAIM_DEBUG_MAX_PARTITIONS 192
+
+/*
+ * xclaim_debug_copy_entries
+ *      Copies every shared entry into an array in CurrentMemoryContext and
+ *      returns it, with the row count in *out_count.
+ *
+ * The array is sized from live_capacity plus a margin: an atomic read,
+ * clamped to [0, max_claims]. hash_get_num_entries() is exact only under
+ * every partition lock (it sums per-freelist counts that other backends
+ * change), so it is read after the locks are taken. If the table grew past
+ * the array in between, the locks are released and the copy starts over
+ * with a larger array. debug_scans counts the copies made.
+ */
+static XClaimEntry *
+xclaim_debug_copy_entries(const char *fname, uint64 *out_count)
+{
+    int             num_partitions = XClaimCtl->num_partitions;
+    XClaimEntry    *copy = NULL;
+    uint64          cap;
+    int             p;
+
+    if (num_partitions > XCLAIM_DEBUG_MAX_PARTITIONS)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("%s cannot acquire %d partition LWLocks "
+                        "simultaneously (PG MAX_SIMUL_LWLOCKS = ~200)",
+                        fname, num_partitions),
+                 errhint("Set pg_xclaim.num_partitions <= 192 in clusters "
+                         "that use %s. Use xclaim.stats() for routine "
+                         "production observability.", fname)));
+
+    {
+        int64   live = (int64) pg_atomic_read_u64(&XClaimCtl->live_capacity);
+
+        cap = (uint64) Min(Max(live, 0), (int64) xclaim_max_claims);
+    }
+    for (;;)
+    {
+        HASH_SEQ_STATUS seq;
+        XClaimEntry    *entry;
+        uint64          n = 0;
+        uint64          exact;
+
+        cap += cap / 8 + 64;
+        copy = (XClaimEntry *) MemoryContextAllocExtended(CurrentMemoryContext,
+                                                         mul_size((Size) cap, sizeof(XClaimEntry)),
+                                                         MCXT_ALLOC_HUGE);
+
+        CHECK_FOR_INTERRUPTS();
+
+        for (p = 0; p < num_partitions; p++)
+            LWLockAcquire(&XClaimPartitionLocks[p].lock, LW_SHARED);
+
+        exact = (uint64) Max(hash_get_num_entries(XClaimHash), 0);
+        if (exact > cap)
+        {
+            for (p = num_partitions - 1; p >= 0; p--)
+                LWLockRelease(&XClaimPartitionLocks[p].lock);
+            pfree(copy);
+            cap = exact;
+            continue;
+        }
+
+        hash_seq_init(&seq, XClaimHash);
+        while ((entry = (XClaimEntry *) hash_seq_search(&seq)) != NULL)
+        {
+            /* exact <= cap, so this holds unless the count is wrong. */
+            if (unlikely(n >= cap))
+            {
+                hash_seq_term(&seq);
+                break;
+            }
+            copy[n++] = *entry;
+        }
+
+        for (p = num_partitions - 1; p >= 0; p--)
+            LWLockRelease(&XClaimPartitionLocks[p].lock);
+
+        pg_atomic_fetch_add_u64(&XClaimCtl->debug_scans, 1);
+        *out_count = n;
+        return copy;
+    }
+}
 
 /*
  * xclaim_emit_debug_row
@@ -551,21 +659,65 @@ xclaim_emit_debug_row(Tuplestorestate *tupstore, TupleDesc tupdesc,
     pfree(DatumGetPointer(values[1]));
 }
 
+/*
+ * xclaim_debug_materialize
+ *      Common body of xclaim.debug() and xclaim.debug_snapshot(): checks
+ *      the SRF call context, copies the entries, then fills the
+ *      tuplestore with no partition lock held.
+ */
+static void
+xclaim_debug_materialize(FunctionCallInfo fcinfo, const char *fname)
+{
+    ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    TupleDesc       tupdesc;
+    Tuplestorestate *tupstore;
+    MemoryContext   per_query_ctx;
+    MemoryContext   oldcontext;
+    XClaimEntry    *copy;
+    uint64          n;
+    uint64          i;
+
+    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("set-valued function called in context that cannot accept a set")));
+    if (!(rsinfo->allowedModes & SFRM_Materialize))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("materialize mode required, but it is not allowed in this context")));
+
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("%s: function returning record called in context "
+                        "that cannot accept type record", fname)));
+
+    copy = xclaim_debug_copy_entries(fname, &n);
+
+    per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+    oldcontext = MemoryContextSwitchTo(per_query_ctx);
+    tupstore = tuplestore_begin_heap(true, false, work_mem);
+    rsinfo->returnMode = SFRM_Materialize;
+    rsinfo->setResult  = tupstore;
+    rsinfo->setDesc    = tupdesc;
+
+    for (i = 0; i < n; i++)
+    {
+        CHECK_FOR_INTERRUPTS();
+        xclaim_emit_debug_row(tupstore, tupdesc, &copy[i]);
+    }
+
+    MemoryContextSwitchTo(oldcontext);
+    pfree(copy);
+}
+
 /* -------------------------------------------------------------------- */
 /* xclaim.debug_snapshot() -- shared-state snapshot for pg_monitor.    */
 /*                                                                      */
-/* PARALLEL RESTRICTED STABLE. Acquires SHARED LWLocks on ALL partitions for */
-/* the scan. The result is consistent with respect to concurrent        */
-/* xclaim writers for the duration of the scan, but the function may    */
-/* refuse to run when num_partitions exceeds the MAX_SIMUL_LWLOCKS      */
-/* safety margin.                                                       */
-/*                                                                      */
-/* Concurrency: dynahash hash_seq_init/hash_seq_search visits ALL       */
-/* entries. Since we hold all partition locks, the loop can emit every  */
-/* row directly, without per-partition filtering.                       */
-/*                                                                      */
-/* Memory: tuplestore is created in per-query context, and per-row      */
-/* palloc (CStringGetTextDatum) lands there too.                        */
+/* PARALLEL RESTRICTED STABLE. Returns a consistent snapshot of every   */
+/* claim: the rows are copied under all partition LWLocks (see above).  */
+/* Granted to pg_monitor. Acquisitions wait only for the copy, not for  */
+/* the result building. pg_xclaim.enabled does not change the result.   */
 /* -------------------------------------------------------------------- */
 
 PG_FUNCTION_INFO_V1(xclaim_debug_snapshot);
@@ -573,154 +725,21 @@ PG_FUNCTION_INFO_V1(xclaim_debug_snapshot);
 Datum
 xclaim_debug_snapshot(PG_FUNCTION_ARGS)
 {
-    ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-    TupleDesc       tupdesc;
-    Tuplestorestate *tupstore;
-    MemoryContext   per_query_ctx;
-    MemoryContext   oldcontext;
-    int             num_partitions;
-    int             p;
-
     XCLAIM_REQUIRE_INIT();
 
-    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("set-valued function called in context that cannot accept a set")));
-    if (!(rsinfo->allowedModes & SFRM_Materialize))
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("materialize mode required, but it is not allowed in this context")));
-
-    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("xclaim.debug_snapshot: function returning record called in context "
-                        "that cannot accept type record")));
-
-    /*
-     * enabled=off short-circuit: return empty tuplestore and bump counter.
-     * The caller observes zero rows, and xclaim.stats().disabled_calls > 0
-     * is the diagnostic.
-     */
-    if (!xclaim_enabled)
-        pg_atomic_fetch_add_u64(&XClaimCtl->disabled_calls, 1);
-
-    pg_atomic_fetch_add_u64(&XClaimCtl->debug_scans, 1);
-
-    per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
-    oldcontext = MemoryContextSwitchTo(per_query_ctx);
-    tupstore = tuplestore_begin_heap(true, false, work_mem);
-    rsinfo->returnMode = SFRM_Materialize;
-    rsinfo->setResult  = tupstore;
-    rsinfo->setDesc    = tupdesc;
-    MemoryContextSwitchTo(oldcontext);
-
-    if (!xclaim_enabled)
-        return (Datum) 0;
-
-    num_partitions = XClaimCtl->num_partitions;
-
-    /*
-     * dynahash safety:
-     *
-     * `hash_seq_search` walks ALL buckets of the hash table -- not just
-     * one partition's slice. With HASH_PARTITION, the partition LWLocks
-     * synchronise per-partition mutators only. When a writer modifies
-     * partition X's bucket linked list concurrently, a scan that
-     * happens to traverse a bucket in partition X observes inconsistent
-     * state (bucket pointer torn between dynahash's segment-pointer
-     * write and the ELEMENT->link assignment). Holding ONLY one
-     * partition's lock SHARED while running a full hash_seq_search and
-     * filtering by partition_id is therefore incorrect: writers in
-     * other partitions are NOT serialised with us, and dynahash does
-     * not document a "scan one partition" mode.
-     *
-     * The minimal correct behavior is to acquire ALL partition LWLocks
-     * SHARED for the entire scan, identical to xclaim.debug(). This
-     * does collapse the two functions to the same lock pressure
-     * profile -- documented below.
-     *
-     * MAX_SIMUL_LWLOCKS guard mirrors xclaim.debug() -- PG limits
-     * concurrent LWLocks per backend to ~200, so we cap at 192 to leave
-     * headroom for catalog access etc.
-     */
-    if (num_partitions > 192)
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("xclaim.debug_snapshot() cannot acquire %d partition LWLocks "
-                        "simultaneously (PG MAX_SIMUL_LWLOCKS = ~200)",
-                        num_partitions),
-                 errhint("Set pg_xclaim.num_partitions <= 192 in test "
-                         "clusters that use xclaim.debug_snapshot().")));
-
-    /*
-     * Acquire ALL partition LWLocks SHARED. Errors inside the scan loop
-     * are wrapped with PG_TRY/PG_CATCH so the locks are released even
-     * on ereport (e.g. tuplestore palloc OOM). `seq_ds_initialized` gates
-     * `hash_seq_term` in PG_CATCH so we only call it when the iterator
-     * was actually started.
-     */
-    {
-        HASH_SEQ_STATUS seq_ds;
-        volatile bool   seq_ds_initialized = false;
-        XClaimEntry    *entry_ds;
-
-        PG_TRY();
-        {
-            for (p = 0; p < num_partitions; p++)
-                LWLockAcquire(&XClaimPartitionLocks[p].lock, LW_SHARED);
-
-            hash_seq_init(&seq_ds, XClaimHash);
-            seq_ds_initialized = true;
-            while ((entry_ds = (XClaimEntry *) hash_seq_search(&seq_ds)) != NULL)
-            {
-                MemoryContextSwitchTo(per_query_ctx);
-                xclaim_emit_debug_row(tupstore, tupdesc, entry_ds);
-                MemoryContextSwitchTo(oldcontext);
-            }
-            /* hash_seq_search NULL return deregisters automatically. */
-            seq_ds_initialized = false;
-
-            for (p = num_partitions - 1; p >= 0; p--)
-                LWLockRelease(&XClaimPartitionLocks[p].lock);
-        }
-        PG_CATCH();
-        {
-            int q;
-
-            if (seq_ds_initialized)
-                hash_seq_term(&seq_ds);
-
-            for (q = num_partitions - 1; q >= 0; q--)
-            {
-                LWLock *l = &XClaimPartitionLocks[q].lock;
-                if (LWLockHeldByMe(l))
-                    LWLockRelease(l);
-            }
-            PG_RE_THROW();
-        }
-        PG_END_TRY();
-    }
-
+    xclaim_debug_materialize(fcinfo, "xclaim.debug_snapshot()");
     return (Datum) 0;
 }
 
 /* -------------------------------------------------------------------- */
 /* xclaim.debug() -- consistent all-partition snapshot.                */
 /*                                                                      */
-/* PARALLEL UNSAFE STABLE. Holds SHARED LWLock on EVERY partition for  */
-/* the entire scan -- serializes the whole extension under load. SQL   */
-/* surface restricted to superuser via REVOKE PUBLIC (no GRANT).       */
+/* PARALLEL UNSAFE STABLE. Same snapshot as xclaim.debug_snapshot().    */
+/* SQL surface restricted to superuser via REVOKE PUBLIC (no GRANT).    */
 /*                                                                      */
 /* Use case: regression tests that need a single consistent snapshot   */
 /* across all partitions. NOT for routine production polling. Use      */
 /* xclaim.stats() for steady observability.                            */
-/*                                                                      */
-/* Lock ordering: ascending partition index. Other code paths (acquire,*/
-/* cleanup) lock at most ONE partition at a time, so cross-partition  */
-/* deadlock cannot occur regardless of our order. We use ascending so  */
-/* any multi-partition operation has a documented total order.         */
 /* -------------------------------------------------------------------- */
 
 PG_FUNCTION_INFO_V1(xclaim_debug);
@@ -728,145 +747,9 @@ PG_FUNCTION_INFO_V1(xclaim_debug);
 Datum
 xclaim_debug(PG_FUNCTION_ARGS)
 {
-    ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-    TupleDesc       tupdesc;
-    Tuplestorestate *tupstore;
-    MemoryContext   per_query_ctx;
-    MemoryContext   oldcontext;
-    int             num_partitions;
-    int             p;
-    HASH_SEQ_STATUS seq;
-    /*
-     * `seq_initialized`: hash_seq_term dereferences `seq.hashp`, which
-     * is set by hash_seq_init. Calling hash_seq_term before init
-     * touches uninitialised stack memory. The flag lets PG_CATCH
-     * decide whether to terminate the iterator -- LWLockAcquire on
-     * the success path doesn't ereport, but defensive against code
-     * added between init and the scan loop.
-     */
-    volatile bool   seq_initialized = false;
-    XClaimEntry    *entry;
-
     XCLAIM_REQUIRE_INIT();
 
-    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("set-valued function called in context that cannot accept a set")));
-    if (!(rsinfo->allowedModes & SFRM_Materialize))
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("materialize mode required, but it is not allowed in this context")));
-
-    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("xclaim.debug: function returning record called in context "
-                        "that cannot accept type record")));
-
-    if (!xclaim_enabled)
-        pg_atomic_fetch_add_u64(&XClaimCtl->disabled_calls, 1);
-
-    pg_atomic_fetch_add_u64(&XClaimCtl->debug_scans, 1);
-
-    per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
-    oldcontext = MemoryContextSwitchTo(per_query_ctx);
-    tupstore = tuplestore_begin_heap(true, false, work_mem);
-    rsinfo->returnMode = SFRM_Materialize;
-    rsinfo->setResult  = tupstore;
-    rsinfo->setDesc    = tupdesc;
-    MemoryContextSwitchTo(oldcontext);
-
-    if (!xclaim_enabled)
-        return (Datum) 0;
-
-    num_partitions = XClaimCtl->num_partitions;
-
-    /*
-     * MAX_SIMUL_LWLOCKS guard: PG limits each backend to at most 200
-     * simultaneous LWLocks (`MAX_SIMUL_LWLOCKS` in lwlock.c). The
-     * production default `num_partitions = 128` stays comfortably
-     * inside this budget, while clusters that raise it above 192 (e.g. to
-     * 256 on >100-core deployments) will see this function refuse with
-     * the message below. xclaim.debug_snapshot() has the same all-lock
-     * scan guard. Use xclaim.stats() for routine production
-     * observability.
-     *
-     * 192 is a safe margin -- PG core may take a handful of LWLocks on
-     * its own during the call (catalog access, snapshot, etc).
-     */
-    if (num_partitions > 192)
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("xclaim.debug() cannot acquire %d partition LWLocks "
-                        "simultaneously (PG MAX_SIMUL_LWLOCKS = ~200)",
-                        num_partitions),
-                 errhint("Set pg_xclaim.num_partitions <= 192 in test "
-                         "clusters that use xclaim.debug(). Use xclaim.stats() "
-                         "for routine production observability.")));
-
-    /*
-     * Acquire ALL partition LWLocks SHARED in ascending index order. On
-     * PG_CATCH we release them in REVERSE order (LIFO) for cleanliness.
-     * Errors inside the scan loop are wrapped with PG_TRY/PG_CATCH so
-     * the locks are guaranteed released.
-     */
-    PG_TRY();
-    {
-        for (p = 0; p < num_partitions; p++)
-            LWLockAcquire(&XClaimPartitionLocks[p].lock, LW_SHARED);
-
-        hash_seq_init(&seq, XClaimHash);
-        seq_initialized = true;
-        while ((entry = (XClaimEntry *) hash_seq_search(&seq)) != NULL)
-        {
-            MemoryContextSwitchTo(per_query_ctx);
-            xclaim_emit_debug_row(tupstore, tupdesc, entry);
-            MemoryContextSwitchTo(oldcontext);
-        }
-        /*
-         * hash_seq_search returning NULL deregisters the seq itself
-         * (dynahash convention). Mark our flag false so PG_CATCH
-         * does NOT double-deregister.
-         */
-        seq_initialized = false;
-
-        for (p = num_partitions - 1; p >= 0; p--)
-            LWLockRelease(&XClaimPartitionLocks[p].lock);
-    }
-    PG_CATCH();
-    {
-        /*
-         * Terminate the hash_seq iterator first. dynahash tracks
-         * in-flight scans in a process-global fixed-size array
-         * (seq_scan_tables[MAX_SEQ_SCANS]). An abandoned hash_seq_search
-         * leaves the HTAB registered there, so the next hash_seq_init
-         * for the SAME HTAB can assert (or worse, silently corrupt
-         * iteration). hash_seq_term requires
-         * hash_seq_init to have populated `seq.hashp` first, so we
-         * gate on the `seq_initialized` flag tracked in the TRY body.
-         *
-         * Then release every lock we may have acquired so far. We do
-         * not know which partition failed, so iterate all and let
-         * LWLockHeldByMe release silently if we never acquired it
-         * (LWLockReleaseAll is the canonical contrib-module pattern,
-         * and we replicate the safe subset by iterating in reverse).
-         */
-        int q;
-
-        if (seq_initialized)
-            hash_seq_term(&seq);
-
-        for (q = num_partitions - 1; q >= 0; q--)
-        {
-            LWLock *l = &XClaimPartitionLocks[q].lock;
-            if (LWLockHeldByMe(l))
-                LWLockRelease(l);
-        }
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-
+    xclaim_debug_materialize(fcinfo, "xclaim.debug()");
     return (Datum) 0;
 }
 
@@ -918,7 +801,7 @@ xclaim_debug_inject_stale(PG_FUNCTION_ARGS)
     memset(&lk, 0, sizeof(lk));
     lk.dbid = MyDatabaseId;
     lk.form = XCLAIM_FORM_PAIR;
-    lk.k1   = ((int64) (uint32) scope << 32) | (uint32) key;
+    lk.k1   = (int64) (((uint64) (uint32) scope << 32) | (uint32) key);
 
     hashvalue = xclaim_compute_hash(&lk);
     plock = xclaim_partition_lock(hashvalue);

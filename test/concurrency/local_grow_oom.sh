@@ -20,9 +20,20 @@
 #   Test 3: one insert grows the set twice, and the second growth fails. The
 #           first growth replaced the bucket array, so the set has to come
 #           back to the grown array, not to the one the insert started with.
+#           The insert comes from xclaim.try_many, which inserts under the
+#           partition LWLock, so the ERROR reaches its PG_CATCH with the lock
+#           held. Afterwards statement_timeout still cancels a statement of
+#           the same session: the handler restored the interrupt holdoff
+#           count before it released the lock.
 #   Test 4: the first bucket array of a session does not fit. Every failed
 #           attempt leaves no memory context behind, and the first claim
 #           after the cap is lifted creates the set.
+#   Test 5: exit_on_error = on turns the ERROR into FATAL, which skips every
+#           PG_CATCH. The cleanup at backend exit walks the set, so the set
+#           has to be back at the geometry of its array before the ERROR is
+#           raised (PostgreSQL 16 sets the doubled geometry before the
+#           allocation). The server survives the exit, and no claim of the
+#           session stays in shared memory.
 # The cluster runs with restart_after_crash = off, so a crashed backend
 # stops the server instead of hiding in a crash restart.
 #
@@ -107,9 +118,11 @@ capped_session() {
     echo "  backend $pid: VmSize ${vm_kb} kB, address space capped at +${margin_kb} kB"
     xclaim_holder_sql "$sql"
     xclaim_holder_sql "SELECT 'done';"
-    # Growing the set to half a million entries takes a few seconds.
+    # Growing the set to half a million entries takes a few seconds. A
+    # session that ends on FATAL closes psql before the marker.
     for i in $(seq 1 600); do
         grep -q '^done$' "$XCLAIM_HOLDER_OUT" 2>/dev/null && return 0
+        kill -0 "$XCLAIM_HOLDER_JOB" 2>/dev/null || return 2
         server_alive || return 1
         sleep 0.1
     done
@@ -279,7 +292,7 @@ BEGIN
     END LOOP;
     RAISE NOTICE 'before_bytes=%', (SELECT total_bytes FROM pg_backend_memory_contexts WHERE name = 'xclaim local set');
     BEGIN
-        PERFORM xclaim.try((SELECT k FROM grow_keys WHERE role = 'collider' ORDER BY k LIMIT 1));
+        PERFORM xclaim.try_many(ARRAY[(SELECT k FROM grow_keys WHERE role = 'collider' ORDER BY k LIMIT 1)]);
         RAISE NOTICE 'trigger=inserted';
     EXCEPTION WHEN out_of_memory THEN
         GET STACKED DIAGNOSTICS err_detail = PG_EXCEPTION_DETAIL;
@@ -295,7 +308,10 @@ BEGIN;
 SELECT 'fresh2=' || xclaim.try((SELECT k FROM grow_keys WHERE role = 'fresh' ORDER BY k OFFSET 1 LIMIT 1));
 SELECT 'held2=' || xclaim.count();
 COMMIT;
-SELECT 'after2=' || xclaim.count();"
+SELECT 'after2=' || xclaim.count();
+SET statement_timeout = '300ms';
+SELECT 'sleep=' || pg_sleep(3);
+RESET statement_timeout;"
 
     if ! server_alive; then
         server_down "second_growth_oom"
@@ -310,6 +326,8 @@ SELECT 'after2=' || xclaim.count();"
         FRESH2="$(sed -n 's/^fresh2=//p' "$XCLAIM_HOLDER_OUT")"
         HELD2="$(sed -n 's/^held2=//p' "$XCLAIM_HOLDER_OUT")"
         AFTER2="$(sed -n 's/^after2=//p' "$XCLAIM_HOLDER_OUT")"
+        TIMEOUT_OK="$(grep -c 'canceling statement due to statement timeout' "$XCLAIM_HOLDER_OUT" || true)"
+        SLEPT="$(grep -c '^sleep=' "$XCLAIM_HOLDER_OUT" || true)"
         ROWS="$(q "SELECT count(*) FROM xclaim.debug_snapshot();")"
         # The context holds the 2^17 array and less than one entry per
         # bucket of small blocks, so its size gives the entry size.
@@ -318,15 +336,17 @@ SELECT 'after2=' || xclaim.count();"
         SECOND_GROWTH_BYTES=$(( 524288 * ENTRY_BYTES ))
         echo "  set bytes before: ${BEFORE_BYTES:-none} (entry $ENTRY_BYTES bytes), failed request: ${SIZE:-none} bytes, set bytes after: ${AFTER_BYTES:-none}"
         echo "  reenter: $REENTER, fresh: $FRESH, held: $HELD, after: $AFTER, next transaction: $FRESH2 held $HELD2 after $AFTER2, shared rows: $ROWS"
+        echo "  statement_timeout after the error: cancelled $TIMEOUT_OK, pg_sleep finished $SLEPT"
         if [[ -z "$BEFORE_BYTES" || -z "$AFTER_BYTES" ]] || (( ENTRY_BYTES < 16 )); then
             fail "second_growth_oom" "set_bytes" "before=${BEFORE_BYTES:-none}" "the set must start from the 2^17 array"
         elif [[ "$SIZE" != "$SECOND_GROWTH_BYTES" ]] || (( AFTER_BYTES < GROWN_BYTES || AFTER_BYTES >= SECOND_GROWTH_BYTES )); then
             fail "second_growth_oom" "request_size" "size=${SIZE:-none} after=$AFTER_BYTES" "the first growth must succeed and the second ($SECOND_GROWTH_BYTES bytes) must fail"
         elif [[ "$REENTER" == "t" && "$FRESH" == "t" && "$HELD" == "30027" && "$AFTER" == "0" \
-                && "$FRESH2" == "true" && "$HELD2" == "1" && "$AFTER2" == "0" && "$ROWS" == "0" ]]; then
-            pass "second_growth_oom" "request_size" "$SIZE" "the set stays usable after the second growth of one insert fails"
+                && "$FRESH2" == "true" && "$HELD2" == "1" && "$AFTER2" == "0" && "$ROWS" == "0" \
+                && "$TIMEOUT_OK" == "1" && "$SLEPT" == "0" ]]; then
+            pass "second_growth_oom" "request_size" "$SIZE" "the set stays usable after the second growth of one insert fails, and statement_timeout still cancels"
         else
-            fail "second_growth_oom" "state" "reenter=$REENTER fresh=$FRESH held=$HELD after=$AFTER next=$FRESH2/$HELD2/$AFTER2 rows=$ROWS" "the set must serve lookups and new claims after the second growth fails, and the transaction ends must release everything"
+            fail "second_growth_oom" "state" "reenter=$REENTER fresh=$FRESH held=$HELD after=$AFTER next=$FRESH2/$HELD2/$AFTER2 rows=$ROWS timeout=$TIMEOUT_OK slept=$SLEPT" "the set must serve lookups and new claims after the second growth fails, the transaction ends must release everything, and statement_timeout must still cancel"
         fi
     fi
 fi
@@ -390,6 +410,40 @@ else
             else
                 fail "create_oom" "state" "failed=$FAILED array=$ARRAY_FAILED contexts=$CONTEXTS retry=$RETRY contexts2=$CONTEXTS2" "every creation must fail on the first array and drop its context, and the claim after the cap is lifted must create the set"
             fi
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Test 5: the ERROR turns into FATAL
+# ---------------------------------------------------------------------------
+echo "--- Test 5: out of memory while growing with exit_on_error = on ---"
+
+if ! server_alive; then
+    server_down "fatal_oom"
+else
+    MISSES_BEFORE="$(q "SELECT cleanup_misses FROM xclaim.stats();")"
+    run_capped "$MARGIN_KB" "SET exit_on_error = on;
+DO \$\$ BEGIN $GROW_LOOP END \$\$;"
+    # The exit callbacks have run once the backend process is gone.
+    FATAL_PID="$(sed -n 's/^pid=//p' "$XCLAIM_HOLDER_OUT")"
+    GONE=no
+    if [[ -n "$FATAL_PID" ]] && xclaim_wait_backend_gone "$FATAL_PID"; then
+        GONE=yes
+    fi
+    if ! server_alive; then
+        server_down "fatal_oom"
+    elif [[ "$GONE" != "yes" ]]; then
+        fail "fatal_oom" "backend" "${FATAL_PID:-none}" "the backend of the session must exit after the FATAL"
+    else
+        SIZE="$(failed_request_size)"
+        FATAL_SEEN="$(grep -c '^FATAL:  out of memory' "$XCLAIM_HOLDER_OUT" || true)"
+        STATE="$(q "SELECT (SELECT count(*) FROM xclaim.debug_snapshot()) || '/' || capacity_used || '/' || (cleanup_misses - ${MISSES_BEFORE:-0}) FROM xclaim.stats();")"
+        echo "  FATAL lines: $FATAL_SEEN, failed request: ${SIZE:-none} bytes, shared rows/capacity_used/new cleanup_misses after the exit: $STATE"
+        if [[ "$FATAL_SEEN" == "1" && -n "$SIZE" ]] && (( SIZE >= MIN_GROWTH_BYTES )) && [[ "$STATE" == "0/0/0" ]]; then
+            pass "fatal_oom" "rows" "0" "the backend exits on FATAL during a growth, the server survives and no claim stays behind"
+        else
+            fail "fatal_oom" "state" "fatal=$FATAL_SEEN size=${SIZE:-none} state=$STATE" "a growth must fail with FATAL, the server must survive and the exit must release every claim"
         fi
     fi
 fi

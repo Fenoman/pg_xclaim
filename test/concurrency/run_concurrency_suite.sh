@@ -10,7 +10,8 @@
 #   --skip-slow        Skip the slow scripts: hot_standby_rejection.sh
 #                      (requires pg_basebackup ~30-60s), stress_10x100k.sh
 #                      (long running), and debug_scan_stress.sh.
-#   --only <name>      Run only the named script (without .sh suffix).
+#   --only <name>      Run only the named script (without .sh suffix). A
+#                      name that is not in the registry below is an error.
 #
 # Exit: 0 if all tests PASS, non-zero if any FAIL.
 #
@@ -28,7 +29,12 @@ ONLY_SCRIPT=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-slow) SKIP_SLOW=true; shift ;;
-        --only) ONLY_SCRIPT="$2"; shift 2 ;;
+        --only)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                echo "--only needs a script name" >&2
+                exit 1
+            fi
+            ONLY_SCRIPT="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -59,14 +65,26 @@ ALL_SCRIPTS=(
     "owner_reuse"
     # per-backend peak watermark LOG hint
     "peak_warn"
+    # the lowest accepted settings serve claims up to capacity
+    "min_config"
+    # LWLockAcquire ERROR in xclaim.try, session_reset from a hook in try_many
+    "hook_error_paths"
     # out of memory while the local set grows (Linux only)
     "local_grow_oom"
     # autonomous transactions refused, parent claims kept (Postgres Pro Enterprise only)
     "autonomous_xact"
+    # live_capacity equals the shared rows after a terminate inside try_many
+    "bulk_fatal_capacity"
+    # out-of-memory cleanup at transaction end is linear (Linux only)
+    "cleanup_oom_fallback"
+    # a one-claim transaction costs the same whatever the local set size
+    "short_xact_cost"
     # debug scan stress
     "debug_scan_stress"
     # bulk concurrent
     "bulk_concurrent"
+    # try_many holds a partition lock only for its run, reentrant tail included
+    "bulk_reentrant_lock"
     # wait-event observability
     "wait_event_check"
     # grouped cleanup 50k <100ms (HARD gate)
@@ -98,6 +116,14 @@ for s in "${ALL_SCRIPTS[@]}"; do
     SCRIPTS_TO_RUN+=("$s")
 done
 
+# --only must select exactly one registered script: a misspelled name would
+# otherwise run nothing and exit 0.
+if [[ -n "$ONLY_SCRIPT" ]] && (( ${#SCRIPTS_TO_RUN[@]} != 1 )); then
+    echo "[suite] FAIL: --only '$ONLY_SCRIPT' selects ${#SCRIPTS_TO_RUN[@]} registered scripts, expected 1" >&2
+    echo "[suite] registered: ${ALL_SCRIPTS[*]}" >&2
+    exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # Run each script
 # ---------------------------------------------------------------------------
@@ -115,9 +141,11 @@ echo ""
 
 for script in "${SCRIPTS_TO_RUN[@]}"; do
     SCRIPT_PATH="$SUITE_DIR/${script}.sh"
+    # A registered script missing from disk is a FAIL: skipping it would let
+    # the suite pass without running the test.
     if [[ ! -f "$SCRIPT_PATH" ]]; then
-        echo "[suite] SKIP (not found): $script"
-        SKIP_SCRIPTS+=("$script")
+        echo "[suite] FAIL (not found): $script" >&2
+        FAIL_SCRIPTS+=("$script:not found")
         continue
     fi
 

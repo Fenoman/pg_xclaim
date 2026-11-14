@@ -31,7 +31,15 @@ FROM results;
 -- stats.capacity_warnings must be > 0 (warnings were issued)
 SELECT capacity_warnings > 0 AS has_warnings FROM xclaim.stats();
 
+-- A key rejected for capacity stays rejected in the same transaction: the
+-- failed try left no entry in the local set, so the second try goes to
+-- shared memory again, and the local count still equals the shared one.
+SELECT xclaim.try(1, 100) AS second_try;
+SELECT xclaim.count() AS local_count, capacity_used AS shared_count
+FROM xclaim.stats();
+
 ROLLBACK;
 
--- After rollback: count = 0
+-- After rollback: count = 0, and every local entry had its shared row
 SELECT xclaim.count() AS after_rollback;
+SELECT cleanup_misses FROM xclaim.stats();

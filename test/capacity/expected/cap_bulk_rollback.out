@@ -3,9 +3,10 @@
 --
 -- Invariant: when xclaim.try_many hits capacity exhaustion mid-batch
 -- under on_capacity_exhaustion='error', the catastrophic rollback path
--- HASH_REMOVE's already-inserted shared rows. The deferred live_capacity
--- flush never runs in that scenario, so the rollback path itself does
--- NOT touch live_capacity. We verify that AFTER the failed transaction
+-- HASH_REMOVE's already-inserted shared rows. Before the ERROR the
+-- capacity path released the partition lock and added the rows of that
+-- partition run to live_capacity, and the rollback subtracts every row it
+-- had added. We verify that AFTER the failed transaction
 -- aborts, xclaim.stats().capacity_used (sourced from live_capacity) is
 -- consistent with the actual number of rows visible in xclaim.debug().
 --

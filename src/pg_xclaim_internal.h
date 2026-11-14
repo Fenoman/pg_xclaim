@@ -169,7 +169,7 @@ typedef struct XClaimBackendInfo
  * cache line.
  *
  * Cost: at MaxBackends=100, the slot array grows from ~3.7 KB to
- * 12.5 KB -- negligible vs the ~360 MB shared dynahash. The
+ * 12.5 KB -- negligible vs the ~291 MB shared dynahash. The
  * `xclaim_shmem_size` formula already uses sizeof(XClaimBackendInfo),
  * which includes any tail padding the compiler inserts to satisfy
  * the alignment, so the request stays in lock-step with the actual

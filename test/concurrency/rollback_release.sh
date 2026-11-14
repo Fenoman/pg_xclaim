@@ -3,8 +3,12 @@
 # Rollback releases claim.
 #
 # Scenario:
-#   Session A: BEGIN; xclaim.try(1, 300) -> true; ROLLBACK
-#   Session B: xclaim.try(1, 300) -> true (A rolled back, entry released)
+#   Session A: BEGIN; xclaim.try(1, 300) -> true; ROLLBACK. A stays connected.
+#   Session B: xclaim.try(1, 300) -> true while A's backend is still alive.
+#
+# A is a holder session (_lib.sh) and closes only after B's check. Were A
+# gone before B, the backend-exit cleanup would release the claim and hide
+# a ROLLBACK that does not. B's check requires A's claim (true) first.
 #
 # HARD INVARIANTS: set -euo pipefail, /tmp cluster, ru_RU.UTF-8, trap cleanup
 set -euo pipefail
@@ -27,13 +31,35 @@ CSV_ROWS=()
 # ---------------------------------------------------------------------------
 echo "--- Test 1: rollback releases claim ---"
 
-pg_xclaim_psql -X -A -t <<'SQLA' >/dev/null 2>&1
-BEGIN;
-SELECT xclaim.try(1, 300);
-ROLLBACK;
-SQLA
+xclaim_holder_open
+xclaim_holder_sql "BEGIN;"
+xclaim_holder_sql "SELECT 'claim=' || xclaim.try(1, 300);"
+xclaim_holder_sql "ROLLBACK;"
+xclaim_holder_sql "SELECT 'rolled_back=' || pg_backend_pid();"
+A_VAL=""
+A_PID=""
+if xclaim_holder_wait '^rolled_back='; then
+    A_VAL="$(sed -n 's/^claim=//p' "$XCLAIM_HOLDER_OUT")"
+    A_PID="$(sed -n 's/^rolled_back=//p' "$XCLAIM_HOLDER_OUT")"
+fi
+A_STATE=""
+if [[ "$A_PID" =~ ^[0-9]+$ ]]; then
+    A_STATE="$(pg_xclaim_psql -X -A -t -q -v ON_ERROR_STOP=1 \
+        -c "SELECT state FROM pg_stat_activity WHERE pid = $A_PID;")"
+fi
+echo "  Session A: xclaim.try(1,300) = ${A_VAL:-none}, state after ROLLBACK '${A_STATE:-gone}'"
+if [[ "$A_VAL" == "true" && "$A_STATE" == "idle" ]]; then
+    echo "  PASS: A took the claim, rolled back and is still connected"
+    PASS=$(( PASS + 1 ))
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "rollback_release_a_true" "PASS" "result" "true" "A acquired, alive after ROLLBACK")")
+else
+    echo "  FAIL: A must take the claim (true) and stay connected and idle after ROLLBACK, output follows:" >&2
+    sed 's/^/    /' "$XCLAIM_HOLDER_OUT" >&2
+    FAIL=$(( FAIL + 1 ))
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "rollback_release_a_true" "FAIL" "result" "${A_VAL:-none}" "state ${A_STATE:-gone}")")
+fi
 
-B_RESULT="$(pg_xclaim_psql -X -A -t <<'SQLB' 2>/dev/null
+B_RESULT="$(pg_xclaim_psql -X -A -t -v ON_ERROR_STOP=1 <<'SQLB' 2>/dev/null
 BEGIN;
 SELECT xclaim.try(1, 300);
 ROLLBACK;
@@ -41,7 +67,8 @@ SQLB
 )"
 
 B_VAL="$(echo "$B_RESULT" | grep -E '^(t|f)$' | head -1 || echo "unknown")"
-echo "  Session B after A ROLLBACK: xclaim.try(1,300) = $B_VAL"
+echo "  Session B after A ROLLBACK, A still connected: xclaim.try(1,300) = $B_VAL"
+xclaim_holder_close
 
 if [[ "$B_VAL" == "t" ]]; then
     echo "  PASS: B got true after A rolled back"

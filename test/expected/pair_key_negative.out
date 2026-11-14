@@ -1,0 +1,57 @@
+-- test/sql/pair_key_negative.sql
+-- A pair key with a negative classid or objid packs into the same 64-bit
+-- image as its unsigned bit pattern, and debug() decomposes it back into
+-- the values the caller passed.
+\set VERBOSITY terse
+CREATE EXTENSION IF NOT EXISTS pg_xclaim;
+NOTICE:  extension "pg_xclaim" already exists, skipping
+BEGIN;
+SELECT xclaim.try(-1, 0) AS minus_one_zero,
+       xclaim.try(-2147483648, -1) AS int_min_minus_one,
+       xclaim.try(2147483647, -2147483648) AS int_max_int_min;
+ minus_one_zero | int_min_minus_one | int_max_int_min 
+----------------+-------------------+-----------------
+ t              | t                 | t
+(1 row)
+
+SELECT xclaim.try_many(-1, ARRAY[1, -1, 2147483647]) AS bulk_minus_one;
+ bulk_minus_one 
+----------------
+ {t,t,t}
+(1 row)
+
+-- Reentrant: the same pairs again.
+SELECT xclaim.try(-1, 0) AS reentrant_scalar,
+       xclaim.try_many(-1, ARRAY[1, -1]) AS reentrant_bulk;
+ reentrant_scalar | reentrant_bulk 
+------------------+----------------
+ t                | {t,t}
+(1 row)
+
+SELECT form, scope, key
+FROM xclaim.debug()
+WHERE form = 'pair'
+ORDER BY scope, key;
+ form |    scope    |     key     
+------+-------------+-------------
+ pair | -2147483648 |          -1
+ pair |          -1 |          -1
+ pair |          -1 |           0
+ pair |          -1 |           1
+ pair |          -1 |  2147483647
+ pair |  2147483647 | -2147483648
+(6 rows)
+
+SELECT xclaim.count() AS held;
+ held 
+------
+    6
+(1 row)
+
+ROLLBACK;
+SELECT xclaim.count() AS held_after_rollback;
+ held_after_rollback 
+---------------------
+                   0
+(1 row)
+
