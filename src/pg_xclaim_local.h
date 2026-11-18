@@ -26,14 +26,20 @@
  *         xclaim_local_lookup_with_hash(key, hashvalue, &out)
  *           bulk/precomputed-hash fast path that forwards to simplehash's
  *           `_hash` variant.
- *         xclaim_local_add(key, hashvalue, partition_id)
- *           xclaim.try: entry in the set before the partition LWLock
- *         xclaim_local_note_held(key, hashvalue)
- *           records an added entry as held after the shared insert
+ *         xclaim_local_add(key, hashvalue, partition_id, &already_staged)
+ *           xclaim.try: staged entry in the set before the partition LWLock
+ *         xclaim_local_stage(key, hashvalue, partition_id, &bulk_target)
+ *           xclaim.try_many: stages one slot of a partition run before LWLock
+ *         xclaim_local_find_entry(key, hashvalue)
+ *           xclaim.try_many: O(1) lookup of a staged or held entry
+ *         xclaim_local_unstage(key, hashvalue)
+ *           xclaim.try_many: deletes a staged entry that was not acquired
+ *         xclaim_local_demote_to_staged(key, hashvalue)
+ *           xclaim.try_many: demotes a rolled-back pre-staged entry back to staged
+ *         xclaim_local_note_held(entry)
+ *           promotes a staged entry to held after the shared insert
  *         xclaim_local_drop(entry)
  *           deletes an added entry that was not recorded
- *         xclaim_local_insert_held(key, hashvalue, partition_id)
- *           add + note_held, xclaim.try_many under the partition LWLock
  *         xclaim_local_remove(key)
  *           rollback of a recorded entry (xclaim.try_many PG_CATCH)
  *   * Sizing:
@@ -170,12 +176,12 @@ extern void xclaim_local_shrink(bool force);
  *      keys that, with the claims held, take half of the first bucket
  *      array or more. A set less than XCLAIM_SHRINK_FACTOR times the size
  *      the call needs restarts the streak of small cleanups, a larger one
- *      shrinks here once the streak is complete. A set shrunk after a
- *      burst grows toward twice the room the claims need, up to the
- *      largest size it shrank from. May ERROR (out of memory) with the set
- *      at its size before the growth.
+ *      shrinks here once the streak is complete. Returns the post-shrink
+ *      re-expansion target (up to `XClaimLocalShrunkFrom`, or 0 if none) so
+ *      `xclaim_local_stage` applies that jump lazily only on the first
+ *      genuinely new key rather than on repeated already-held keys.
  */
-extern void xclaim_local_prepare_bulk(uint64 nkeys);
+extern uint64 xclaim_local_prepare_bulk(uint64 nkeys);
 extern void xclaim_local_emit_peak_warning(void);
 
 /*
@@ -258,35 +264,75 @@ extern bool xclaim_local_lookup_with_hash(const XClaimKey *key,
                                           uint32 hashvalue,
                                           XClaimLocalEntry **out);
 
+/* `held` values of a local entry. */
+#define XCLAIM_LOCAL_STAGED     0   /* staged before LWLock, not yet held */
+#define XCLAIM_LOCAL_HELD       1   /* taken, not yet visited by cleanup */
+#define XCLAIM_LOCAL_VISITED    2   /* gathered by the current list cleanup */
+
+/* Return codes of xclaim_local_stage(). */
+typedef enum XClaimStageState
+{
+    XCLAIM_STAGE_FRESH = 0,         /* newly inserted as XCLAIM_LOCAL_STAGED */
+    XCLAIM_STAGE_ALREADY_STAGED,    /* already staged by an earlier slot/call */
+    XCLAIM_STAGE_ALREADY_HELD       /* already held by this backend          */
+} XClaimStageState;
+
 /*
  * xclaim_local_add
- *      Put an entry for `key` into the set. PRECONDITION: caller has
- *      already verified the key is NOT present (via xclaim_local_lookup)
- *      AND xclaim_ensure_owner_token() has run. Allocates inside
- *      XClaimLocalContext via the simplehash machinery (a growth can
- *      raise an out-of-memory ERROR), and status is initialised by
- *      simplehash. Changes no count: see xclaim_local_note_held.
+ *      Put a staged entry for `key` into the set. PRECONDITION: caller has
+ *      already verified the key is NOT held (via xclaim_local_lookup) AND
+ *      xclaim_ensure_owner_token() has run. Sets `*already_staged = true`
+ *      when an outer xclaim.try_many already staged `key`, so a failed
+ *      reentrant scalar call inside an emit_log_hook does not drop the
+ *      outer call's staged entry. Allocates inside XClaimLocalContext via
+ *      simplehash, changing no count until xclaim_local_note_held.
  *
- * xclaim_local_note_held
- *      Record an added entry as held, once its shared row is taken:
- *      live count, peak, held-key list and the 75% hint. Allocates
+ * xclaim_local_stage
+ *      Bulk partition-chunk pre-staging before LWLockAcquire. Returns
+ *      XCLAIM_STAGE_ALREADY_HELD when `key` is already held,
+ *      XCLAIM_STAGE_ALREADY_STAGED when `key` was already staged earlier,
+ *      or XCLAIM_STAGE_FRESH when a new staged entry was inserted. Any
+ *      simplehash growth runs here with no partition LWLock held.
+ *
+ * xclaim_local_find_entry
+ *      O(1) lookup by precomputed hash returning the local entry whether
+ *      staged or held. Allocates nothing.
+ *
+ * xclaim_local_unstage
+ *      Deletes a staged entry (`held == XCLAIM_LOCAL_STAGED`) by key and
+ *      hash. No-op when absent or already promoted to held. Allocates
  *      nothing and raises no ERROR.
  *
- * xclaim_local_insert_held
- *      xclaim_local_add followed by xclaim_local_note_held.
+ * xclaim_local_demote_to_staged
+ *      Demotes a held entry back to XCLAIM_LOCAL_STAGED and decrements the
+ *      live count without deleting the bucket. Used when a nested
+ *      xclaim.try_many rolls back a key that an outer xclaim.try_many had
+ *      already staged. Allocates nothing and raises no ERROR.
+ *
+ * xclaim_local_note_held
+ *      Promotes an added/staged entry to held once its shared row is
+ *      taken: sets `held = XCLAIM_LOCAL_HELD` and updates live count,
+ *      peak, held-key list and the 75% hint. Allocates nothing and raises
+ *      no ERROR.
  *
  * xclaim_local_drop
- *      Delete the entry that xclaim_local_add returned and
+ *      Delete the entry that xclaim_local_add freshly created and
  *      xclaim_local_note_held did not record, before any other insert into
  *      or delete from the set. Raises no ERROR.
  */
 extern XClaimLocalEntry *xclaim_local_add(const XClaimKey *key,
                                           uint32 hashvalue,
-                                          uint32 partition_id);
-extern void xclaim_local_note_held(const XClaimKey *key, uint32 hashvalue);
-extern void xclaim_local_insert_held(const XClaimKey *key,
-                                     uint32 hashvalue,
-                                     uint32 partition_id);
+                                          uint32 partition_id,
+                                          bool *already_staged);
+extern XClaimStageState xclaim_local_stage(const XClaimKey *key,
+                                           uint32 hashvalue,
+                                           uint32 partition_id,
+                                           uint64 *bulk_target_inout);
+extern XClaimLocalEntry *xclaim_local_find_entry(const XClaimKey *key,
+                                                 uint32 hashvalue);
+extern void xclaim_local_unstage(const XClaimKey *key, uint32 hashvalue);
+extern void xclaim_local_demote_to_staged(const XClaimKey *key, uint32 hashvalue);
+extern void xclaim_local_note_held(XClaimLocalEntry *entry);
 extern void xclaim_local_drop(XClaimLocalEntry *entry);
 
 /*

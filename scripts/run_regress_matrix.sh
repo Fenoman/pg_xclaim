@@ -180,17 +180,21 @@ echo " REGRESS MATRIX SUMMARY"
 echo "================================================================"
 
 FAILED_COUNT=0
+SKIPPED_COUNT=0
 for r in "${RESULTS[@]}"; do
     rc="${r##*:}"
     if [[ "$rc" -eq 0 ]]; then
         echo "  PASS  $r"
+    elif [[ "$rc" -eq 77 ]]; then
+        echo "  SKIP  $r"
+        SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
     else
         echo "  FAIL  $r" >&2
         FAILED_COUNT=$((FAILED_COUNT + 1))
     fi
 done
 echo ""
-echo "Total steps: ${#RESULTS[@]}    Failures: $FAILED_COUNT"
+echo "Total steps: ${#RESULTS[@]}    Skipped: $SKIPPED_COUNT    Failures: $FAILED_COUNT"
 
 [[ "$FAILED_COUNT" -eq 0 ]] || exit 1
 exit 0

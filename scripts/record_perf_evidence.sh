@@ -120,6 +120,8 @@ fi
 
 # --- Cluster setup --------------------------------------------------------
 PGDATA="$(mktemp -d "/tmp/pg_xclaim_evidence_${USER:-root}_$$.XXXXXX")"
+RUN_SCRATCH="$(mktemp -d "/tmp/pg_xclaim_evidence_scratch_${USER:-root}_$$.XXXXXX")"
+chmod 700 "$RUN_SCRATCH"
 
 # Free-port probe -- python3 is available on Linux CI/dev hosts. A blind
 # random port pick can collide with an in-use port and fail boot.
@@ -151,8 +153,15 @@ restore_sysctls() {
 }
 
 cleanup() {
-    runuser -u "$RUN_USER" -- "$PGBIN/pg_ctl" stop -D "$PGDATA" -m immediate >/dev/null 2>&1 || true
-    rm -rf "${PGDATA:?}"
+    local st=0
+    runuser -u "$RUN_USER" -- "$PGBIN/pg_ctl" stop -D "$PGDATA" -m immediate -w >/dev/null 2>&1 || true
+    rm -rf "${RUN_SCRATCH:?}"
+    if [[ ! -e "$PGDATA/postmaster.pid" ]]; then
+        rm -rf "${PGDATA:?}"
+        return 0
+    fi
+    runuser -u "$RUN_USER" -- "$PGBIN/pg_ctl" status -D "$PGDATA" >/dev/null 2>&1 || st=$?
+    [[ "$st" -eq 3 ]] && rm -rf "${PGDATA:?}" || true
 }
 # Restore sysctls FIRST so a failing rm in cleanup() can never leave the
 # kernel with relaxed kptr_restrict / perf_event_paranoid settings.
@@ -182,6 +191,7 @@ pg_xclaim.max_claims = 4194304
 pg_xclaim.num_partitions = 128
 pg_xclaim.expected_claims_per_backend = 1048576
 log_min_messages = warning
+lc_messages = 'C'
 logging_collector = off
 max_connections = 64
 # 10ms sampling -> ~100 samples/sec/backend. A 12s window gives 1200
@@ -205,7 +215,8 @@ PERF_STAT_EVENTS="cycles,instructions,cache-references,cache-misses,LLC-load-mis
 run_scenario() {
     local NAME="$1" SQL="$2" WINDOW="$3" CONCURRENT="${4:-0}"
 
-    local PERF_REC="/tmp/${NAME}_rec_$$.perf.data"
+    local PERF_REC="$RUN_SCRATCH/${NAME}_rec.perf.data"
+    local PERF_STAT_TMP="$RUN_SCRATCH/${NAME}_perfstat.txt"
     local PERF_STAT_OUT="$PERFSTAT_DIR/$NAME.txt"
     local SVG="$FLAME_DIR/$NAME.svg"
     local WAIT_CSV="$WAITEV_DIR/$NAME.csv"
@@ -216,7 +227,7 @@ run_scenario() {
     echo "============================================"
 
     # --- Pass 1: perf record + pg_wait_sampling capture ------------------
-    runuser -u "$RUN_USER" -- "$PGBIN/psql" -h "$PGSOCKET" -p "$PGPORT" \
+    runuser -u "$RUN_USER" -- "$PGBIN/psql" -X -h "$PGSOCKET" -p "$PGPORT" \
         -U postgres -d postgres -c "SELECT pg_wait_sampling_reset_profile();" >/dev/null
 
     perf record -F 997 -g -a -o "$PERF_REC" -- sleep "$WINDOW" &
@@ -224,25 +235,53 @@ run_scenario() {
     sleep 1
 
     SCENARIO_PSQL_PIDS=()
+    local ERR_LOG1="$RUN_SCRATCH/${NAME}_pass1_err.log"
+    : > "$ERR_LOG1"
     if [[ "$CONCURRENT" -eq 0 ]]; then
-        runuser -u "$RUN_USER" -- "$PGBIN/psql" -h "$PGSOCKET" -p "$PGPORT" \
-            -U postgres -d postgres -c "$SQL" >/dev/null 2>&1 || true
+        if ! LC_MESSAGES=C runuser -u "$RUN_USER" -- "$PGBIN/psql" -X -h "$PGSOCKET" -p "$PGPORT" \
+            -U postgres -d postgres -v ON_ERROR_STOP=1 -c "$SQL" >/dev/null 2>"$ERR_LOG1"; then
+            echo "record_perf_evidence: pass 1 scenario $NAME psql failed:" >&2
+            cat "$ERR_LOG1" >&2
+            kill "$PERF_PID" 2>/dev/null || true
+            wait "$PERF_PID" 2>/dev/null || true
+            rm -f "$ERR_LOG1" "$PERF_REC"
+            return 1
+        fi
     else
         local w
         for w in $(seq 1 "$CONCURRENT"); do
-            runuser -u "$RUN_USER" -- "$PGBIN/psql" -h "$PGSOCKET" -p "$PGPORT" \
-                -U postgres -d postgres -c "$SQL" >/dev/null 2>&1 &
+            LC_MESSAGES=C runuser -u "$RUN_USER" -- "$PGBIN/psql" -X -h "$PGSOCKET" -p "$PGPORT" \
+                -U postgres -d postgres -v ON_ERROR_STOP=1 -c "$SQL" >/dev/null 2>>"$ERR_LOG1" &
             SCENARIO_PSQL_PIDS+=("$!")
         done
     fi
-    wait "$PERF_PID" 2>/dev/null || true
-    # Kill exactly the psql clients this scenario spawned (by PID), never a
-    # `pkill -f` pattern that could also match unrelated psql processes.
+    local PERF_RC1=0
+    wait "$PERF_PID" 2>/dev/null || PERF_RC1=$?
+    local WORKER_ERR1=0
     if [[ "${#SCENARIO_PSQL_PIDS[@]}" -gt 0 ]]; then
-        kill "${SCENARIO_PSQL_PIDS[@]}" 2>/dev/null || true
-        wait "${SCENARIO_PSQL_PIDS[@]}" 2>/dev/null || true
+        local wpid wrc
+        for wpid in "${SCENARIO_PSQL_PIDS[@]}"; do
+            wrc=0
+            kill "$wpid" 2>/dev/null || true
+            wait "$wpid" 2>/dev/null || wrc=$?
+            if [[ "$wrc" -ne 0 && "$wrc" -ne 143 ]]; then
+                WORKER_ERR1=1
+            fi
+        done
         SCENARIO_PSQL_PIDS=()
     fi
+    if [[ "$PERF_RC1" -ne 0 ]]; then
+        echo "record_perf_evidence: pass 1 scenario $NAME perf record exited with $PERF_RC1" >&2
+        rm -f "$ERR_LOG1" "$PERF_REC"
+        return 1
+    fi
+    if [[ "$WORKER_ERR1" -ne 0 ]] || { grep -vE 'terminating connection|canceling statement|connection to server was lost' "$ERR_LOG1" | grep -qE 'psql:|ERROR:|FATAL:|PANIC:'; }; then
+        echo "record_perf_evidence: pass 1 scenario $NAME worker error:" >&2
+        cat "$ERR_LOG1" >&2
+        rm -f "$ERR_LOG1" "$PERF_REC"
+        return 1
+    fi
+    rm -f "$ERR_LOG1"
     sleep 1
 
     # Snapshot the cumulative pg_wait_sampling profile (reset above, so
@@ -250,6 +289,8 @@ run_scenario() {
     # `Activity:*` wait_event_type -- those are background workers (and
     # idle client backends) parked on their main loops, not real waits
     # during our workload. We want LWLock, Lock, IO, IPC, etc.
+    local WAIT_CSV_TMP="$RUN_SCRATCH/${NAME}_waits.csv"
+    local SVG_TMP="$RUN_SCRATCH/${NAME}.svg"
     runuser -u "$RUN_USER" -- "$PGBIN/psql" -h "$PGSOCKET" -p "$PGPORT" \
         -U postgres -d postgres -A -F',' -c "
             COPY (
@@ -262,7 +303,7 @@ run_scenario() {
                 ORDER BY samples DESC
                 LIMIT 20
             ) TO STDOUT WITH CSV HEADER
-        " > "$WAIT_CSV"
+        " > "$WAIT_CSV_TMP"
 
     echo "  perf.data: $(stat -c%s "$PERF_REC") bytes"
 
@@ -272,8 +313,8 @@ run_scenario() {
         | grep "^postgres" \
         | "$FLAMEGRAPH_DIR/flamegraph.pl" --colors hot --width 1600 \
             --title "$NAME (PG $PG_MAJOR, $ARCH Linux)" \
-        > "$SVG"
-    echo "  SVG: $SVG ($(stat -c%s "$SVG") bytes)"
+        > "$SVG_TMP"
+    echo "  SVG: $SVG ($(stat -c%s "$SVG_TMP") bytes)"
 
     echo "  Top-15 leaves:"
     perf script -i "$PERF_REC" 2>/dev/null \
@@ -293,9 +334,9 @@ for leaf, cnt in agg.most_common(15):
 "
     rm -f "$PERF_REC"
 
-    echo "  pg_wait_sampling: $WAIT_CSV ($(wc -l < "$WAIT_CSV") lines)"
+    echo "  pg_wait_sampling: $WAIT_CSV ($(wc -l < "$WAIT_CSV_TMP") lines)"
     echo "  Top wait events:"
-    awk -F',' 'NR>1 {printf "    %6d  %s:%s\n", $3, $1, $2}' "$WAIT_CSV" | head -5
+    awk -F',' 'NR>1 {printf "    %6d  %s:%s\n", $3, $1, $2}' "$WAIT_CSV_TMP" | head -5
 
     # --- Pass 2: perf stat for HW counters (no -g, no record overhead) ---
     echo ""
@@ -306,36 +347,65 @@ for leaf, cnt in agg.most_common(15):
         echo "# Window: ${WINDOW}s, concurrent=$CONCURRENT"
         echo "# Events: $PERF_STAT_EVENTS"
         echo ""
-    } > "$PERF_STAT_OUT"
+    } > "$PERF_STAT_TMP"
 
-    perf stat -e "$PERF_STAT_EVENTS" -a -o /tmp/perfstat_$$.txt --append -- sleep "$WINDOW" &
+    perf stat -e "$PERF_STAT_EVENTS" -a -o "$PERF_STAT_TMP" --append -- sleep "$WINDOW" &
     local STAT_PID=$!
     sleep 1
 
     SCENARIO_PSQL_PIDS=()
+    local ERR_LOG2="$RUN_SCRATCH/${NAME}_pass2_err.log"
+    : > "$ERR_LOG2"
     if [[ "$CONCURRENT" -eq 0 ]]; then
-        runuser -u "$RUN_USER" -- "$PGBIN/psql" -h "$PGSOCKET" -p "$PGPORT" \
-            -U postgres -d postgres -c "$SQL" >/dev/null 2>&1 || true
+        if ! LC_MESSAGES=C runuser -u "$RUN_USER" -- "$PGBIN/psql" -X -h "$PGSOCKET" -p "$PGPORT" \
+            -U postgres -d postgres -v ON_ERROR_STOP=1 -c "$SQL" >/dev/null 2>"$ERR_LOG2"; then
+            echo "record_perf_evidence: pass 2 scenario $NAME psql failed:" >&2
+            cat "$ERR_LOG2" >&2
+            kill "$STAT_PID" 2>/dev/null || true
+            wait "$STAT_PID" 2>/dev/null || true
+            rm -f "$ERR_LOG2" "$PERF_STAT_TMP"
+            return 1
+        fi
     else
         local w
         for w in $(seq 1 "$CONCURRENT"); do
-            runuser -u "$RUN_USER" -- "$PGBIN/psql" -h "$PGSOCKET" -p "$PGPORT" \
-                -U postgres -d postgres -c "$SQL" >/dev/null 2>&1 &
+            LC_MESSAGES=C runuser -u "$RUN_USER" -- "$PGBIN/psql" -X -h "$PGSOCKET" -p "$PGPORT" \
+                -U postgres -d postgres -v ON_ERROR_STOP=1 -c "$SQL" >/dev/null 2>>"$ERR_LOG2" &
             SCENARIO_PSQL_PIDS+=("$!")
         done
     fi
-    wait "$STAT_PID" 2>/dev/null || true
-    # Kill exactly the psql clients this scenario spawned (by PID), never a
-    # `pkill -f` pattern that could also match unrelated psql processes.
+    local STAT_RC=0
+    wait "$STAT_PID" 2>/dev/null || STAT_RC=$?
+    local WORKER_ERR2=0
     if [[ "${#SCENARIO_PSQL_PIDS[@]}" -gt 0 ]]; then
-        kill "${SCENARIO_PSQL_PIDS[@]}" 2>/dev/null || true
-        wait "${SCENARIO_PSQL_PIDS[@]}" 2>/dev/null || true
+        local wpid wrc
+        for wpid in "${SCENARIO_PSQL_PIDS[@]}"; do
+            wrc=0
+            kill "$wpid" 2>/dev/null || true
+            wait "$wpid" 2>/dev/null || wrc=$?
+            if [[ "$wrc" -ne 0 && "$wrc" -ne 143 ]]; then
+                WORKER_ERR2=1
+            fi
+        done
         SCENARIO_PSQL_PIDS=()
     fi
+    if [[ "$STAT_RC" -ne 0 ]]; then
+        echo "record_perf_evidence: pass 2 scenario $NAME perf stat exited with $STAT_RC" >&2
+        rm -f "$ERR_LOG2" "$PERF_STAT_TMP"
+        return 1
+    fi
+    if [[ "$WORKER_ERR2" -ne 0 ]] || { grep -vE 'terminating connection|canceling statement|connection to server was lost' "$ERR_LOG2" | grep -qE 'psql:|ERROR:|FATAL:|PANIC:'; }; then
+        echo "record_perf_evidence: pass 2 scenario $NAME worker error:" >&2
+        cat "$ERR_LOG2" >&2
+        rm -f "$ERR_LOG2" "$PERF_STAT_TMP"
+        return 1
+    fi
+    rm -f "$ERR_LOG2"
     sleep 1
 
-    cat /tmp/perfstat_$$.txt >> "$PERF_STAT_OUT"
-    rm -f /tmp/perfstat_$$.txt
+    mv "$WAIT_CSV_TMP" "$WAIT_CSV"
+    mv "$SVG_TMP" "$SVG"
+    mv "$PERF_STAT_TMP" "$PERF_STAT_OUT"
 
     # Parse + echo headline metrics. The `|| true` keeps the loop alive
     # even if parsing hits an unexpected `perf stat` layout (e.g. a

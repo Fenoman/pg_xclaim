@@ -2,14 +2,15 @@
  *
  * pg_xclaim_stats.c
  *      Atomic-counter stats, capacity watermark logging, backend-local
- *      count, debug introspection (shared-state snapshots), and
- *      the test-only stale-entry injector.
+ *      count, and debug introspection (shared-state snapshots).
  *
  * Surface summary:
  *   xclaim.count             -- backend-local count, PARALLEL RESTRICTED
  *                               STABLE.
- *   xclaim.debug             -- consistent, all-partition LWLock,
- *                               superuser only. PARALLEL UNSAFE STABLE.
+ *   xclaim.debug             -- consistent all-partition LWLock snapshot,
+ *                               restricted by default via REVOKE FROM PUBLIC
+ *                               (delegable via GRANT EXECUTE). PARALLEL
+ *                               UNSAFE STABLE.
  *   xclaim.debug_snapshot    -- all-partition shared LWLock snapshot,
  *                               pg_monitor. PARALLEL RESTRICTED STABLE.
  *   xclaim.stats             -- 14 columns (counters / gauges), 80/90/95%
@@ -19,11 +20,6 @@
  *                               debug_snapshot and stats keep reporting
  *                               the claims taken before it, and none of
  *                               them counts in `disabled_calls`.
- *   xclaim.debug_inject_stale -- superuser-only test helper that seeds
- *                                an XClaimEntry with a guaranteed-stale
- *                                owner triple so the reaper test can
- *                                observe a successful reap.
- *                                PARALLEL UNSAFE VOLATILE.
  *
  * HARD invariants enforced here:
  *   * stats counters read via pg_atomic_read_u64 (lock-free atomic load).
@@ -437,17 +433,30 @@ xclaim_stats(PG_FUNCTION_ARGS)
     /*
      * capacity_pct as numeric(5,2). Numeric arithmetic avoids the float
      * precision pitfalls that would show up in regression tests
-     * (e.g. 99.99% rendered as 99.99000003 by float).
+     * (e.g. 99.99% rendered as 99.99000003 by float). Clamp into
+     * [0.00, 999.99] so a transient unlocked counter skew or anomalous
+     * live_capacity never crashes monitoring queries with 22003
+     * numeric field overflow.
      */
     {
-        Datum   used_d   = DirectFunctionCall1(int8_numeric, Int64GetDatum(capacity_used));
-        Datum   max_d    = DirectFunctionCall1(int8_numeric, Int64GetDatum(capacity_max));
+        int64   pct_used = (capacity_used < 0) ? 0 : capacity_used;
+        int64   pct_max  = (capacity_max > 0) ? capacity_max : 1;
+        Datum   used_d   = DirectFunctionCall1(int8_numeric, Int64GetDatum(pct_used));
+        Datum   max_d    = DirectFunctionCall1(int8_numeric, Int64GetDatum(pct_max));
         Datum   hundred  = DirectFunctionCall1(int8_numeric, Int64GetDatum((int64) 100));
         Datum   numerator = DirectFunctionCall2(numeric_mul, used_d, hundred);
         Datum   pct_raw  = DirectFunctionCall2(numeric_div, numerator, max_d);
+        Datum   cap_ceil = DirectFunctionCall3(numeric_in,
+                                               CStringGetDatum("999.99"),
+                                               ObjectIdGetDatum(InvalidOid),
+                                               Int32GetDatum(-1));
         /* Force scale 2 (numeric(5,2) -- typmod = ((5 << 16) | 2) + VARHDRSZ). */
         int32   typmod   = ((5 << 16) | 2) + VARHDRSZ;
-        Datum   pct_clamped = DirectFunctionCall2(numeric, pct_raw, Int32GetDatum(typmod));
+        Datum   pct_clamped;
+
+        if (DatumGetBool(DirectFunctionCall2(numeric_gt, pct_raw, cap_ceil)))
+            pct_raw = cap_ceil;
+        pct_clamped = DirectFunctionCall2(numeric, pct_raw, Int32GetDatum(typmod));
         capacity_pct_num = DatumGetNumeric(pct_clamped);
     }
 
@@ -732,14 +741,15 @@ xclaim_debug_snapshot(PG_FUNCTION_ARGS)
 }
 
 /* -------------------------------------------------------------------- */
-/* xclaim.debug() -- consistent all-partition snapshot.                */
+/* xclaim.debug() -- consistent all-partition snapshot.                 */
 /*                                                                      */
 /* PARALLEL UNSAFE STABLE. Same snapshot as xclaim.debug_snapshot().    */
-/* SQL surface restricted to superuser via REVOKE PUBLIC (no GRANT).    */
+/* SQL surface restricted by default via REVOKE FROM PUBLIC (no default */
+/* GRANT, delegable by the DBA via GRANT EXECUTE).                      */
 /*                                                                      */
-/* Use case: regression tests that need a single consistent snapshot   */
-/* across all partitions. NOT for routine production polling. Use      */
-/* xclaim.stats() for steady observability.                            */
+/* Use case: regression tests and triage queries that need a single     */
+/* consistent snapshot across all partitions. NOT for routine           */
+/* production polling. Use xclaim.stats() for steady observability.     */
 /* -------------------------------------------------------------------- */
 
 PG_FUNCTION_INFO_V1(xclaim_debug);
@@ -751,116 +761,4 @@ xclaim_debug(PG_FUNCTION_ARGS)
 
     xclaim_debug_materialize(fcinfo, "xclaim.debug()");
     return (Datum) 0;
-}
-
-/* -------------------------------------------------------------------- */
-/* xclaim.debug_inject_stale(scope int4, key int4) -- test helper.      */
-/*                                                                      */
-/* SUPERUSER ONLY. Used by the stale-owner reaper test to seed an       */
-/* XClaimEntry whose owner triple is GUARANTEED stale (procno = INT_MAX */
-/* is out of MaxBackends range -> reaper signal "out-of-range procno"). */
-/*                                                                      */
-/* NOT FOR PRODUCTION (DBA runbook caveat). The function bypasses the   */
-/* normal acquisition path -- there is no local-set entry, no owner-    */
-/* token-publish, no xact callback registration -- it is a pure shared- */
-/* state injection.                                                     */
-/* -------------------------------------------------------------------- */
-
-PG_FUNCTION_INFO_V1(xclaim_debug_inject_stale);
-
-Datum
-xclaim_debug_inject_stale(PG_FUNCTION_ARGS)
-{
-    int32       scope;
-    int32       key;
-    XClaimKey   lk;
-    uint32      hashvalue;
-    LWLock     *plock;
-    XClaimEntry *new_entry;
-    bool        found;
-
-    XCLAIM_REQUIRE_INIT();
-
-    /*
-     * Superuser gate (defense-in-depth, SQL surface also REVOKEs from
-     * PUBLIC). Without superuser, refuse to inject stale state.
-     */
-    if (!superuser())
-        ereport(ERROR,
-                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-                 errmsg("xclaim.debug_inject_stale requires superuser")));
-
-    if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
-        ereport(ERROR,
-                (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-                 errmsg("xclaim.debug_inject_stale arguments must not be NULL")));
-
-    scope = PG_GETARG_INT32(0);
-    key   = PG_GETARG_INT32(1);
-
-    memset(&lk, 0, sizeof(lk));
-    lk.dbid = MyDatabaseId;
-    lk.form = XCLAIM_FORM_PAIR;
-    lk.k1   = (int64) (((uint64) (uint32) scope << 32) | (uint32) key);
-
-    hashvalue = xclaim_compute_hash(&lk);
-    plock = xclaim_partition_lock(hashvalue);
-
-    LWLockAcquire(plock, LW_EXCLUSIVE);
-
-    new_entry = (XClaimEntry *) hash_search_with_hash_value(XClaimHash,
-                                                            &lk,
-                                                            hashvalue,
-                                                            HASH_ENTER_NULL,
-                                                            &found);
-    if (new_entry == NULL)
-    {
-        LWLockRelease(plock);
-        ereport(ERROR,
-                (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-                 errmsg("xclaim.debug_inject_stale: max_claims exhausted")));
-    }
-
-    /*
-     * Refuse to overwrite a live entry. Without this guard, injecting
-     * "stale" state on a key that some backend legitimately holds would
-     * synthesize a guaranteed-stale owner triple on top of the real
-     * owner -- the next caller's reaper would treat the live claim as
-     * stale and recycle it, silently violating mutual exclusion.
-     *
-     * The helper is intended exclusively to seed reaper test cases on
-     * keys that no one holds. Overwriting a live claim is never a valid
-     * use case, so make it loudly fail rather than corrupt state.
-     */
-    if (found)
-    {
-        LWLockRelease(plock);
-        ereport(ERROR,
-                (errcode(ERRCODE_OBJECT_IN_USE),
-                 errmsg("xclaim.debug_inject_stale: key (%d,%d) is live; refusing to overwrite",
-                        scope, key),
-                 errhint("Pick a key that is not currently held by any backend.")));
-    }
-    pg_atomic_fetch_add_u64(&XClaimCtl->live_capacity, 1);
-
-    /*
-     * Synthesize a guaranteed-stale owner triple:
-     *   - procno = INT32_MAX -> out of [0, MaxBackends) -> hits the
-     *     reaper's "out-of-range procno" check, which precedes
-     *     signal 1 (proc slot empty) in pg_xclaim_reaper.c.
-     *   - owner_pid = 999999 -> sentinel, matched against the dead PGPROC
-     *     pid, but the procno bounds check fires first.
-     *   - owner_token = 0 -> reserved-invalid, never legitimately issued
-     *     (next_token starts at 1).
-     *   - owner_lxid = 0 -> never matches a live xact (lxids start at 1).
-     */
-    new_entry->owner_pid     = 999999;
-    new_entry->owner_procno  = INT32_MAX;
-    new_entry->owner_lxid    = 0;
-    new_entry->owner_token   = 0;
-    new_entry->lifetime_kind = XCLAIM_LIFETIME_XACT;
-
-    LWLockRelease(plock);
-
-    PG_RETURN_VOID();
 }

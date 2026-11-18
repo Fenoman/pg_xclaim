@@ -17,8 +17,8 @@ SCRIPT="commit_release"
 LIB_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$LIB_DIR/_lib.sh"
 
-pg_xclaim_start_temp_cluster "commit_release"
 trap pg_xclaim_stop_temp_cluster EXIT INT TERM
+pg_xclaim_start_temp_cluster "commit_release"
 
 xclaim_banner "$SCRIPT"
 

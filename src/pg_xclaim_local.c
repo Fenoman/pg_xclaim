@@ -159,9 +159,7 @@ static bool            XClaimMyExitCbRegistered = false;    /* once per backend 
  */
 #define XCLAIM_HELD_LIST_RATIO  64
 
-/* `held` values of a local entry. */
-#define XCLAIM_LOCAL_HELD       1   /* taken, not yet visited by cleanup */
-#define XCLAIM_LOCAL_VISITED    2   /* gathered by the current list cleanup */
+/* `held` values come from pg_xclaim_local.h (STAGED=0, HELD=1, VISITED=2). */
 
 typedef struct XClaimHeldKey
 {
@@ -190,11 +188,12 @@ static XClaimLocalEntry **XClaimCleanupBuf   = NULL;    /* XClaimHeldListCap */
 /* enlarged set at once.                                                */
 /*                                                                      */
 /* A later xclaim.try_many whose keys take half of the first array or  */
-/* more grows the set toward the largest size it shrank from, before    */
-/* its first partition LWLock (xclaim_local_prepare_bulk): its runs     */
-/* would otherwise grow the set again under their locks. Such a call    */
-/* restarts the streak only while the set is less than                  */
-/* XCLAIM_SHRINK_FACTOR times the size the call needs.                  */
+/* more computes its post-shrink re-expansion target toward the largest */
+/* size it shrank from (xclaim_local_prepare_bulk), and applies that    */
+/* jump lazily in xclaim_local_stage on the first distinct unheld key   */
+/* (with no partition LWLock held) so repeated held keys never enlarge  */
+/* a shrunk set. Such a call restarts the streak only while the set is  */
+/* less than XCLAIM_SHRINK_FACTOR times the size the call needs.        */
 /* -------------------------------------------------------------------- */
 
 #define XCLAIM_SHRINK_AFTER     64
@@ -219,23 +218,18 @@ static uint64 XClaimLocalShrunkFrom     = 0;    /* largest size before a shrink 
 /* and every later insert would try to grow again, even into an empty   */
 /* set.                                                                 */
 /*                                                                      */
-/* Every bucket array of a growth or of the creation comes from        */
-/* xcl_local_allocate(), and XClaimLocalArraySize holds the bucket      */
-/* count of the array the set uses. xclaim_local_shrink() puts its own  */
-/* smaller array into the empty set and records its count as well.      */
-/* When the allocation for a growth fails, the allocator gives the set  */
-/* the size, mask and grow threshold of that array back, the way        */
-/* simplehash computes them, BEFORE the out-of-memory ERROR is raised.  */
-/* The ERROR can turn into FATAL (exit_on_error = on), which skips      */
-/* every PG_CATCH, and the cleanup at backend exit walks the set. One   */
-/* insert can grow the set more than once (a long probe right after a   */
-/* growth grows it again), and every growth allocates here, so the set  */
-/* comes back to the array it uses whichever growth fails.              */
+/* Allocator. Every bucket array of a growth or creation comes from     */
+/* xcl_local_allocate(), while XClaimLocalArraySize tracks the bucket   */
+/* count of the active array (and xclaim_local_shrink() updates it for  */
+/* its shrunk array). One insert can grow twice on a long probe, and    */
+/* every growth goes through this allocator.                            */
 /*                                                                      */
-/* The first attempt does not raise the ERROR (MCXT_ALLOC_NO_OOM). With */
-/* the geometry restored, a second attempt raises the server's own      */
-/* out-of-memory ERROR when memory is still short, and when it          */
-/* succeeds, the set takes the geometry of the new array again.         */
+/* Error escalation. When a growth fails under MCXT_ALLOC_NO_OOM, the   */
+/* allocator restores the active array's size, mask and grow threshold  */
+/* BEFORE repeating the request without MCXT_ALLOC_NO_OOM to raise the  */
+/* server's out-of-memory ERROR (or adopt the new geometry if memory    */
+/* freed up). If exit_on_error = on turns that ERROR into FATAL and     */
+/* skips PG_CATCH, backend-exit cleanup still sees a valid set.         */
 /* -------------------------------------------------------------------- */
 
 static uint64 XClaimLocalArraySize = 0;
@@ -252,6 +246,16 @@ static inline void *
 xcl_local_allocate(xcl_local_hash *tb, Size size)
 {
     void       *data;
+
+    /*
+     * HARD invariant: local simplehash bucket arrays are allocated strictly
+     * outside every partition LWLock. Both xclaim.try and xclaim.try_many
+     * stage their local entries before LWLockAcquire.
+     */
+    Assert(XClaimPartitionLocks == NULL ||
+           !LWLockAnyHeldByMe(&XClaimPartitionLocks[0].lock,
+                              XClaimCtl->num_partitions,
+                              sizeof(LWLockPadded)));
 
     data = MemoryContextAllocExtended(tb->ctx, size,
                                       MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO |
@@ -539,7 +543,7 @@ xclaim_local_lookup(const XClaimKey *key, XClaimLocalEntry **out)
     Assert(key != NULL);
 
     entry = xcl_local_lookup(XClaimLocalSet, *key);
-    if (entry == NULL)
+    if (entry == NULL || entry->held == XCLAIM_LOCAL_STAGED)
         return false;
 
     if (out != NULL)
@@ -573,7 +577,7 @@ xclaim_local_lookup_with_hash(const XClaimKey *key,
     Assert(key != NULL);
 
     entry = xcl_local_lookup_hash(XClaimLocalSet, *key, hashvalue);
-    if (entry == NULL)
+    if (entry == NULL || entry->held == XCLAIM_LOCAL_STAGED)
         return false;
 
     if (out != NULL)
@@ -583,27 +587,30 @@ xclaim_local_lookup_with_hash(const XClaimKey *key,
 }
 
 /* -------------------------------------------------------------------- */
-/* Inserting a claim.                                                   */
+/* Inserting and staging claims.                                        */
 /*                                                                      */
-/*   xclaim_local_add()          puts the entry into the set            */
-/*   xclaim_local_note_held()    records it as held: live count, peak,  */
-/*                               held-key list and the 75% hint         */
-/*   xclaim_local_insert_held()  both, for xclaim.try_many, which       */
-/*                               inserts after it took the shared row   */
+/*   xclaim_local_add()          puts a staged entry into the set       */
+/*   xclaim_local_stage()        stages one slot of a try_many run      */
+/*   xclaim_local_find_entry()   looks up a staged or held entry        */
+/*   xclaim_local_unstage()      deletes a staged entry not acquired    */
+/*   xclaim_local_note_held()    promotes an entry to held: live count, */
+/*                               peak, held-key list and the 75% hint   */
 /*   xclaim_local_drop()         deletes an entry that was added and    */
 /*                               not recorded                           */
 /*                                                                      */
-/* xclaim.try adds the entry before it takes the partition LWLock, so   */
-/* that a growth of the set runs without the lock, and records it after */
-/* the shared insert succeeded. On a conflict or a capacity miss it     */
-/* drops the entry, and the backend's held-key list, peak and 75% hint  */
-/* stay as they were: they count only claims the backend took.          */
+/* Both xclaim.try and xclaim.try_many stage their local entries before */
+/* taking a partition LWLock, so every simplehash growth (fill-factor   */
+/* or long-probe) runs with no lock held. Once the shared row is ours   */
+/* the entry is promoted via xclaim_local_note_held(). On a conflict or */
+/* a capacity miss a newly staged entry is dropped after LWLockRelease  */
+/* (an entry pre-staged by an enclosing call stays staged for it), and  */
+/* the backend's held-key list, peak and 75% hint stay as they were.    */
 /*                                                                      */
 /* PRECONDITIONS of xclaim_local_add():                                 */
 /*   * xclaim_local_init()           ran.                               */
 /*   * xclaim_ensure_owner_token()   ran (XClaimMyOwnerToken != 0).     */
 /*   * caller verified absence via xclaim_local_lookup() -- the assert  */
-/*     `!found` enforces this.                                          */
+/*      enforces that no held entry is overwritten.                      */
 /*                                                                      */
 /* MEMORY-CONTEXT WRAPPING (HARD invariant -- see file-top comment):    */
 /*   simplehash.h allocates growth segments from the context passed    */
@@ -616,7 +623,8 @@ xclaim_local_lookup_with_hash(const XClaimKey *key,
 XClaimLocalEntry *
 xclaim_local_add(const XClaimKey *key,
                  uint32 hashvalue,
-                 uint32 partition_id)
+                 uint32 partition_id,
+                 bool *already_staged)
 {
     MemoryContext old;
     XClaimLocalEntry *entry;
@@ -625,6 +633,7 @@ xclaim_local_add(const XClaimKey *key,
     Assert(XClaimLocalSet != NULL);     /* xclaim_local_init() must precede */
     Assert(XClaimMyOwnerToken != 0);    /* ensure_owner_token first */
     Assert(key != NULL);
+    Assert(already_staged != NULL);
 
     /*
      * TopMemoryContext (HARD invariant). XClaimLocalContext is a child
@@ -638,39 +647,152 @@ xclaim_local_add(const XClaimKey *key,
      * Pass the dynahash-precomputed `hashvalue` directly to simplehash's
      * `_hash` variant. dynahash with HASH_BLOBS routes through tag_hash,
      * which is `hash_bytes(bytes, size)` -- byte-for-byte identical to
-     * our SH_HASH_KEY macro. Reusing the value keeps the simplehash
-     * insert at one hash compute per slot, shared with the dynahash
-     * insert. On bulk paths every slot already holds its hashvalue
-     * in `slots[i].hashvalue` from the unpack loop.
+     * our SH_HASH_KEY macro.
      */
     entry = xcl_local_insert_hash(XClaimLocalSet, *key, hashvalue, &found);
-    Assert(!found);                     /* caller verified absence */
+    Assert(!found || entry->held == XCLAIM_LOCAL_STAGED);
+    *already_staged = found;
 
     /*
-     * Populate the entry. Field order matches the struct layout in
-     * pg_xclaim_local.h (key already populated by SH_INSERT).
+     * Populate the entry as staged until the shared row is acquired.
+     * Cleanup ignores staged entries if a FATAL interrupts acquisition.
      */
     entry->hashvalue    = hashvalue;
     entry->partition_id = partition_id;
-
-    /* Owner identity captured here -- saved fields are the SOLE source
-     * of truth at cleanup time. */
     entry->saved_procno = (int32) xclaim_get_current_procno();
     entry->saved_lxid   = xclaim_get_current_top_lxid();
     entry->saved_token  = XClaimMyOwnerToken;
-
-    entry->held = XCLAIM_LOCAL_HELD;
-    /* `status` is already set by simplehash to SH_STATUS_IN_USE. */
+    entry->held         = XCLAIM_LOCAL_STAGED;
 
     MemoryContextSwitchTo(old);
 
     return entry;
 }
 
-void
-xclaim_local_note_held(const XClaimKey *key, uint32 hashvalue)
+static void xclaim_local_fit_held_list(void);
+
+XClaimStageState
+xclaim_local_stage(const XClaimKey *key,
+                   uint32 hashvalue,
+                   uint32 partition_id,
+                   uint64 *bulk_target_inout)
 {
+    MemoryContext     old;
+    XClaimLocalEntry *entry;
+    bool              found;
+    uint64            bulk_target = (bulk_target_inout != NULL)
+                                    ? *bulk_target_inout
+                                    : 0;
+
+    Assert(XClaimLocalSet != NULL);
+    Assert(XClaimMyOwnerToken != 0);
     Assert(key != NULL);
+
+    /*
+     * Probe existing membership before any growth or insert so an already-held
+     * or already-staged key never enlarges the bucket array (neither via
+     * grow_threshold, deferred post-shrink bulk_target, nor a long probe in
+     * simplehash's SH_INSERT). When the set is empty, skip the lookup.
+     */
+    if (XClaimLocalSet->members > 0)
+    {
+        entry = xcl_local_lookup_hash(XClaimLocalSet, *key, hashvalue);
+        if (entry != NULL)
+            return (entry->held != XCLAIM_LOCAL_STAGED)
+                   ? XCLAIM_STAGE_ALREADY_HELD
+                   : XCLAIM_STAGE_ALREADY_STAGED;
+    }
+
+    if (unlikely(XClaimLocalSet->members == 0 ||
+                 XClaimLocalSet->members + 1 >= XClaimLocalSet->grow_threshold ||
+                 bulk_target > XClaimLocalSet->size))
+    {
+        if (bulk_target > XClaimLocalSet->size)
+        {
+            *bulk_target_inout = 0;
+            old = MemoryContextSwitchTo(XClaimLocalContext);
+            xcl_local_grow(XClaimLocalSet, bulk_target);
+            MemoryContextSwitchTo(old);
+            xclaim_local_fit_held_list();
+        }
+        xclaim_local_reserve(1);
+    }
+
+    old = MemoryContextSwitchTo(XClaimLocalContext);
+    entry = xcl_local_insert_hash(XClaimLocalSet, *key, hashvalue, &found);
+    MemoryContextSwitchTo(old);
+
+    if (found)
+    {
+        if (entry->held != XCLAIM_LOCAL_STAGED)
+            return XCLAIM_STAGE_ALREADY_HELD;
+        return XCLAIM_STAGE_ALREADY_STAGED;
+    }
+
+    xclaim_local_fit_held_list();
+
+    entry->hashvalue    = hashvalue;
+    entry->partition_id = partition_id;
+    entry->saved_procno = (int32) xclaim_get_current_procno();
+    entry->saved_lxid   = xclaim_get_current_top_lxid();
+    entry->saved_token  = XClaimMyOwnerToken;
+    entry->held         = XCLAIM_LOCAL_STAGED;
+
+    return XCLAIM_STAGE_FRESH;
+}
+
+XClaimLocalEntry *
+xclaim_local_find_entry(const XClaimKey *key, uint32 hashvalue)
+{
+    Assert(XClaimLocalSet != NULL);
+    Assert(key != NULL);
+
+    return xcl_local_lookup_hash(XClaimLocalSet, *key, hashvalue);
+}
+
+void
+xclaim_local_unstage(const XClaimKey *key, uint32 hashvalue)
+{
+    XClaimLocalEntry *entry;
+
+    if (XClaimLocalSet == NULL)
+        return;
+
+    Assert(key != NULL);
+
+    entry = xcl_local_lookup_hash(XClaimLocalSet, *key, hashvalue);
+    if (entry != NULL && entry->held == XCLAIM_LOCAL_STAGED)
+        xcl_local_delete_item(XClaimLocalSet, entry);
+}
+
+void
+xclaim_local_demote_to_staged(const XClaimKey *key, uint32 hashvalue)
+{
+    XClaimLocalEntry *entry;
+
+    if (XClaimLocalSet == NULL)
+        return;
+
+    Assert(key != NULL);
+
+    entry = xcl_local_lookup_hash(XClaimLocalSet, *key, hashvalue);
+    if (entry == NULL)
+        return;
+
+    if (entry->held != XCLAIM_LOCAL_STAGED)
+    {
+        entry->held = XCLAIM_LOCAL_STAGED;
+        if (XClaimMyLocalCount > 0)
+            XClaimMyLocalCount--;
+    }
+}
+
+void
+xclaim_local_note_held(XClaimLocalEntry *entry)
+{
+    Assert(entry != NULL);
+
+    entry->held = XCLAIM_LOCAL_HELD;
 
     /* Per-backend bookkeeping. */
     XClaimMyLocalCount++;
@@ -680,8 +802,8 @@ xclaim_local_note_held(const XClaimKey *key, uint32 hashvalue)
     /* Held-key list (see the file-scope comment). No allocation here. */
     if (XClaimHeldListLen < XClaimHeldListCap)
     {
-        XClaimHeldList[XClaimHeldListLen].key       = *key;
-        XClaimHeldList[XClaimHeldListLen].hashvalue = hashvalue;
+        XClaimHeldList[XClaimHeldListLen].key       = entry->key;
+        XClaimHeldList[XClaimHeldListLen].hashvalue = entry->hashvalue;
         XClaimHeldListLen++;
     }
     else
@@ -696,7 +818,7 @@ xclaim_local_note_held(const XClaimKey *key, uint32 hashvalue)
      * probe can grow the set earlier, and xclaim.try_many writes the hint
      * only after its loop.
      *
-     * xclaim.try_many records its claims under a partition LWLock, so the
+     * xclaim.try_many promotes its claims under a partition LWLock, so the
      * LOG is only marked pending: xclaim_local_emit_peak_warning() writes
      * it after the release. Writing a message can block on the client
      * socket or the log pipe, and an emit_log_hook can run arbitrary code.
@@ -720,15 +842,6 @@ xclaim_local_note_held(const XClaimKey *key, uint32 hashvalue)
             XClaimMyPeakWarnCount = XClaimMyLocalCount;
         }
     }
-}
-
-void
-xclaim_local_insert_held(const XClaimKey *key,
-                         uint32 hashvalue,
-                         uint32 partition_id)
-{
-    (void) xclaim_local_add(key, hashvalue, partition_id);
-    xclaim_local_note_held(key, hashvalue);
 }
 
 void
@@ -938,14 +1051,10 @@ xclaim_local_shrink(bool force)
 /*                                                                      */
 /* simplehash also grows the set inside an insert, below the threshold, */
 /* when a key probes more than SH_GROW_MAX_DIB buckets from its own     */
-/* (from a fill of about 0.65 in large sets). xclaim.try inserts its    */
-/* local entry before the partition LWLock, so that growth runs without */
-/* the lock too. xclaim.try_many inserts under the lock of the          */
-/* partition run, where a long-probe growth still holds the partition.  */
-/* Its keys arrive partition by partition, and the partition is the low */
-/* bits of the hash that also picks the bucket: the keys of one run     */
-/* start their probes from 1/num_partitions of the buckets, and a large */
-/* call grows the set by long probes from a fill of about 0.1.          */
+/* (from a fill of about 0.65 in large sets). Both xclaim.try and       */
+/* xclaim.try_many stage their local entries before taking the          */
+/* partition LWLock, so every fill-factor and long-probe growth runs    */
+/* with no partition lock held.                                         */
 /* -------------------------------------------------------------------- */
 
 void
@@ -1002,39 +1111,36 @@ xclaim_local_reserve(uint64 additional)
 /*     set of the size its calls need                                   */
 /*   * a smaller set restarts the streak, so the reservation of the     */
 /*     call's first partition run does not shrink a set the call needs  */
-/*   * a set shrunk after an earlier burst grows back, toward the       */
-/*     largest size it shrank from, until it has twice the room the     */
-/*     claims need. The runs of the call insert under their partition   */
-/*     LWLocks, where a growth would rehash the set while other         */
-/*     backends wait. The keys of a run start their probes from         */
-/*     1/num_partitions of the buckets, and long probes grow a set      */
-/*     filled well below the 0.9 threshold, so the room is doubled.     */
+/*   * a set shrunk after an earlier burst computes a re-expansion      */
+/*     target toward the largest size it shrank from until it has twice */
+/*     the room the claims need, and xclaim_local_stage applies that    */
+/*     target on the first genuinely new key (outside any LWLock) so    */
+/*     repeating already-held keys never re-expands a shrunk set while  */
+/*     a real burst still avoids intermediate rehashes.                 */
 /*                                                                      */
-/* The keys are counted as given: repeated keys and keys the backend    */
-/* holds already count too. The growth stops at a size the backend had  */
-/* before, and a later shrink gives it back again.                      */
+/* The candidate count includes duplicates for target sizing, while     */
+/* actual allocation happens only when a distinct new key is staged.    */
+/* The growth stops at a size the backend had before, and a later       */
+/* shrink gives it back again.                                          */
 /*                                                                      */
-/* The doubled room is for keys spread over the partitions the way the  */
-/* hash spreads them. A backend that never had a set of the needed size */
-/* still grows it inside the runs, under their locks (the known limit   */
-/* of xclaim_local_reserve), and so can keys that crowd one partition   */
-/* run more than that. An out-of-memory ERROR of the growth leaves the  */
-/* set at the size before it, shrunk or not.                            */
+/* A backend that never had a set of the needed size grows it during    */
+/* run pre-staging, before taking the partition LWLock. An              */
+/* out-of-memory ERROR of the growth leaves the set at the size before  */
+/* it, shrunk or not.                                                   */
 /* -------------------------------------------------------------------- */
 
-void
+uint64
 xclaim_local_prepare_bulk(uint64 nkeys)
 {
-    uint64        needed;
-    uint64        want;
-    uint64        target;
-    MemoryContext old;
+    uint64 needed;
+    uint64 want;
+    uint64 target;
 
     Assert(XClaimLocalSet != NULL);
 
     needed = Min(XClaimLocalSet->members + nkeys, (uint64) xclaim_max_claims);
     if (needed < XClaimLocalFirstSize / 2)
-        return;
+        return 0;
 
     want = XClaimLocalFirstSize;
     while (want / 2 <= needed)
@@ -1047,13 +1153,7 @@ xclaim_local_prepare_bulk(uint64 nkeys)
     target = XClaimLocalSet->size;
     while (target / 2 <= needed && target < XClaimLocalShrunkFrom)
         target *= 2;
-    if (target > XClaimLocalSet->size)
-    {
-        old = MemoryContextSwitchTo(XClaimLocalContext);
-        xcl_local_grow(XClaimLocalSet, target);
-        MemoryContextSwitchTo(old);
-        xclaim_local_fit_held_list();
-    }
+    return (target > XClaimLocalSet->size) ? target : 0;
 }
 
 /* -------------------------------------------------------------------- */
@@ -1082,7 +1182,8 @@ xclaim_local_reset_peak_warning(void)
 void
 xclaim_local_remove(const XClaimKey *key)
 {
-    bool removed;
+    XClaimLocalEntry *entry;
+    bool              was_held;
 
     if (XClaimLocalSet == NULL)
         return;
@@ -1090,12 +1191,16 @@ xclaim_local_remove(const XClaimKey *key)
     Assert(key != NULL);
 
     /*
-     * simplehash's SH_DELETE deletes by key. There is no allocation
-     * involved, so no MemoryContextSwitchTo wrapper is required for the
-     * HARD invariant.
+     * Delete by lookup+item so XClaimMyLocalCount decrements only when
+     * the entry had already been promoted to held. Allocates nothing.
      */
-    removed = xcl_local_delete(XClaimLocalSet, *key);
-    if (removed && XClaimMyLocalCount > 0)
+    entry = xcl_local_lookup(XClaimLocalSet, *key);
+    if (entry == NULL)
+        return;
+
+    was_held = (entry->held != XCLAIM_LOCAL_STAGED);
+    xcl_local_delete_item(XClaimLocalSet, entry);
+    if (was_held && XClaimMyLocalCount > 0)
         XClaimMyLocalCount--;
     /* peak survives -- it is a high-water-mark, not a current count */
 }
@@ -1124,6 +1229,8 @@ xclaim_local_gather_pointers(XClaimLocalEntry **buf, uint32 cap)
     xcl_local_start_iterate(XClaimLocalSet, &it);
     while ((entry = xcl_local_iterate(XClaimLocalSet, &it)) != NULL)
     {
+        if (entry->held == XCLAIM_LOCAL_STAGED)
+            continue;
         if (count < cap)
             buf[count] = entry;
         count++;
@@ -1374,6 +1481,9 @@ xclaim_local_release_one_by_one(void)
         XClaimEntry *shared;
         bool         found;
 
+        if (saved->held == XCLAIM_LOCAL_STAGED)
+            continue;
+
         Assert(saved->partition_id < (uint32) XClaimCtl->num_partitions);
         plock = &XClaimPartitionLocks[saved->partition_id].lock;
 
@@ -1406,6 +1516,14 @@ xclaim_local_cleanup_by_list(void)
     uint32      gathered = 0;
     uint32      removed;
     uint32      i;
+
+    /*
+     * When a FATAL interrupted pre-staging, XClaimLocalSet->members holds
+     * unacquired staged entries in addition to XClaimMyLocalCount. Fall
+     * back to the full path so xcl_local_reset() clears staged entries too.
+     */
+    if (XClaimLocalSet->members != XClaimMyLocalCount)
+        return false;
 
     for (i = 0; i < XClaimHeldListLen; i++)
     {
@@ -1474,26 +1592,32 @@ xclaim_local_cleanup_full(void)
     uint32              acc;
     uint32              i;
     int                 p;
+    Size                entry_ptr_bytes;
+    Size                part_u32_bytes;
     MemoryContext       old;
 
     /*
-     * MemoryContextSwitchTo restore safety: the switch back to `old`
-     * happens before any code path that can ereport. Below the known
-     * limit these palloc calls cannot ereport -- they return NULL on
-     * out-of-memory. The simplehash iteration helpers do not allocate.
+     * MemoryContextSwitchTo restore safety: mul_size runs before the
+     * context switch and the switch back to `old` happens before any
+     * other code path that can ereport. With MCXT_ALLOC_NO_OOM these
+     * palloc_extended calls return NULL on out-of-memory instead of
+     * raising ERROR.
      */
+    entry_ptr_bytes = mul_size(members, sizeof(XClaimLocalEntry *));
+    part_u32_bytes = mul_size((Size) num_parts, sizeof(uint32));
+
     old = MemoryContextSwitchTo(XClaimLocalContext);
     buf = (XClaimLocalEntry **)
-        palloc_extended(mul_size(members, sizeof(XClaimLocalEntry *)),
+        palloc_extended(entry_ptr_bytes,
                         MCXT_ALLOC_HUGE | MCXT_ALLOC_NO_OOM);
     scratch = (XClaimLocalEntry **)
-        palloc_extended(mul_size(members, sizeof(XClaimLocalEntry *)),
+        palloc_extended(entry_ptr_bytes,
                         MCXT_ALLOC_HUGE | MCXT_ALLOC_NO_OOM);
     partition_counts = (uint32 *)
-        palloc_extended(num_parts * sizeof(uint32),
+        palloc_extended(part_u32_bytes,
                         MCXT_ALLOC_NO_OOM | MCXT_ALLOC_ZERO);
     partition_cursor = (uint32 *)
-        palloc_extended(num_parts * sizeof(uint32), MCXT_ALLOC_NO_OOM);
+        palloc_extended(part_u32_bytes, MCXT_ALLOC_NO_OOM);
     MemoryContextSwitchTo(old);
 
     if (buf == NULL || scratch == NULL ||
@@ -1560,18 +1684,19 @@ xclaim_local_cleanup_full(void)
 void
 xclaim_local_cleanup_held(void)
 {
-    /* Idempotent no-op: nothing held -> nothing to do. */
+    /* Idempotent no-op: nothing held -> wipe any leftover staged entries. */
     if (XClaimLocalSet == NULL)
         return;
-    if (XClaimLocalSet->members == 0)
+    if (XClaimMyLocalCount == 0)
     {
+        if (XClaimLocalSet->members > 0)
+            xcl_local_reset(XClaimLocalSet);
         xclaim_local_forget_held_list();
-        XClaimMyLocalCount = 0;
         return;
     }
 
     /* Small: the claims would have fit in the first bucket array. */
-    if (XClaimLocalSet->members < XClaimLocalFirstThreshold)
+    if (XClaimMyLocalCount < XClaimLocalFirstThreshold)
     {
         if (XClaimSmallCleanups < XCLAIM_SHRINK_AFTER)
             XClaimSmallCleanups++;
@@ -1580,7 +1705,7 @@ xclaim_local_cleanup_held(void)
         XClaimSmallCleanups = 0;
 
     if (XClaimHeldListFull ||
-        (uint64) XClaimLocalSet->members * XCLAIM_HELD_LIST_RATIO > XClaimLocalSet->size ||
+        XClaimMyLocalCount * XCLAIM_HELD_LIST_RATIO > XClaimLocalSet->size ||
         !xclaim_local_cleanup_by_list())
         xclaim_local_cleanup_full();
 
@@ -1606,7 +1731,7 @@ xclaim_local_holds_current_xact(void)
     int32               procno;
     LocalTransactionId  lxid;
 
-    if (XClaimLocalSet == NULL || XClaimLocalSet->members == 0 ||
+    if (XClaimLocalSet == NULL || XClaimMyLocalCount == 0 ||
         XClaimMyOwnerToken == 0)
         return false;
 
@@ -1616,6 +1741,8 @@ xclaim_local_holds_current_xact(void)
     xcl_local_start_iterate(XClaimLocalSet, &it);
     while ((entry = xcl_local_iterate(XClaimLocalSet, &it)) != NULL)
     {
+        if (entry->held == XCLAIM_LOCAL_STAGED)
+            continue;
         if (entry->saved_procno == procno &&
             entry->saved_lxid   == lxid &&
             entry->saved_token  == XClaimMyOwnerToken)

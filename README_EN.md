@@ -162,23 +162,19 @@ pg_xclaim.on_capacity_exhaustion      = error
 >
 > A raised GUC is a set of that size in every backend for its whole
 > life. With the default, the set grows only in a backend that needs it.
-> For `xclaim.try` the growth runs before the partition lock is taken.
-> `xclaim.try_many` grows the set before the lock at the boundary of each
-> run of keys of one partition, but inside a run the keys start their
-> probes from 1/`num_partitions` of the buckets, and the set grows by long
-> probes from a fill of ~0.1, under the partition lock (a known limit, see
-> `docs/runbook_en.md` §3). After 64 transactions in a row, each of which
-> took at least one claim and no more than the first array holds, a set
-> grown 4 times or more goes back to its first size and returns the
-> memory. An `xclaim.try_many` that needs half of the first array or more
-> breaks this count only while the set is less than 4 times the size the
-> call needs. Such a call gives the set, before its first lock, twice the
-> room the claims of the transaction need, up to the largest size the set
-> shrank from. Under a lock the set grows only when the backend has not
-> had a set of the needed size before (with keys the hash spreads evenly
-> over the partitions). Raise the GUC
-> when that first growth shows: for
-> example, behind a pooler that often replaces its backends.
+> For both `xclaim.try` and `xclaim.try_many` local staging and every
+> simplehash growth (both the 0.9 fill threshold and `SH_GROW_MAX_DIB`
+> long probes starting around ~0.1 fill inside a single-partition run)
+> run **before taking any partition lock** (see `docs/runbook_en.md` §3).
+> After 64 transactions in a row, each of which took at least one claim
+> and no more than the first array holds, a set grown 4 times or more
+> goes back to its first size and returns the memory. An `xclaim.try_many`
+> that needs half of the first array or more breaks this count only while
+> the set is less than 4 times the size the call needs. After a shrink,
+> such a call expands the set on its first distinct new key (with no
+> partition lock held) toward twice the room the claims need, up to the
+> largest size the set shrank from. Raise the GUC when the initial cold
+> growth shows: for example, behind a pooler that often replaces its backends.
 >
 > Total memory budget formula. Each held claim occupies a 48-byte
 > `XClaimLocalEntry`. With simplehash rounding to a power of two and a
@@ -227,14 +223,13 @@ never `public`).
 |----------|---------|
 | `xclaim.try(int4, int4) RETURNS boolean` | Two-arg API, signature matches `pg_try_advisory_xact_lock(int4, int4)` for ergonomic legacy migration. |
 | `xclaim.try(int8) RETURNS boolean` | Single-arg API, signature matches `pg_try_advisory_xact_lock(bigint)`. Distinct keyspace. |
-| `xclaim.try_many(int4, int4[]) RETURNS boolean[]` | Bulk variant, pre-sorts by partition (<= `num_partitions` LWLock cycles for the whole batch, in `warn` mode each capacity miss adds a cycle). |
+| `xclaim.try_many(int4, int4[]) RETURNS boolean[]` | Bulk variant, pre-sorts by partition (<= `num_partitions` LWLock cycles when per-partition new keys fit in `max_claims + 64`, `warn`-mode capacity misses or larger chunks add cycles). |
 | `xclaim.try_many(int8[]) RETURNS boolean[]` | Bulk single-arg form. |
 | `xclaim.count() RETURNS int8` | Number of claims held by current top-level transaction. |
 | `xclaim.stats() RETURNS TABLE(...)` | Atomic counter snapshot + capacity gauges. `pg_monitor`. |
 | `xclaim.debug_snapshot() RETURNS TABLE(...)` | Consistent snapshot of all claims. Under shared locks on all partitions it only copies the entries, and the result is built after the release: acquisitions wait for the copy only. `pg_monitor`, requires `pg_xclaim.num_partitions <= 192`. |
-| `xclaim.debug() RETURNS TABLE(...)` | The same snapshot as `debug_snapshot()`. **Superuser only.** |
-| `xclaim.debug_inject_stale(int4, int4) RETURNS void` | **Test-only.** Stale-entry injector (simulates an owner that did not survive a crash). **Superuser only**, `REVOKE`d from `PUBLIC`. Never called in production. |
-| `xclaim.session_reset() RETURNS void` | Optional triage hook. Force-clears local state, gives an enlarged local set back to the allocator and rotates owner_token. Refuses inside a transaction block, in a parallel worker, inside `xclaim.try_many` and while the running transaction holds claims. **Not required for routine operation:** claims are released automatically by the xact callback on every COMMIT/ABORT. Only for a session that holds claims outside a transaction (`xclaim.count() > 0` in autocommit). It does not release claims of the running transaction: inside an explicit `BEGIN`, in a function, a DO block or the same statement as `xclaim.try` it raises an ERROR. Normal operation never produces that state, see section 6 of `docs/runbook_en.md`. Do not wire into the pooler `server_reset_query` - it adds an RTT per handoff with no functional benefit. |
+| `xclaim.debug() RETURNS TABLE(...)` | The same snapshot as `debug_snapshot()` (`PARALLEL UNSAFE`). Restricted by default via `REVOKE ALL FROM PUBLIC` (accessible to owner/superuser, delegable via `GRANT EXECUTE`). |
+| `xclaim.session_reset() RETURNS void` | Optional triage hook. Force-clears local state, gives an enlarged local set back to the allocator and rotates owner_token. Refuses inside a transaction block, in a parallel worker, inside the `xclaim.try_many` acquisition loop and while the running transaction holds claims. **Not required for routine operation:** claims are released automatically by the xact callback on every COMMIT/ABORT. Only for a session that holds claims outside a transaction (`xclaim.count() > 0` in autocommit). It does not release claims of the running transaction: inside an explicit `BEGIN`, in a function, a DO block or the same statement as `xclaim.try` it raises an ERROR. Normal operation never produces that state, see section 6 of `docs/runbook_en.md`. Do not wire into the pooler `server_reset_query` - it adds an RTT per handoff with no functional benefit. |
 
 ### Function-attribute parity with `pg_try_advisory_xact_lock`
 
@@ -373,10 +368,11 @@ pg_xclaim/
 ├── Makefile                                   # PGXS
 ├── pg_xclaim.control                          # extension metadata
 ├── sql/
-│   ├── pg_xclaim--1.0.0-rc1.sql               # install script
+│   ├── pg_xclaim--1.0.0-rc5.sql               # install script
 │   ├── pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql    # update script
 │   ├── pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql    # update script
-│   └── pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql    # update script
+│   ├── pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql    # update script
+│   └── pg_xclaim--1.0.0-rc4--1.0.0-rc5.sql    # update script
 ├── src/
 │   ├── pg_xclaim.c                            # _PG_init + GUCs + glue
 │   ├── pg_xclaim_compat.h                     # PG 16/17/18 ABI shim
@@ -483,8 +479,10 @@ standard alternatives forming a full 2x2 matrix of
 | **LOGGED**   | D | E |
 
 Plus C: row locks via `FOR UPDATE NOWAIT`. The benchmark runs in two
-workload modes: `overlap` (shared key pool, ~52% pairwise overlap at
-N=8 K=100k) and `disjoint` (worker-disjoint slices, no key overlap).
+workload modes: `overlap` (shared key pool, ~50% analytical overlap against
+at least one of the other 7 workers and ~9.5% pairwise with replacement at
+N=8 K=100k) and `disjoint`
+(worker-disjoint slices, no key overlap).
 
 Full numbers, methodology, and fairness caveats live in
 [`docs/perf/COMPARISON_EN.md`](docs/perf/COMPARISON_EN.md). Raw
@@ -505,11 +503,12 @@ state of B-F (claim-table rows, C's row locks) vanishes when the
 subtransaction rolls back, while pg_xclaim claims survive the rollback
 and accumulate until the transaction ends, so with every iteration a
 growing share of A's acquisitions re-enters keys it already holds or
-conflicts with claims of other workers. A B or D worker that fails on a
-deadlock drops out without samples, while throughput is computed for
-the full iteration count. The A and B-F numbers are therefore not
-directly comparable: they are an order of magnitude for this
-methodology, not a ratio of acquisition costs.
+conflicts with claims of other workers. In the recorded `2026-05-24`
+tables below, a B or D worker that hit a deadlock dropped out without
+samples while throughput divided the full iteration count by wall time
+(the script itself flags partial runs as `*_INCOMPLETE`). The A and B-F
+numbers are therefore not directly comparable: they are an order of
+magnitude for this methodology, not a ratio of acquisition costs.
 
 Top-line summary (PG 17, ITERS=200, `fsync=on`, `log_lock_waits=on`, ACCOUNT_POOL=1M):
 
@@ -625,13 +624,14 @@ advisory's defaults and carry the same exposure: any grantee can
 deliberately exhaust the pool and force `on_capacity_exhaustion=error`
 to raise for other sessions. On clusters with untrusted roles, run
 `REVOKE EXECUTE` (verify the exact signatures in
-[`sql/pg_xclaim--1.0.0-rc1.sql`](sql/pg_xclaim--1.0.0-rc1.sql)):
+[`sql/pg_xclaim--1.0.0-rc5.sql`](sql/pg_xclaim--1.0.0-rc5.sql)):
 
 ```sql
 REVOKE EXECUTE ON FUNCTION xclaim.try(int8)              FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION xclaim.try(int4, int4)        FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION xclaim.try_many(int8[])       FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION xclaim.try_many(int4, int4[]) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION xclaim.session_reset()        FROM PUBLIC;
 ```
 
 Keys deliberately chosen for one partition can also keep its LWLock held
@@ -792,12 +792,12 @@ Copyright (c) 2026, E. Pavlichenko.
 
 ## Status
 
-**v1.0.0-rc4** - fourth release candidate of an experimental
+**v1.0.0-rc5** - fifth release candidate of an experimental
 proof-of-concept. Documentation and tests are in place, build matrix
 green on PG 16/17/18, the code is covered by a 3-tier test suite plus
 perf budgets.
 
-Why `1.0.0-rc4` rather than `0.x` while still "experimental": the public
+Why `1.0.0-rc5` rather than `0.x` while still "experimental": the public
 SQL API is frozen (function signatures, GUC names, schema), and the
 extension passes the full test matrix on PG 16/17/18. "Experimental"
 refers to the narrowness of the niche and operational maturity, not to

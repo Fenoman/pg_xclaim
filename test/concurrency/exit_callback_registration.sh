@@ -33,8 +33,8 @@ source "$LIB_DIR/_lib.sh"
 # The pid in the line prefix ties each exit line to its backend.
 XCLAIM_EXTRA_CONF="log_line_prefix = '%m [%p] '"
 
-pg_xclaim_start_temp_cluster "exit_callback_registration"
 trap pg_xclaim_stop_temp_cluster EXIT INT TERM
+pg_xclaim_start_temp_cluster "exit_callback_registration"
 
 xclaim_banner "$SCRIPT"
 

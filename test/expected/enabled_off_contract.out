@@ -175,3 +175,37 @@ FROM xclaim.debug() WHERE form = 'solo' AND key IN (50020, 50021, 50022);
                          0
 (1 row)
 
+-- 6. NULL scalar arguments and NULL array elements still raise 22004 when disabled.
+BEGIN;
+SET LOCAL pg_xclaim.enabled = off;
+DO $$
+DECLARE
+    caught int := 0;
+    stmt text;
+BEGIN
+    FOREACH stmt IN ARRAY ARRAY[
+        'SELECT xclaim.try(NULL::int8)',
+        'SELECT xclaim.try(1, NULL::int4)',
+        'SELECT xclaim.try_many(NULL::int8[])',
+        'SELECT xclaim.try_many(ARRAY[1, NULL]::int8[])',
+        'SELECT xclaim.try_many(1, ARRAY[1, NULL]::int4[])'
+    ] LOOP
+        BEGIN
+            EXECUTE stmt;
+            RAISE EXCEPTION 'unexpected success on NULL input: %', stmt;
+        EXCEPTION WHEN null_value_not_allowed THEN
+            caught := caught + 1;
+        END;
+    END LOOP;
+    IF caught <> 5 THEN
+        RAISE EXCEPTION 'expected 5 22004 rejections, got %', caught;
+    END IF;
+END;
+$$;
+SELECT true AS null_rejected_while_disabled;
+ null_rejected_while_disabled 
+------------------------------
+ t
+(1 row)
+
+ROLLBACK;

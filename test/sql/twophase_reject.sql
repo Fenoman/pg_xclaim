@@ -34,3 +34,10 @@ COMMIT;
 
 -- No entries of any xclaim after test
 SELECT xclaim.count() AS final_count;
+
+-- When xclaim.count() == 0 after an earlier transaction held claims,
+-- PREPARE TRANSACTION + COMMIT PREPARED succeeds cleanly.
+BEGIN;
+SELECT 1 AS dummy_work;
+PREPARE TRANSACTION 'xclaim_2pc_allowed_when_empty';
+COMMIT PREPARED 'xclaim_2pc_allowed_when_empty';

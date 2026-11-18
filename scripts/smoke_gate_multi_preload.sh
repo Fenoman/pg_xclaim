@@ -54,9 +54,7 @@ POSTGRES="$BIN/postgres"
 # for an interrupt mid-run.
 CURRENT_DATADIR=""
 smoke_cleanup() {
-    # Preserve the script's real exit status: an EXIT trap whose last
-    # command returns non-zero (here `[[ -n "" ]]` once the datadir is
-    # already cleared) would otherwise OVERRIDE `exit 0` and fail the run.
+    # Preserve the exit status recorded before cleanup commands run.
     local rc=$?
     [[ -n "$CURRENT_DATADIR" ]] && rm -rf "${CURRENT_DATADIR:?}"
     return $rc
@@ -68,7 +66,7 @@ trap smoke_cleanup EXIT INT TERM
 PKGLIB="$("$PG_CONFIG_BIN" --pkglibdir)"
 if [[ ! -e "$PKGLIB/pg_stat_statements.dylib" && ! -e "$PKGLIB/pg_stat_statements.so" ]]; then
     echo "smoke_gate_multi_preload: pg_stat_statements not installed in $PKGLIB -- SKIPPED" >&2
-    exit 0
+    exit 77
 fi
 
 run_one() {

@@ -304,7 +304,7 @@ Bulk путь vs scalar: `xclaim_local_lookup_with_hash` 11.7% vs 35.9% -
 | 25.9% | `hash_search_with_hash_value` | HASH_FIND + HASH_REMOVE в cleanup-цикле + HASH_ENTER_NULL во время захвата (доминирует, потому что cleanup проходит ВСЕ 2.5M записей) |
 | 20.0% | `xclaim_local_lookup_with_hash` | Reentrancy lookup в acquire-фазе, по одному на каждый из 2.5M ключей. Обход local-set в cleanup идет через итератор simplehash и сюда не входит |
 |  6.6% | `xclaim_local_cleanup_held` | Self-time драйвера групповой очистки по партициям (gather + sort + per-partition sweep) |
-|  2.7% | `xclaim_local_insert_held` | Insert в local-set после успешного shared insert |
+|  2.7% | `xclaim_local_insert_held` | Вставка в local-set на кадре `cleanup-commit.svg` (соответствует связке `xclaim_local_stage` + `xclaim_local_note_held`) |
 |  2.7% | `ExecInterpExpr` | Диспетчер выражений executor'а |
 |  2.4% | `xclaim_try_many_internal` | Self-time bulk-драйвера |
 |  2.1% | `[libc.so.6]` | libc symbols без debug |
@@ -410,7 +410,7 @@ Stat-счетчики при этом per-backend: каждый бэкенд п�
 
 | Категория | Скаляр | Пакет | Очистка | Конкуренция | Что это |
 |-----------|-------:|------:|--------:|------------:|---------|
-| **Local simplehash** (`xclaim_local_lookup_with_hash`, `xclaim_local_insert_held`, `xclaim_local_cleanup_held`) | ~39% | ~12% | ~29% | ~7% | быстрый путь повторного входа + вставка в local-set + group-by-partition cleanup. Хеш ключа сюда не входит: `hash_bytes` учтен в строке shared dynahash |
+| **Local simplehash** (`xclaim_local_lookup_with_hash`, `xclaim_local_stage`, `xclaim_local_note_held`, `xclaim_local_cleanup_held`) | ~39% | ~12% | ~29% | ~7% | быстрый путь повторного входа + pre-stage/фиксация в local-set + group-by-partition cleanup. Хеш ключа сюда не входит: `hash_bytes` учтен в строке shared dynahash |
 | **Shared dynahash** (`hash_search_with_hash_value` + `hash_bytes`) | ~12.5% | ~5% | ~28% | ~16% | партиционированный shared hash под partition-LWLock |
 | **PG executor / plpgsql** (`ExecInterpExpr`, tuplestore, SRF dispatch) | - | - | - | - | dispatch вызовов, машинерия FOR-loop, tuplestore I/O. Состав категории открытый, и ее долю из опубликованных профилей не восстановить |
 | **xclaim driver self-time** (`xclaim_try_internal`, `xclaim_try_many_internal`, `xclaim_is_stale_owner`) | ~2% | ~3% | ~3% | **~10%** | self-time + stale-owner reaper (последний поднимается под конкуренцией) |
@@ -418,23 +418,27 @@ Stat-счетчики при этом per-backend: каждый бэкенд п�
 | **Kernel page-zero + faults** (`clear_page_rep`, `asm_exc_page_fault`) | <1% | ~2% | ~3% | ~3% | first-touch zero-fill свежих palloc страниц + page-fault entry |
 | **libc opaque** (`[libc.so.6]`) | ~3% | ~5% | ~2% | ~5% | memcpy/memset/strlen - нужен `libc6-dbg` для резолва |
 | **Атомарные счетчики** (`__atomic_*`) | - | - | - | - | per-backend stat-слоты + live_capacity. На x86_64 это inline `lock`-prefixed insns внутри вызывающих функций: своих кадров нет, и доля в профиле не выделяется |
-| **LWLock acquire/release** | не в top-15 | не в top-15 | не в top-15 | не в top-15 | циклы partition-lock'а (<= num_partitions=128). `LWLockAcquire` и `LWLockRelease` в top-15 нет, то есть каждая не больше 15-й строки таблицы сценария: 1.4% в scalar, 2.1% в bulk, 1.1% в cleanup, 1.2% в concurrent |
+| **LWLock acquire/release** | не в top-15 | не в top-15 | не в top-15 | не в top-15 | циклы partition-lock'а (на штатном пути без промахов `warn`, OOM-fallback очистки и порций крупнее `max_claims + 64`: до `num_partitions=128` на вызов `try_many` и на групповую очистку, по одному циклу на новый ключ в `scalar`). `LWLockAcquire` и `LWLockRelease` в top-15 нет, то есть каждая не больше 15-й строки таблицы сценария: 1.4% в scalar, 2.1% в bulk, 1.1% в cleanup, 1.2% в concurrent |
 
 ---
 
 ## Архитектурная валидация
 
-Профайл подтверждает три ключевых инварианта, а п. 2 он проверить не
+Профайл согласуется с тремя инвариантами дизайна, а п. 2 он проверить не
 может:
 
-1. **Циклы LWLock ограничены `num_partitions`, а не количеством
-   записей.** `LWLockRelease` не попадает в top-15 ни в одном из
-   четырех сценариев, то есть не больше 15-й строки таблицы: 1.4% в
-   scalar, 2.1% в bulk, 1.1% в cleanup, 1.2% в concurrent. Это
-   нижняя оценка стоимости группой очистки: 2.5M записей cleanup сценария
-   проходят через <= 128 LWLock циклов (default `num_partitions`),
-   а не 2.5M. Инвариант group-by-partition cleanup держится -
-   подтверждено напрямую с разрешенными pg_xclaim symbols.
+1. **На штатном пути групповой захват `try_many` и групповая очистка
+   ограничены `num_partitions` циклами LWLock** (при отсутствии
+   `warn`-промахов емкости, порций длиннее `max_claims + 64` и
+   аварийного поштучного OOM-fallback очистки). Прямое доказательство этого дает
+   устройство `xclaim_try_many_internal` и `xclaim_local_cleanup_held`
+   (сортировка по `partition_id`), а не sampling-профиль сам по себе:
+   отсутствие `LWLockAcquire` и `LWLockRelease` в top-15 показывает лишь,
+   что на каждую из них приходится не больше 15-й строки таблицы сценария
+   (1.4% в scalar, 2.1% в bulk, 1.1% в cleanup, 1.2% в concurrent). В
+   сценарии cleanup 2.5M записей проходят через <= 128 циклов LWLock
+   (default `num_partitions`), тогда как в scalar каждый новый ключ берет
+   свой цикл LWLock и все равно не выводит сами вызовы блокировки в top-15.
 
 2. **Атомарные счетчики профиль не показывает.** `__atomic_*` (x86_64
    lock prefix) инлайнятся в вызывающие функции, их цена сидит внутри
@@ -506,6 +510,7 @@ sudo git clone https://github.com/brendangregg/FlameGraph /opt/FlameGraph
 
 # Сборка pg_xclaim с frame pointers + debug info
 PG=/usr/lib/postgresql/17/bin/pg_config
+make PG_CONFIG=$PG clean
 PG_CFLAGS="-O2 -g -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer" \
   make PG_CONFIG=$PG -j"$(nproc)"
 sudo make PG_CONFIG=$PG install

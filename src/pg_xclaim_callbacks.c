@@ -21,12 +21,13 @@
  *   PARALLEL RESTRICTED and the C entry points reject IsParallelWorker()),
  *   so its cleanup finds an empty local set.
  *
- *   We do NOT clean on PRE_COMMIT / PRE_PREPARE / PREPARE. Cleanup is
- *   deliberately tied to the post-outcome COMMIT/ABORT callbacks so we
- *   never release a claim before the transaction outcome is known. The
- *   PRE_PREPARE event is used ONLY to reject 2PC (PREPARE TRANSACTION)
- *   when claims are held. The subsequent ABORT re-entry then runs
- *   cleanup.
+ *   Held claims are NEVER released on PRE_COMMIT / PRE_PREPARE / PREPARE:
+ *   shared-row cleanup is tied to the post-outcome COMMIT/ABORT callbacks so
+ *   a claim is never released before the transaction outcome is known.
+ *   PRE_PREPARE rejects 2PC (PREPARE TRANSACTION) when claims are held (and
+ *   its ABORT re-entry releases them), while PREPARE (reached only when zero
+ *   claims are held) resets any leftover non-held local entries so nothing
+ *   carries the prepared transaction's saved_lxid forward.
  *
  *   xclaim_shmem_exit_cb is an `on_shmem_exit` callback. Each backend
  *   registers it on its first claim (xclaim_ensure_owner_token()),
@@ -92,19 +93,18 @@
 /* xclaim_xact_callback                                                 */
 /*                                                                      */
 /* RegisterXactCallback contract: invoked on every XactEvent. We act    */
-/* on five events:                                                      */
+/* on six events:                                                       */
 /*                                                                      */
-/*   PRE_PREPARE                       -> 2PC reject                    */
+/*   PRE_PREPARE                       -> 2PC reject if count > 0       */
+/*   PREPARE                           -> wipe non-held local entries   */
 /*   COMMIT / PARALLEL_COMMIT          -> cleanup                       */
 /*   ABORT  / PARALLEL_ABORT           -> cleanup (also the PRE_PREPARE */
 /*                                       re-entry path)                 */
 /*                                                                      */
-/* All other events (PRE_COMMIT / PARALLEL_PRE_COMMIT / PREPARE /       */
-/* etc.) are no-ops. Cleanup before the transaction outcome is known    */
-/* would release claims too early. Using PREPARE (vs PRE_PREPARE) for   */
-/* the user-facing reject is also too late -- by then the xact has      */
-/* crossed into prepare cleanup paths and the operator gets a much less */
-/* actionable error.                                                    */
+/* PRE_COMMIT and PARALLEL_PRE_COMMIT are no-ops: releasing held claims */
+/* before the transaction outcome is known would drop mutual exclusion  */
+/* too early, and rejecting 2PC in PREPARE instead of PRE_PREPARE would */
+/* be too late once PostgreSQL has entered prepare cleanup paths.       */
 /*                                                                      */
 /* Tantor SE adds PRE_ABORT / PARALLEL_PRE_ABORT, both no-ops here. It  */
 /* fires them at the start of AbortTransaction, after the LWLocks are   */
@@ -189,22 +189,35 @@ xclaim_xact_callback(XactEvent event, void *arg)
 
         case XACT_EVENT_PRE_COMMIT:
         case XACT_EVENT_PARALLEL_PRE_COMMIT:
-        case XACT_EVENT_PREPARE:
             /*
              * Idempotent no-op. Cleanup before outcome is known would
-             * release claims too early. Throwing the 2PC ERROR from
-             * XACT_EVENT_PREPARE is also too late (the xact has crossed
-             * into prepare cleanup).
+             * release claims too early.
              */
+            return;
+
+        case XACT_EVENT_PREPARE:
+            /*
+             * XACT_EVENT_PRE_PREPARE already verified zero held claims.
+             * Wipe any non-held local entries so nothing carries the
+             * prepared transaction's saved_lxid into a later transaction.
+             */
+            if (xclaim_local_count() == 0)
+                xclaim_local_cleanup_held();
             return;
 
 #ifdef XCLAIM_HAVE_XACT_EVENT_PRE_ABORT
         case XACT_EVENT_PRE_ABORT:
-        case XACT_EVENT_PARALLEL_PRE_ABORT:
             /*
-             * No-op (Tantor SE). ABORT / PARALLEL_ABORT of the same
-             * AbortTransaction call releases the claims.
+             * No-op (Tantor SE). Fired at the start of AbortTransaction
+             * before ProcArrayEndTransaction, and XACT_EVENT_ABORT follows
+             * to run actual cleanup.
              */
+            return;
+#endif
+
+#ifdef XCLAIM_HAVE_XACT_EVENT_PARALLEL_PRE_ABORT
+        case XACT_EVENT_PARALLEL_PRE_ABORT:
+            /* No-op (Tantor SE parallel worker pre-abort, paired with PARALLEL_ABORT). */
             return;
 #endif
 

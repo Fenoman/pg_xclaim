@@ -36,17 +36,19 @@ the already-installed `pg_xclaim.so` (`installcheck-smoke` and
 `--sharedir`).
 
 ```bash
-PG_CONFIG=/path/to/bin/pg_config        # adjust per major (16 / 17 / 18)
+export PG_CONFIG=/path/to/bin/pg_config # adjust per major (16 / 17 / 18)
 make PG_CONFIG="$PG_CONFIG" -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
 sudo make PG_CONFIG="$PG_CONFIG" install                # REQUIRED before installcheck
 
-# Test suites - run all three before opening a PR
+# Test suites - run all of them before opening a PR
 make PG_CONFIG="$PG_CONFIG" installcheck                # main
 make PG_CONFIG="$PG_CONFIG" installcheck-capacity       # capacity
 make PG_CONFIG="$PG_CONFIG" installcheck-nonpreload     # no-preload
+make PG_CONFIG="$PG_CONFIG" installcheck-lwlocks        # lwlocks guard
 bash test/concurrency/run_concurrency_suite.sh          # cross-session
 bash scripts/smoke_gate.sh "$PG_CONFIG"                 # preload smoke
 bash scripts/smoke_gate_no_preload.sh "$PG_CONFIG"      # no-preload smoke
+bash scripts/smoke_gate_multi_preload.sh "$PG_CONFIG"   # multi-preload smoke
 
 # Optional
 bash scripts/bench_try_many.sh "$PG_CONFIG"             # perf-budget gate
@@ -79,10 +81,12 @@ them. Key items:
   `LANGUAGE c VOLATILE PARALLEL RESTRICTED CALLED ON NULL INPUT`
   (mirror of `pg_try_advisory_xact_lock`, with strictness as the one
   deliberate divergence).
-- **Cleanup callback events:** handle ONLY `XACT_EVENT_COMMIT`,
-  `XACT_EVENT_PARALLEL_COMMIT`, `XACT_EVENT_ABORT`,
-  `XACT_EVENT_PARALLEL_ABORT`. `XACT_EVENT_PRE_PREPARE` is rejected
-  with `ERRCODE_FEATURE_NOT_SUPPORTED`.
+- **Cleanup callback events:** release held shared claims ONLY on
+  `XACT_EVENT_COMMIT`, `XACT_EVENT_PARALLEL_COMMIT`, `XACT_EVENT_ABORT`,
+  `XACT_EVENT_PARALLEL_ABORT`. `XACT_EVENT_PRE_PREPARE` rejects with
+  `ERRCODE_FEATURE_NOT_SUPPORTED` whenever claims are held, and
+  `XACT_EVENT_PREPARE` (`xclaim_local_count() == 0`) clears any leftover
+  non-held `XCLAIM_LOCAL_STAGED` entries from the backend-local set.
 - **Backend exit:** an `on_shmem_exit` callback registered in the
   backend on first use (`xclaim_ensure_owner_token`), once per backend.
   It runs after `ShutdownPostgres` and before `ProcKill`, so `MyProc`

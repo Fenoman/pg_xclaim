@@ -58,8 +58,8 @@ STRINGS = {
         "shmem_caption": "Allocates the partitioned hash\ntable in shared memory with\n"
                          "128 partitions.",
         "lwlock": "one LWLock\nper partition",
-        "bottom_caption": "Each partition is an array of hash buckets (HASH_BLOBS);\n"
-                          "each bucket is a short chained list of entries.",
+        "bottom_caption": "Each partition is an array of hash buckets (HASH_BLOBS),\n"
+                          "and each bucket is a short chained list of entries.",
     },
     "ru": {
         "partitions_title": "128 партиций (по умолчанию)",
@@ -67,8 +67,8 @@ STRINGS = {
         "shmem_caption": "Размещает партиционированную\nхеш-таблицу в разделяемой\n"
                          "памяти со 128 партициями.",
         "lwlock": "один LWLock\nна партицию",
-        "bottom_caption": "Каждая партиция — массив хеш-бакетов (HASH_BLOBS);\n"
-                          "каждый бакет — короткий связный список записей.",
+        "bottom_caption": "Каждая партиция - массив хеш-бакетов (HASH_BLOBS),\n"
+                          "каждый бакет - короткий связный список записей.",
     },
 }
 

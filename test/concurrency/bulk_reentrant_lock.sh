@@ -36,8 +36,8 @@ LIB_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$LIB_DIR/_lib.sh"
 
 XCLAIM_MAX_CLAIMS=2097152
-pg_xclaim_start_temp_cluster "bulk_reentrant"
 trap pg_xclaim_stop_temp_cluster EXIT INT TERM
+pg_xclaim_start_temp_cluster "bulk_reentrant"
 
 xclaim_banner "$SCRIPT"
 

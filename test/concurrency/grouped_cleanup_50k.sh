@@ -3,7 +3,7 @@
 # Grouped cleanup stress: 50k claims COMMIT < 100ms.
 #
 # Scenario:
-#   Single backend: BEGIN; xclaim.try_many 50000 keys; time COMMIT
+#   Single backend: BEGIN, xclaim.try_many 50000 keys, time COMMIT
 #   Assert: cleanup latency (COMMIT time) < 100ms
 #
 # Why <100ms? Group-by-partition cleanup:
@@ -26,16 +26,14 @@ LATENCY_BUDGET_MS=100
 LIB_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$LIB_DIR/_lib.sh"
 
-pg_xclaim_start_temp_cluster "cleanup50k"
-
-# Temp SQL files are registered here so they are removed even when an
-# assertion aborts the script early (set -e), not only on the success path.
 XCLAIM_TMPFILES=()
 cleanup_cleanup50k() {
     rm -f "${XCLAIM_TMPFILES[@]:-}"
     pg_xclaim_stop_temp_cluster
 }
 trap cleanup_cleanup50k EXIT INT TERM
+
+pg_xclaim_start_temp_cluster "cleanup50k"
 
 xclaim_banner "$SCRIPT"
 echo "KEY_COUNT=$KEY_COUNT  LATENCY_BUDGET=${LATENCY_BUDGET_MS}ms"
@@ -80,7 +78,7 @@ check_measured() {  # label
 echo "--- Test 1: acquire $KEY_COUNT keys ---"
 
 T_ACQUIRE_START="$(xclaim_now_ms)"
-ACQUIRE_RESULT="$(pg_xclaim_psql -X -A -t 2>/dev/null <<SQLACQUIRE
+ACQUIRE_RESULT="$(pg_xclaim_psql -X -A -t -v ON_ERROR_STOP=1 <<SQLACQUIRE
 SELECT count(v) FROM unnest(
     xclaim.try_many(1, ARRAY(SELECT generate_series(1, $KEY_COUNT)::int4))
 ) v WHERE v;
@@ -111,7 +109,7 @@ echo "--- Test 2: verify $KEY_COUNT claims visible in transaction ---"
 # Try_many without explicit transaction block auto-commits.
 # Let's verify by doing a proper transaction:
 
-CLEANUP_RESULT="$(pg_xclaim_psql -X -A -t 2>/dev/null <<SQLCLEAN
+CLEANUP_RESULT="$(pg_xclaim_psql -X -A -t -v ON_ERROR_STOP=1 <<SQLCLEAN
 BEGIN;
 SELECT count(v) FROM unnest(
     xclaim.try_many(1, ARRAY(SELECT generate_series(1, $KEY_COUNT)::int4))
@@ -189,16 +187,14 @@ SQLEOF2
 measured_psql "$ACQ_SQL_FILE"
 T_ACQ_END="$(xclaim_now_ms)"
 rm -f "$ACQ_SQL_FILE"
-check_measured "rollback_reference" || true
+ACQ_REF_OK=true
+check_measured "rollback_reference" || ACQ_REF_OK=false
 
 ACQUIRE_ONLY_MS=$(( T_ACQ_END - T_ACQ_START ))
-# COMMIT overhead = total - acquire_with_rollback (rollback also triggers cleanup)
-# More accurately: cleanup happens at both COMMIT and ROLLBACK.
-# Use: compare COMMIT path vs baseline from total timing.
-# When the difference is not positive, the estimate falls back to total_ms.
-COMMIT_ESTIMATE_MS=$(( TOTAL_MS - ACQUIRE_ONLY_MS > 0 ? TOTAL_MS - ACQUIRE_ONLY_MS : TOTAL_MS ))
+# Both COMMIT and ROLLBACK run cleanup, so clamp scheduling noise at 0ms.
+COMMIT_ESTIMATE_MS=$(( TOTAL_MS > ACQUIRE_ONLY_MS ? TOTAL_MS - ACQUIRE_ONLY_MS : 0 ))
 echo "  Acquire+ROLLBACK reference: ${ACQUIRE_ONLY_MS}ms"
-echo "  Commit-path delta estimate: ${COMMIT_ESTIMATE_MS}ms"
+echo "  Commit-vs-rollback delta:   ${COMMIT_ESTIMATE_MS}ms"
 
 # Ceiling on the whole acquire + COMMIT transaction, connection included:
 # 5x LATENCY_BUDGET_MS. TOTAL_MS is a conservative upper bound of the commit
@@ -216,94 +212,69 @@ else
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "commit_latency_total" "FAIL" "total_ms" "$TOTAL_MS" "exceeds 5x budget")")
 fi
 
-# STRICT assertion: use psql \timing to measure COMMIT step only
-echo "  Measuring COMMIT step only via psql \\timing..."
-TIMING_SQL_FILE="$(mktemp /tmp/xclaim_timing.XXXXXX.sql)"
-XCLAIM_TMPFILES+=("$TIMING_SQL_FILE")
-cat > "$TIMING_SQL_FILE" <<SQLEOF3
-\timing on
-BEGIN;
-SELECT 'acquired=' || count(v) FROM unnest(
-    xclaim.try_many(1, ARRAY(SELECT generate_series(300001, $((300000 + KEY_COUNT)))::int4))
-) v WHERE v;
-COMMIT;
-SQLEOF3
+# STRICT assertion: measure server-side 50k acquire+COMMIT AND pure COMMIT step
+# via clock_timestamp() inside a PL/pgSQL PROCEDURE (no psql startup or
+# generate_series array-construction overhead). Both must be < 100ms.
+echo "  Measuring server-side 50k acquire+COMMIT and COMMIT step via PL/pgSQL PROCEDURE..."
+COMMIT_MS_RAW="$(pg_xclaim_psql -X -A -t -q -F'|' -v ON_ERROR_STOP=1 <<SQLPROC
+CREATE UNLOGGED TABLE commit_50k_bench (keys int4[], total_srv_ms numeric, commit_ms numeric);
+INSERT INTO commit_50k_bench(keys)
+SELECT array_agg(g::int4) FROM generate_series(300001, $((300000 + KEY_COUNT))) g;
 
-# measured_psql forces the C locale on this invocation only, so the parser
-# below finds "Time:" regardless of the temp cluster's ru_RU.UTF-8 setup.
-# The wall-clock fallback covers any other unexpected format.
-measured_psql "$TIMING_SQL_FILE"
-rm -f "$TIMING_SQL_FILE"
-TIMING_OK=true
-check_measured "commit_latency_hard_gate" || TIMING_OK=false
-TIMING_OUTPUT="$MEASURED_OUT"
+CREATE PROCEDURE measure_commit_50k() LANGUAGE plpgsql AS \$\$
+DECLARE
+    k int4[];
+    n int;
+    t_acq timestamptz;
+    t0    timestamptz;
+    t1    timestamptz;
+BEGIN
+    SELECT keys INTO k FROM commit_50k_bench;
+    t_acq := clock_timestamp();
+    SELECT count(v) INTO n FROM unnest(xclaim.try_many(1, k)) v WHERE v;
+    IF n <> $KEY_COUNT THEN
+        RAISE EXCEPTION 'expected % claims, got %', $KEY_COUNT, n;
+    END IF;
+    t0 := clock_timestamp();
+    COMMIT;
+    t1 := clock_timestamp();
+    UPDATE commit_50k_bench
+       SET total_srv_ms = round(extract(epoch FROM (t1 - t_acq)) * 1000.0, 3),
+           commit_ms    = round(extract(epoch FROM (t1 - t0)) * 1000.0, 3);
+END;
+\$\$;
 
-# Extract COMMIT timing line
-COMMIT_TIMING="$(echo "$TIMING_OUTPUT" | grep -i "^Time:" | tail -1 || echo "")"
-echo "  psql \\timing COMMIT line: $COMMIT_TIMING"
+CALL measure_commit_50k();
+SELECT total_srv_ms, commit_ms FROM commit_50k_bench;
+DROP PROCEDURE measure_commit_50k();
+DROP TABLE commit_50k_bench;
+SQLPROC
+)"
+SRV_LINE="$(echo "$COMMIT_MS_RAW" | grep -E '^[0-9]+(\.[0-9]+)?\|[0-9]+(\.[0-9]+)?$' | tail -1)"
+SRV_TOTAL_MS="${SRV_LINE%%|*}"
+COMMIT_MS_PSQL="${SRV_LINE##*|}"
+echo "  Server-side 50k acquire+COMMIT: ${SRV_TOTAL_MS:-none}ms, COMMIT step: ${COMMIT_MS_PSQL:-none}ms"
 
-# Parse ms value
-COMMIT_MS_PSQL=""
-if ! $TIMING_OK; then
-    COMMIT_MS_PSQL="none (measured transaction failed)"
-elif [[ -n "$COMMIT_TIMING" ]]; then
-    COMMIT_MS_PSQL="$(echo "$COMMIT_TIMING" | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "")"
-    if [[ -n "$COMMIT_MS_PSQL" ]]; then
-        COMMIT_MS_INT="$(echo "$COMMIT_MS_PSQL" | cut -d. -f1)"
-        echo "  COMMIT step latency: ${COMMIT_MS_PSQL}ms"
-
-        if (( COMMIT_MS_INT < LATENCY_BUDGET_MS )); then
-            echo "  PASS: COMMIT latency ${COMMIT_MS_PSQL}ms < ${LATENCY_BUDGET_MS}ms (HARD gate)"
-            PASS=$(( PASS + 1 ))
-            CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "commit_latency_hard_gate" "PASS" "commit_ms" "$COMMIT_MS_PSQL" "<${LATENCY_BUDGET_MS}ms gate PASSED")")
-        else
-            echo "  FAIL: COMMIT latency ${COMMIT_MS_PSQL}ms >= ${LATENCY_BUDGET_MS}ms (HARD gate VIOLATED)" >&2
-            FAIL=$(( FAIL + 1 ))
-            CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "commit_latency_hard_gate" "FAIL" "commit_ms" "$COMMIT_MS_PSQL" "HARD gate VIOLATED")")
-        fi
-    fi
-fi
-
-if [[ -z "$COMMIT_MS_PSQL" ]]; then
-    echo "  INFO: could not parse \\timing output, using wall-clock fallback"
-    # Wall-clock fallback: measure the whole acquire+COMMIT step
-    WALL_SQL_FILE="$(mktemp /tmp/xclaim_wall.XXXXXX.sql)"
-    XCLAIM_TMPFILES+=("$WALL_SQL_FILE")
-    cat > "$WALL_SQL_FILE" <<SQLCOMMIT
-BEGIN;
-SELECT 'acquired=' || count(v) FROM unnest(
-    xclaim.try_many(1, ARRAY(SELECT generate_series(400001, $((400000 + KEY_COUNT)))::int4))
-) v WHERE v;
-COMMIT;
-SQLCOMMIT
-    T_C_START="$(xclaim_now_ms)"
-    measured_psql "$WALL_SQL_FILE"
-    T_C_END="$(xclaim_now_ms)"
-    rm -f "$WALL_SQL_FILE"
-    WALL_MS=$(( T_C_END - T_C_START ))
-    echo "  Wall-clock for acquire+COMMIT: ${WALL_MS}ms"
-
-    if ! check_measured "commit_latency_hard_gate"; then
-        : # check_measured has counted the FAIL
-    elif (( WALL_MS < LATENCY_BUDGET_MS * 3 )); then
-        echo "  PASS: wall-clock ${WALL_MS}ms within 3x budget (acquire dominates)"
-        PASS=$(( PASS + 1 ))
-        CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "commit_latency_hard_gate" "PASS" "wall_ms" "$WALL_MS" "wall-clock fallback")")
-    else
-        echo "  FAIL: wall-clock ${WALL_MS}ms exceeds 3x budget" >&2
-        FAIL=$(( FAIL + 1 ))
-        CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "commit_latency_hard_gate" "FAIL" "wall_ms" "$WALL_MS" "exceeds budget")")
-    fi
-    COMMIT_MS_PSQL="$WALL_MS (wall-clock)"
+ACQ_GATE_STATUS="FAIL"
+CMT_GATE_STATUS="FAIL"
+[[ -n "$SRV_TOTAL_MS" ]] && awk -v v="$SRV_TOTAL_MS" -v b="$LATENCY_BUDGET_MS" 'BEGIN { exit !(v < b) }' && ACQ_GATE_STATUS="PASS"
+[[ -n "$COMMIT_MS_PSQL" ]] && awk -v v="$COMMIT_MS_PSQL" -v b="$LATENCY_BUDGET_MS" 'BEGIN { exit !(v < b) }' && CMT_GATE_STATUS="PASS"
+CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "acquire_commit_hard_gate" "$ACQ_GATE_STATUS" "acquire_commit_srv_ms" "${SRV_TOTAL_MS:-0}" "<${LATENCY_BUDGET_MS}ms gate $ACQ_GATE_STATUS")")
+CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "commit_step_hard_gate" "$CMT_GATE_STATUS" "commit_step_srv_ms" "${COMMIT_MS_PSQL:-0}" "<${LATENCY_BUDGET_MS}ms gate $CMT_GATE_STATUS")")
+if [[ "$ACQ_GATE_STATUS" == "PASS" && "$CMT_GATE_STATUS" == "PASS" ]]; then
+    echo "  PASS: server acquire+COMMIT ${SRV_TOTAL_MS}ms and COMMIT ${COMMIT_MS_PSQL}ms both < ${LATENCY_BUDGET_MS}ms (HARD gate)"
+    PASS=$(( PASS + 1 ))
+else
+    echo "  FAIL: acquire+COMMIT '${SRV_TOTAL_MS:-none}'ms or COMMIT '${COMMIT_MS_PSQL:-none}'ms >= ${LATENCY_BUDGET_MS}ms (HARD gate VIOLATED)" >&2
+    FAIL=$(( FAIL + 1 ))
 fi
 
 # ---------------------------------------------------------------------------
 # Test 4: no leaked entries after commit
 # ---------------------------------------------------------------------------
 echo "--- Test 4: no leaked entries after 50k COMMIT ---"
-DEBUG_FINAL="$(pg_xclaim_psql -X -A -t \
-    -c "SELECT count(*) FROM xclaim.debug();" \
-    2>/dev/null | tr -d ' ' || echo "-1")"
+DEBUG_FINAL="$(pg_xclaim_psql -X -A -t -v ON_ERROR_STOP=1 \
+    -c "SELECT count(*) FROM xclaim.debug();" | tr -d ' ')"
 echo "  xclaim.debug() count after all commits: $DEBUG_FINAL"
 
 if [[ "$DEBUG_FINAL" == "0" ]]; then
@@ -321,7 +292,7 @@ xclaim_check_server_log "$SCRIPT" || FAIL=$(( FAIL + 1 ))
 echo ""
 echo "=== GROUPED CLEANUP LATENCY SUMMARY ==="
 echo "  Keys acquired: $KEY_COUNT"
-echo "  COMMIT latency (psql timing / wall-clock): ${COMMIT_MS_PSQL}ms"
+echo "  Acquire+COMMIT / COMMIT latency (server clock_timestamp): ${SRV_TOTAL_MS}ms / ${COMMIT_MS_PSQL}ms"
 echo "  Budget: <${LATENCY_BUDGET_MS}ms"
 echo "  Theory: 128 partitions x ~10us/partition = ~1.28ms (vs ${KEY_COUNT} x 3us = $((KEY_COUNT * 3 / 1000))ms per-key)"
 echo ""

@@ -47,7 +47,7 @@
  *     xclaim.debug_snapshot, and xclaim.count are STABLE PARALLEL
  *     RESTRICTED (each touches per-backend state that workers do not
  *     inherit), and xclaim.debug is STABLE PARALLEL UNSAFE. See
- *     sql/pg_xclaim--1.0.0-rc1.sql.
+ *     sql/pg_xclaim--1.0.0-rc5.sql.
  *
  *-------------------------------------------------------------------------
  */
@@ -457,7 +457,7 @@ _PG_init(void)
 /* `xclaim.try(int4, int4)` -> xclaim_try_pair                          */
 /* `xclaim.try(int8)`       -> xclaim_try_solo                          */
 /*                                                                      */
-/* Function attributes (in sql/pg_xclaim--1.0.0-rc1.sql) are:           */
+/* Function attributes (in sql/pg_xclaim--1.0.0-rc5.sql) are:           */
 /*    LANGUAGE c                                                        */
 /*    VOLATILE                                                          */
 /*    PARALLEL RESTRICTED                                                */

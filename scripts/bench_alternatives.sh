@@ -49,7 +49,7 @@
 #   1   bench infrastructure failure
 #
 # HARD INVARIANTS:
-#   - set -euo pipefail; trap cleanup
+#   - set -euo pipefail and trap cleanup
 #   - /tmp temp cluster only, never touch user clusters
 #   - locale ru_RU.UTF-8
 
@@ -115,8 +115,15 @@ PGSOCKET="$PGDATA"
 WORK_DIR="$(mktemp -d "/tmp/pg_xclaim_${USER:-nobody}_$$.bench_work.XXXXXX")"
 
 cleanup() {
-    "$PGCTL" stop -D "$PGDATA" -m immediate >/dev/null 2>&1 || true
-    rm -rf "${PGDATA:?}" "${WORK_DIR:?}"
+    local st=0
+    "$PGCTL" stop -D "$PGDATA" -m immediate -w >/dev/null 2>&1 || true
+    rm -rf "${WORK_DIR:?}"
+    if [[ ! -e "$PGDATA/postmaster.pid" ]]; then
+        rm -rf "${PGDATA:?}"
+        return 0
+    fi
+    "$PGCTL" status -D "$PGDATA" >/dev/null 2>&1 || st=$?
+    [[ "$st" -eq 3 ]] && rm -rf "${PGDATA:?}" || true
 }
 trap cleanup EXIT INT TERM
 
@@ -210,10 +217,11 @@ CREATE UNLOGGED TABLE claims_t_sorted (
 );
 
 -- Random-key generator covering the full ACCOUNT_POOL.
--- Used in MODE=overlap: every backend draws from [1, ACCOUNT_POOL],
--- so concurrent backends compete on the same keyspace (~52% pairwise
--- key overlap at N=8 K=100k POOL=1M). Duplicates within one batch are
--- possible but rare at K << ACCOUNT_POOL.
+-- Used in MODE=overlap: every backend draws with replacement from
+-- [1, ACCOUNT_POOL], so concurrent backends compete on the same keyspace
+-- (~50% probability per key that at least one of the other 7 workers
+-- drew it at N=8 K=100k POOL=1M, ~9.5% against a single peer).
+-- Duplicates within one batch are possible and rare at K << ACCOUNT_POOL.
 CREATE OR REPLACE FUNCTION rand_keys(k int) RETURNS int4[]
 LANGUAGE sql VOLATILE PARALLEL RESTRICTED AS \$\$
     SELECT array_agg(((random() * ($ACCOUNT_POOL - 1))::int4 + 1))
@@ -360,6 +368,10 @@ for line in r.stderr.splitlines():
         except (IndexError, ValueError):
             pass
 
+if len(samples) != iters:
+    sys.stderr.write(f"incomplete worker run: expected {iters} LATENCY notices, got {len(samples)}\n")
+    sys.exit(1)
+
 with open(lat_file, "w") as fh:
     for s in samples:
         fh.write(f"{s}\n")
@@ -369,15 +381,9 @@ EOF
 
 # ---------------------------------------------------------------------------
 # Aggregator: read all lat_<impl>_*.txt for a scenario and emit a summary line.
-#
-# Limitation: throughput is n * ITERS divided by the longest wall time among
-# the workers that finished, so it assumes that every worker completed all
-# its iterations. The plpgsql loop catches only XBENC and lock_not_available.
-# A deadlock or any other error aborts the worker's DO block, and the worker
-# exits without writing samples. `wait` in the main loop does not check
-# worker exit statuses. As long as one worker finishes, the scenario still
-# gets a row: the lost workers' iterations count as done, and p50/p95/p99
-# come from the survivors only.
+# Throughput counts only actually completed transactions (len(samples)), so an
+# alternative worker aborted by deadlock does not get credit for unfinished
+# iterations. For impl=A (pg_xclaim), any non-zero worker exit fails the run.
 # ---------------------------------------------------------------------------
 aggregate() {
     local impl="$1" n="$2" k="$3" wal_bytes="$4" cap_used="$5" deadlocks="$6"
@@ -424,7 +430,7 @@ def pct(p):
 p50 = pct(50)
 p95 = pct(95)
 p99 = pct(99)
-total_tx = n * iters
+total_tx = len(samples)
 throughput = total_tx / wall_max if wall_max > 0 else 0.0
 
 print(f"{impl},{n},{k},{throughput:.1f},{p50:.3f},{p95:.3f},{p99:.3f},{wal_bytes},{cap_used},{deadlocks}")
@@ -470,7 +476,7 @@ for n in "${N_VALUES[@]}"; do
             # Reset xclaim per-backend state -- the previous scenario's
             # backends already disconnected, so xclaim state is empty,
             # but be paranoid.
-            "${PSQL_BASE[@]}" -c "SELECT xclaim.session_reset();" >/dev/null 2>&1 || true
+            "${PSQL_BASE[@]}" -c "SELECT xclaim.session_reset();" >/dev/null
 
             lsn0="$(wal_lsn)"
             cap_before="$(cap_peak 2>/dev/null || echo 0)"
@@ -480,10 +486,24 @@ for n in "${N_VALUES[@]}"; do
             rm -f "$WORK_DIR"/lat_${impl}_*.txt
 
             echo "[bench] impl=$impl mode=$MODE backends=$n K=$k iters=$ITERS ..."
+            WORKER_PIDS=()
             for ((w = 1; w <= n; w++)); do
                 worker "$w" "$impl" "$k" "$n" &
+                WORKER_PIDS+=("$!")
             done
-            wait
+            WORKER_FAILS=0
+            for wpid in "${WORKER_PIDS[@]}"; do
+                if ! wait "$wpid"; then
+                    WORKER_FAILS=$((WORKER_FAILS + 1))
+                fi
+            done
+            if [[ "$impl" == "A" ]] && (( WORKER_FAILS > 0 )); then
+                echo "[bench] ERROR: $WORKER_FAILS pg_xclaim worker(s) failed in impl=A n=$n k=$k" >&2
+                exit 1
+            fi
+            if (( WORKER_FAILS > 0 )); then
+                echo "[bench] WARN: $WORKER_FAILS/$n worker(s) failed in impl=$impl n=$n k=$k (incomplete alternative run)" >&2
+            fi
 
             lsn1="$(wal_lsn)"
             wal_bytes="$(wal_diff_bytes "$lsn0" "$lsn1")"
@@ -496,10 +516,16 @@ for n in "${N_VALUES[@]}"; do
                 cap_used_obs="$cap_after"
             fi
 
-            row="$(aggregate "$impl" "$n" "$k" "$wal_bytes" "$cap_used_obs" "$dl_delta")" || {
-                echo "[bench] aggregate failed for impl=$impl n=$n k=$k" >&2
-                continue
-            }
+            if (( WORKER_FAILS > 0 )); then
+                row="${impl}_INCOMPLETE,${n},${k},nan,nan,nan,nan,${wal_bytes},${cap_used_obs},${dl_delta}"
+            elif ! row="$(aggregate "$impl" "$n" "$k" "$wal_bytes" "$cap_used_obs" "$dl_delta")"; then
+                if [[ "$impl" == "A" ]]; then
+                    echo "[bench] ERROR: aggregate failed for impl=A n=$n k=$k" >&2
+                    exit 1
+                fi
+                echo "[bench] WARN: zero completed samples for impl=$impl n=$n k=$k" >&2
+                row="${impl}_FAILED,${n},${k},nan,nan,nan,nan,${wal_bytes},${cap_used_obs},${dl_delta}"
+            fi
             ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "${ts},${PG_MAJOR},${MODE},${row}" >> "$CSV_OUT"
             echo "  -> $row"
@@ -519,10 +545,10 @@ echo "  - xclaim_capacity_observed is xclaim.stats().capacity_used after impl=A 
 echo
 echo "Two key-space modes are supported (MODE=overlap|disjoint):"
 echo
-echo "MODE=overlap  -- backends share a key pool, ~52% pairwise overlap"
-echo "                at N=8 K=100k. Models real production scenarios"
-echo "                where operations naturally compete for the same"
-echo "                accounts."
+echo "MODE=overlap  -- backends share a 1M-key pool (~50% per-key"
+echo "                probability of overlap with the other 7 workers"
+echo "                at N=8 K=100k, ~9.5% against one peer). Models"
+echo "                real production contention."
 echo "MODE=disjoint -- worker-disjoint key slices: no two backends ever"
 echo "                request the same key. Isolates raw implementation"
 echo "                cost from conflict-resolution cost."

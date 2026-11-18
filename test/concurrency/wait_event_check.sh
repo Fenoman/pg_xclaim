@@ -38,18 +38,16 @@ EXPECTED_TRANCHE="xclaim_partition"
 A_CLAIMS=200000
 # Loops of B sessions that try new keys while A scans.
 N_B_LOOPS=8
-XCLAIM_MAX_CLAIMS=262144 pg_xclaim_start_temp_cluster "wait_event"
-# Server messages of every session in English, whatever the cluster locale.
-export PGOPTIONS='-c lc_messages=C'
-
-# Temp dirs registered here are removed even when an assertion aborts the
-# script early (set -e), not only on the success path.
 XCLAIM_TMPFILES=()
 cleanup_wait_event() {
     rm -rf "${XCLAIM_TMPFILES[@]:-}"
     pg_xclaim_stop_temp_cluster
 }
 trap cleanup_wait_event EXIT INT TERM
+
+XCLAIM_MAX_CLAIMS=262144 pg_xclaim_start_temp_cluster "wait_event"
+# Server messages of every session in English, whatever the cluster locale.
+export PGOPTIONS='-c lc_messages=C'
 
 xclaim_banner "$SCRIPT"
 

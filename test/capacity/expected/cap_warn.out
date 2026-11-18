@@ -30,42 +30,42 @@ SELECT
     count(*) FILTER (WHERE NOT acquired) > 0 AS some_rejected
 FROM results;
 WARNING:  pg_xclaim: capacity watermark crossed -- 95% (61 / 64 claims)
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
  acquired_count | rejected_count | some_rejected 
 ----------------+----------------+---------------
              64 |             36 | t
@@ -82,7 +82,7 @@ SELECT capacity_warnings > 0 AS has_warnings FROM xclaim.stats();
 -- failed try left no entry in the local set, so the second try goes to
 -- shared memory again, and the local count still equals the shared one.
 SELECT xclaim.try(1, 100) AS second_try;
-WARNING:  pg_xclaim: max_claims (64) exhausted; treating as conflict
+WARNING:  pg_xclaim: max_claims (64) exhausted, treating as conflict
  second_try 
 ------------
  f

@@ -3,11 +3,11 @@
 ## Supported versions
 
 `pg_xclaim` is in **release-candidate** state. Security fixes land on
-the current tag (`v1.0.0-rc4`) and on `main`.
+the current tag (`v1.0.0-rc5`) and on `main`.
 
 | Version | Security fixes |
 |---------|----------------|
-| `v1.0.0-rc4` (current) / `main` | Yes |
+| `v1.0.0-rc5` (current) / `main` | Yes |
 
 PostgreSQL major-version matrix: PG 16, 17, 18 (upstream and
 ABI-compatible forks). Security fixes apply to all three majors
@@ -19,9 +19,9 @@ Suspected security issues include:
 
 - Memory corruption (use-after-free, out-of-bounds read/write, double
   free in shared memory or backend-local state).
-- Privilege escalation (any path that lets a non-superuser observe or
-  modify state they shouldn't, including bypass of the `pg_monitor` /
-  superuser gates on `xclaim.debug` and `xclaim.debug_inject_stale`).
+- Privilege escalation (any path that lets an unauthorized role observe
+  or modify state it should not, including bypass of the SQL ACL gates
+  on `xclaim.debug`, `xclaim.debug_snapshot`, and `xclaim.stats`).
 - Denial-of-service via the SQL surface (a single non-superuser call
   that crashes the cluster, exhausts shared memory irrecoverably, or
   permanently deadlocks the LockManager).
@@ -52,7 +52,7 @@ When reporting, please include:
   `.github/ISSUE_TEMPLATE/bug_report.md`.
 - Documented limitations: 2PC rejection at `PRE_PREPARE`, hot-standby
   refusal, managed-cloud incompatibility, `num_partitions <= 192` cap
-  for `xclaim.debug_snapshot()`.
+  for `xclaim.debug()` and `xclaim.debug_snapshot()`.
 - Build failures on a PostgreSQL major outside the supported matrix
   (PG 16 / 17 / 18 upstream + ABI-compatible forks).
 
@@ -71,10 +71,11 @@ On multi-tenant clusters, treat the SQL surface as a privileged
 resource and `REVOKE EXECUTE` from untrusted roles:
 
 ```sql
-REVOKE EXECUTE ON FUNCTION xclaim.try(int8)            FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION xclaim.try(int4, int4)      FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION xclaim.try_many(int8[])     FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION xclaim.try(int8)              FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION xclaim.try(int4, int4)        FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION xclaim.try_many(int8[])       FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION xclaim.try_many(int4, int4[]) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION xclaim.session_reset()        FROM PUBLIC;
 ```
 
 Setting `pg_xclaim.on_capacity_exhaustion=warn` degrades to a failed

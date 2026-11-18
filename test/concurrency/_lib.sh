@@ -4,8 +4,8 @@
 #
 # Usage:
 #   source "$(dirname "$0")/_lib.sh"
-#   pg_xclaim_start_temp_cluster   # sets PGDATA, PGPORT, PGSOCKET, PGHOST
 #   trap pg_xclaim_stop_temp_cluster EXIT INT TERM
+#   pg_xclaim_start_temp_cluster   # sets PGDATA, PGPORT, PGSOCKET, PGHOST
 #   pg_xclaim_psql -c "SELECT 1"
 #
 # HARD INVARIANTS:
@@ -65,6 +65,12 @@ fi
 PGBIN="$("$PG_CONFIG" --bindir)"
 XCLAIM_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Ownership trackers: never trust inherited PGDATA / XCLAIM_TEST_HOOKS_DIR
+# from the caller's environment if an early trap fires before mktemp runs.
+_XCLAIM_OWNED_PGDATA=""
+_XCLAIM_OWNED_HOOKS_DIR=""
+unset PGDATA PGPORT PGSOCKET PGHOST XCLAIM_TEST_HOOKS_DIR
+
 # ---------------------------------------------------------------------------
 # Free-port probe (no races vs fixed-port assignment in a common range).
 # Uses Python3 -- available on macOS and all CI images.
@@ -100,7 +106,13 @@ pg_xclaim_start_temp_cluster() {
     local _max_claims="${XCLAIM_MAX_CLAIMS:-65536}"
     local _num_partitions="${XCLAIM_NUM_PARTITIONS:-128}"
 
+    # Ensure a default cleanup trap is armed before allocating a temp dir.
+    if [[ -z "$(trap -p EXIT)" ]]; then
+        trap pg_xclaim_stop_temp_cluster EXIT INT TERM
+    fi
+
     PGDATA="$(mktemp -d "/tmp/pg_xclaim_${USER:-nobody}_$$.${suffix}.XXXXXX")"
+    _XCLAIM_OWNED_PGDATA="$PGDATA"
     PGPORT="$(xclaim_free_port)"
     PGSOCKET="$PGDATA"   # private socket dir -- no race with other users
     PGHOST="$PGDATA"
@@ -113,6 +125,9 @@ pg_xclaim_start_temp_cluster() {
         echo "[lib] FATAL: locale ru_RU.UTF-8 not available on this host." >&2
         echo "[lib]   Generate it first, e.g.: sudo locale-gen ru_RU.UTF-8" >&2
         echo "[lib]   (macOS ships ru_RU.UTF-8 by default, on Linux install/generate it.)" >&2
+        rm -rf "$_XCLAIM_OWNED_PGDATA"
+        _XCLAIM_OWNED_PGDATA=""
+        unset PGDATA PGPORT PGSOCKET PGHOST
         return 1
     fi
 
@@ -125,6 +140,9 @@ pg_xclaim_start_temp_cluster() {
         -U postgres 2>&1)"; then
         echo "[lib] FATAL: initdb failed, output follows:" >&2
         printf '%s\n' "$_initdb_out" >&2
+        rm -rf "$_XCLAIM_OWNED_PGDATA"
+        _XCLAIM_OWNED_PGDATA=""
+        unset PGDATA PGPORT PGSOCKET PGHOST
         return 1
     fi
 
@@ -151,17 +169,32 @@ pg_xclaim_start_temp_cluster() {
     # a postmaster started with LC_ALL and LANG unset exits with FATAL
     # "postmaster became multithreaded during startup". The prefix keeps
     # the locale scoped to pg_ctl.
-    LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
-    "$PGBIN/pg_ctl" start -D "$PGDATA" -w \
-        -l "$PGDATA/server.log" \
-        -o "-p $PGPORT" \
-        >/dev/null 2>&1
+    if ! LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
+        "$PGBIN/pg_ctl" start -D "$PGDATA" -w \
+            -l "$PGDATA/server.log" \
+            -o "-p $PGPORT" \
+            >/dev/null 2>&1; then
+        echo "[lib] FATAL: pg_ctl start failed, tail of server.log:" >&2
+        tail -n 40 "$PGDATA/server.log" >&2 || true
+        _xclaim_stop_and_remove_dir "$_XCLAIM_OWNED_PGDATA"
+        _XCLAIM_OWNED_PGDATA=""
+        unset PGDATA PGPORT PGSOCKET PGHOST
+        return 1
+    fi
 
     # Create extension (unless caller opted out for non-preload tests)
     if [[ -z "${XCLAIM_NO_EXTENSION:-}" ]] && [[ -z "${XCLAIM_NO_PRELOAD:-}" ]]; then
-        "$PGBIN/psql" -h "$PGSOCKET" -p "$PGPORT" -U postgres -d postgres \
-            -c "CREATE EXTENSION IF NOT EXISTS pg_xclaim;" \
-            >/dev/null 2>&1
+        local _ext_out
+        if ! _ext_out="$("$PGBIN/psql" -h "$PGSOCKET" -p "$PGPORT" -U postgres -d postgres \
+            -v ON_ERROR_STOP=1 \
+            -c "CREATE EXTENSION IF NOT EXISTS pg_xclaim;" 2>&1)"; then
+            echo "[lib] FATAL: CREATE EXTENSION pg_xclaim failed:" >&2
+            printf '%s\n' "$_ext_out" >&2
+            _xclaim_stop_and_remove_dir "$_XCLAIM_OWNED_PGDATA"
+            _XCLAIM_OWNED_PGDATA=""
+            unset PGDATA PGPORT PGSOCKET PGHOST
+            return 1
+        fi
     fi
 
     echo "[lib] cluster up: PGDATA=$PGDATA PGPORT=$PGPORT" >&2
@@ -169,18 +202,36 @@ pg_xclaim_start_temp_cluster() {
 
 # ---------------------------------------------------------------------------
 # Stop and remove the temp cluster.
-# Safe to call multiple times (idempotent).
+# Safe to call multiple times (idempotent). Only touches directories created
+# by this shell's own mktemp calls, never an inherited PGDATA.
 # ---------------------------------------------------------------------------
+_xclaim_stop_and_remove_dir() {
+    local _dir="$1"
+    local _st=0
+    if [[ ! -f "$_dir/postmaster.pid" ]]; then
+        rm -rf "$_dir"
+        return 0
+    fi
+    "$PGBIN/pg_ctl" stop -D "$_dir" -m immediate -w -t 10 >/dev/null 2>&1 || true
+    "$PGBIN/pg_ctl" status -D "$_dir" >/dev/null 2>&1 || _st=$?
+    if [[ "$_st" -ne 3 ]]; then
+        echo "[lib] WARN: pg_ctl status=$_st for $_dir (not confirmed stopped), leaving directory in place" >&2
+        return 0
+    fi
+    rm -rf "$_dir"
+}
+
 pg_xclaim_stop_temp_cluster() {
     local _rc=$?
-    if [[ -n "${PGDATA:-}" ]] && [[ -d "${PGDATA:-}" ]]; then
-        echo "[lib] stopping cluster $PGDATA" >&2
-        "$PGBIN/pg_ctl" stop -D "$PGDATA" -m immediate >/dev/null 2>&1 || true
-        rm -rf "$PGDATA"
+    if [[ -n "${_XCLAIM_OWNED_PGDATA:-}" ]] && [[ "$_XCLAIM_OWNED_PGDATA" == /tmp/pg_xclaim_* ]] && [[ -d "$_XCLAIM_OWNED_PGDATA" ]]; then
+        echo "[lib] stopping cluster $_XCLAIM_OWNED_PGDATA" >&2
+        _xclaim_stop_and_remove_dir "$_XCLAIM_OWNED_PGDATA"
+        _XCLAIM_OWNED_PGDATA=""
         unset PGDATA PGPORT PGSOCKET PGHOST
     fi
-    if [[ -n "${XCLAIM_TEST_HOOKS_DIR:-}" ]] && [[ -d "$XCLAIM_TEST_HOOKS_DIR" ]]; then
-        rm -rf "$XCLAIM_TEST_HOOKS_DIR"
+    if [[ -n "${_XCLAIM_OWNED_HOOKS_DIR:-}" ]] && [[ "$_XCLAIM_OWNED_HOOKS_DIR" == /tmp/pg_xclaim_* ]] && [[ -d "$_XCLAIM_OWNED_HOOKS_DIR" ]]; then
+        rm -rf "$_XCLAIM_OWNED_HOOKS_DIR"
+        _XCLAIM_OWNED_HOOKS_DIR=""
         unset XCLAIM_TEST_HOOKS_DIR
     fi
     return $_rc
@@ -199,8 +250,9 @@ pg_xclaim_stop_temp_cluster() {
 xclaim_build_test_hooks() {
     local src="$XCLAIM_LIB_DIR/../modules/xclaim_test_hooks"
     XCLAIM_TEST_HOOKS_DIR="$(mktemp -d "/tmp/pg_xclaim_${USER:-nobody}_$$.hooks.XXXXXX")"
+    _XCLAIM_OWNED_HOOKS_DIR="$XCLAIM_TEST_HOOKS_DIR"
     cp "$src/xclaim_test_hooks.c" "$src/Makefile" "$XCLAIM_TEST_HOOKS_DIR/"
-    if ! make -C "$XCLAIM_TEST_HOOKS_DIR" PG_CONFIG="$PG_CONFIG" \
+    if ! make -C "$XCLAIM_TEST_HOOKS_DIR" PG_CONFIG="$PG_CONFIG" with_llvm=no \
             XCLAIM_SRC="$(cd "$XCLAIM_LIB_DIR/../../src" && pwd)" \
             >"$XCLAIM_TEST_HOOKS_DIR/build.log" 2>&1; then
         echo "[lib] FATAL: building xclaim_test_hooks failed, output follows:" >&2
@@ -222,6 +274,12 @@ CREATE FUNCTION xclaim_test_set_published_token(int4, int8) RETURNS void
     AS '$XCLAIM_TEST_HOOKS', 'xclaim_test_set_published_token' LANGUAGE C STRICT;
 CREATE FUNCTION xclaim_test_call_with_lwlocks_held(regprocedure, int8) RETURNS bool
     AS '$XCLAIM_TEST_HOOKS', 'xclaim_test_call_with_lwlocks_held' LANGUAGE C STRICT;
+CREATE FUNCTION xclaim_test_inject_stale(int4, int4) RETURNS void
+    AS '$XCLAIM_TEST_HOOKS', 'xclaim_test_inject_stale' LANGUAGE C CALLED ON NULL INPUT;
+CREATE FUNCTION xclaim_test_set_live_capacity(int8) RETURNS void
+    AS '$XCLAIM_TEST_HOOKS', 'xclaim_test_set_live_capacity' LANGUAGE C STRICT;
+CREATE FUNCTION xclaim_test_pair_partition(int4, int4) RETURNS int4
+    AS '$XCLAIM_TEST_HOOKS', 'xclaim_test_pair_partition' LANGUAGE C STRICT;
 SQL
 }
 

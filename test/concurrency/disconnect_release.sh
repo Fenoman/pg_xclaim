@@ -3,7 +3,7 @@
 # Backend disconnect releases claim (the exit path aborts the open transaction).
 #
 # Scenario:
-#   Session A: BEGIN; xclaim.try(1, 500) -> true; client disconnects (psql exits)
+#   Session A: BEGIN, xclaim.try(1, 500) -> true, client disconnects (psql exits)
 #   Session B: xclaim.try(1, 500) -> true (A's exit released the claim)
 #
 # When a backend exits with an open transaction, the core before_shmem_exit
@@ -22,8 +22,8 @@ SCRIPT="disconnect_release"
 LIB_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$LIB_DIR/_lib.sh"
 
-pg_xclaim_start_temp_cluster "disconnect_release"
 trap pg_xclaim_stop_temp_cluster EXIT INT TERM
+pg_xclaim_start_temp_cluster "disconnect_release"
 
 xclaim_banner "$SCRIPT"
 

@@ -3,7 +3,7 @@
 # Cross-session conflict test.
 #
 # Scenario:
-#   Session A: BEGIN; xclaim.try(1, 100) -> true; stays in transaction (idle)
+#   Session A: BEGIN, xclaim.try(1, 100) -> true, stays in transaction (idle)
 #   Session B: BEGIN; xclaim.try(1, 100) -> false  (conflict with A),
 #              the same try again -> false, xclaim.count() -> 0: the
 #              failed try leaves nothing in B's local set
@@ -28,9 +28,8 @@ SCRIPT="conflict"
 LIB_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$LIB_DIR/_lib.sh"
 
-pg_xclaim_start_temp_cluster "conflict"
-
 trap pg_xclaim_stop_temp_cluster EXIT INT TERM
+pg_xclaim_start_temp_cluster "conflict"
 
 xclaim_banner "$SCRIPT"
 

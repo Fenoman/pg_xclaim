@@ -31,10 +31,11 @@
 #   - /tmp clusters only, trap-based cleanup
 #   - never operates against an existing user cluster
 #
-# This script is INTENDED to be backgrounded or sourced by callers. By default
-# it stays in foreground and tears down the cluster on signal -- pass
-# --keep-running to skip cleanup (caller assumes ownership, useful for
-# benchmarks that need the cluster alive after this script returns).
+# By default this script starts the cluster, validates extension creation,
+# prints sourceable KEY=VALUE lines, and tears down the cluster on exit.
+# Pass --keep-running to transfer cluster ownership to the caller once
+# startup and CREATE EXTENSION succeed (on any startup error the cluster
+# is still stopped and removed).
 
 set -euo pipefail
 
@@ -45,6 +46,7 @@ shift
 NO_PRELOAD=0
 NO_EXTENSION=0
 KEEP_RUNNING=0
+CLUSTER_READY=0
 MAX_CLAIMS=65536
 NUM_PARTITIONS=128
 EXTRA_CONF=""
@@ -68,9 +70,37 @@ INITDB="$PGBIN/initdb"
 PGCTL="$PGBIN/pg_ctl"
 PSQL="$PGBIN/psql"
 
+# Locale preflight before allocating $PGDATA.
+if ! { locale -a 2>/dev/null || true; } | grep -qiE "ru_RU\.(UTF-8|utf8)"; then
+    echo "run_temp_cluster: locale ru_RU.UTF-8 not installed (required by initdb)" >&2
+    echo "  install it (e.g. 'localedef -i ru_RU -f UTF-8 ru_RU.UTF-8') and retry" >&2
+    exit 1
+fi
+
 PGDATA="$(mktemp -d "/tmp/pg_xclaim_${USER:-nobody}_$$.tempcluster.XXXXXX")"
 PGSOCKET="$PGDATA"
 PGHOST="$PGDATA"
+
+cleanup() {
+    local rc=$?
+    if [[ "$KEEP_RUNNING" -eq 1 ]] && [[ "$CLUSTER_READY" -eq 1 ]] && [[ "$rc" -eq 0 ]]; then
+        return 0
+    fi
+    if [[ -n "${PGDATA:-}" ]] && [[ -d "$PGDATA" ]]; then
+        if [[ ! -f "$PGDATA/postmaster.pid" ]]; then
+            rm -rf "${PGDATA:?}"
+        else
+            local st=0
+            "$PGCTL" stop -D "$PGDATA" -m immediate -w -t 10 >/dev/null 2>&1 || true
+            "$PGCTL" status -D "$PGDATA" >/dev/null 2>&1 || st=$?
+            if [[ "$st" -eq 3 ]]; then
+                rm -rf "${PGDATA:?}"
+            fi
+        fi
+    fi
+    return $rc
+}
+trap cleanup EXIT INT TERM
 
 # Free-port probe -- python3 is available on macOS + ubuntu-latest CI runners.
 PGPORT="$(python3 -c '
@@ -80,27 +110,6 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     print(s.getsockname()[1])
 ')"
-
-# Locale preflight: initdb dies with an opaque error if ru_RU.UTF-8 is
-# absent. Probe up-front so the failure message names the actual cause.
-if ! { locale -a 2>/dev/null || true; } | grep -qiE "ru_RU\.(UTF-8|utf8)"; then
-    echo "run_temp_cluster: locale ru_RU.UTF-8 not installed (required by initdb)" >&2
-    echo "  install it (e.g. 'localedef -i ru_RU -f UTF-8 ru_RU.UTF-8') and retry" >&2
-    exit 1
-fi
-
-cleanup() {
-    local rc=$?
-    if [[ "$KEEP_RUNNING" -eq 1 ]]; then
-        return $rc
-    fi
-    if [[ -d "$PGDATA" ]]; then
-        "$PGCTL" stop -D "$PGDATA" -m immediate >/dev/null 2>&1 || true
-        rm -rf "${PGDATA:?}"
-    fi
-    return $rc
-}
-trap cleanup EXIT INT TERM
 
 # Capture initdb output: a swallowed failure (e.g. missing locale) would
 # otherwise die silently with no diagnostic.
@@ -148,6 +157,7 @@ if [[ "$NO_PRELOAD" -eq 0 ]] && [[ "$NO_EXTENSION" -eq 0 ]]; then
 fi
 
 # Sourceable output
+CLUSTER_READY=1
 printf 'PGDATA=%s\n' "$PGDATA"
 printf 'PGPORT=%s\n' "$PGPORT"
 printf 'PGSOCKET=%s\n' "$PGSOCKET"

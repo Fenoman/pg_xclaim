@@ -88,7 +88,7 @@ SELECT xclaim.try_many(1, ARRAY[]::int4[]) AS pair_empty,
 
 ROLLBACK;
 -- 5. Synthetic large array -> typed ERROR, no crash.
--- 50M int4 elements means slots array would want ~1.6 GB on 64-bit, well
+-- 50M int4 elements means slots array would want ~2.0 GB on 64-bit, well
 -- over MaxAllocSize (1 GB). We catch this before palloc with our own
 -- ERRCODE_PROGRAM_LIMIT_EXCEEDED + HINT.
 \set ON_ERROR_STOP off
@@ -96,4 +96,142 @@ BEGIN;
 SELECT xclaim.try_many(0, ARRAY(SELECT generate_series(1, 50000000)::int4)) IS NOT NULL AS should_error;
 ERROR:  pg_xclaim: xclaim.try_many array too large (50000000 elements)
 ROLLBACK;
+-- 6. Parallel worker guard applies even on empty arrays and when enabled = off.
+CREATE FUNCTION pg_temp.par_empty_solo() RETURNS boolean[]
+    LANGUAGE plpgsql PARALLEL SAFE
+    AS $$ BEGIN RETURN xclaim.try_many(ARRAY[]::int8[]); END; $$;
+CREATE FUNCTION pg_temp.par_empty_pair() RETURNS boolean[]
+    LANGUAGE plpgsql PARALLEL SAFE
+    AS $$ BEGIN RETURN xclaim.try_many(1, ARRAY[]::int4[]); END; $$;
+CREATE FUNCTION pg_temp.par_disabled_solo() RETURNS boolean[]
+    LANGUAGE plpgsql PARALLEL SAFE
+    AS $$ BEGIN RETURN xclaim.try_many(ARRAY[1, 2]::int8[]); END; $$;
+BEGIN;
+SET LOCAL debug_parallel_query = regress;
+SELECT pg_temp.par_empty_solo();
+ERROR:  pg_xclaim: xclaim.try_many cannot be called from a parallel worker
+ROLLBACK;
+BEGIN;
+SET LOCAL debug_parallel_query = regress;
+SELECT pg_temp.par_empty_pair();
+ERROR:  pg_xclaim: xclaim.try_many cannot be called from a parallel worker
+ROLLBACK;
+BEGIN;
+SET LOCAL pg_xclaim.enabled = off;
+SET LOCAL debug_parallel_query = regress;
+SELECT pg_temp.par_disabled_solo();
+ERROR:  pg_xclaim: xclaim.try_many cannot be called from a parallel worker
+ROLLBACK;
 \set ON_ERROR_STOP on
+-- 7. Repeating an already-held key in xclaim.try_many does not grow or
+-- re-expand the backend-local simplehash bucket array:
+--   (7a) fresh session right at grow_threshold - 1 (1842 distinct buckets of
+--        2048 so DIB = 0 and size stays 2048, bulk_target = 0)
+--   (7b) post-burst shrunk set via session_reset (XClaimLocalShrunkFrom >= 32768)
+\c
+CREATE TEMP TABLE t7a_keys AS
+WITH db AS (
+    SELECT oid::bigint AS o,
+           -- Build native little-endian 16-byte XClaimKey image (dbid, form=1, k)
+           lpad(to_hex(((oid::bigint & 255) << 24)
+                     | (((oid::bigint >> 8) & 255) << 16)
+                     | (((oid::bigint >> 16) & 255) << 8)
+                     | ((oid::bigint >> 24) & 255)), 8, '0') || '01000000' AS pfx_le
+    FROM pg_database WHERE datname = current_database()
+),
+cand AS (
+    SELECT j,
+           (uuid_hash((db.pfx_le || lpad(to_hex(j), 16, '0'))::uuid) & 2047) AS bkt,
+           ('x' || regexp_replace(lpad(to_hex(j), 16, '0'),
+                '(..)(..)(..)(..)(..)(..)(..)(..)',
+                '\8\7\6\5\4\3\2\1'))::bit(64)::bigint AS k
+    FROM db, generate_series(1::bigint, 20000::bigint) j
+),
+uniq AS (
+    SELECT DISTINCT ON (bkt) bkt, k
+    FROM cand
+    WHERE bkt < 1842
+    ORDER BY bkt, j
+)
+SELECT bkt, k FROM uniq ORDER BY bkt;
+SELECT k AS seed_k_7a FROM t7a_keys ORDER BY bkt LIMIT 1 \gset
+BEGIN;
+SELECT xclaim.try(:seed_k_7a::int8) AS first_seed_7a;
+ first_seed_7a 
+---------------
+ t
+(1 row)
+
+SELECT total_bytes AS initial_bytes_7a
+FROM pg_backend_memory_contexts WHERE name = 'xclaim local set' \gset
+SELECT count(*) FILTER (WHERE xclaim.try(k)) AS rest_threshold_ok
+FROM t7a_keys WHERE bkt > 0;
+ rest_threshold_ok 
+-------------------
+              1841
+(1 row)
+
+SELECT total_bytes AS bytes_before_7a
+FROM pg_backend_memory_contexts WHERE name = 'xclaim local set' \gset
+SELECT :bytes_before_7a = :initial_bytes_7a AS stayed_2048_buckets;
+ stayed_2048_buckets 
+---------------------
+ t
+(1 row)
+
+SELECT count(*) FILTER (WHERE ok) AS repeated_ok_7a
+FROM unnest(xclaim.try_many(ARRAY(SELECT :seed_k_7a::int8 FROM generate_series(1, 100000)))) AS ok;
+ repeated_ok_7a 
+----------------
+         100000
+(1 row)
+
+SELECT total_bytes = :bytes_before_7a AS local_set_unchanged_at_threshold,
+       xclaim.count() AS still_1842_claims
+FROM pg_backend_memory_contexts WHERE name = 'xclaim local set';
+ local_set_unchanged_at_threshold | still_1842_claims 
+----------------------------------+-------------------
+ t                                |              1842
+(1 row)
+
+ROLLBACK;
+BEGIN;
+SELECT count(*) FILTER (WHERE ok) AS burst_ok
+FROM unnest(xclaim.try_many(ARRAY(SELECT g::int8 FROM generate_series(1, 20000) g))) AS ok;
+ burst_ok 
+----------
+    20000
+(1 row)
+
+ROLLBACK;
+SELECT xclaim.session_reset();
+ session_reset 
+---------------
+ 
+(1 row)
+
+BEGIN;
+SELECT xclaim.try(777::int8) AS seed_after_shrink;
+ seed_after_shrink 
+-------------------
+ t
+(1 row)
+
+SELECT total_bytes AS bytes_before_7b
+FROM pg_backend_memory_contexts WHERE name = 'xclaim local set' \gset
+SELECT count(*) FILTER (WHERE ok) AS repeated_ok_7b
+FROM unnest(xclaim.try_many(ARRAY(SELECT 777::int8 FROM generate_series(1, 100000)))) AS ok;
+ repeated_ok_7b 
+----------------
+         100000
+(1 row)
+
+SELECT total_bytes = :bytes_before_7b AS local_set_unchanged_after_shrink,
+       xclaim.count() AS still_one_claim
+FROM pg_backend_memory_contexts WHERE name = 'xclaim local set';
+ local_set_unchanged_after_shrink | still_one_claim 
+----------------------------------+-----------------
+ t                                |               1
+(1 row)
+
+ROLLBACK;

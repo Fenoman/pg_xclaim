@@ -26,16 +26,7 @@ source "$LIB_DIR/_lib.sh"
 N_SESSIONS=4
 KEY_RANGE=10000
 
-# ---------------------------------------------------------------------------
-# Start main cluster
-# ---------------------------------------------------------------------------
-pg_xclaim_start_temp_cluster "bulk_concurrent"
-MAIN_PGDATA="$PGDATA"
-MAIN_PGPORT="$PGPORT"
-MAIN_PGHOST="$PGHOST"
-
-# All data dirs created by this script
-ALL_DATADIRS=("$MAIN_PGDATA")
+ALL_DATADIRS=()
 # Bare mktemp files/dirs registered here are removed even on an early set -e
 # abort, not only on the success path.
 XCLAIM_TMPFILES=()
@@ -44,18 +35,30 @@ XCLAIM_TMPFILES=()
 SESSION_PIDS=()
 
 cleanup_all() {
+    local _rc=$?
     for pid in "${SESSION_PIDS[@]:-}"; do
         [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
     done
+    pg_xclaim_stop_temp_cluster || true
     for dd in "${ALL_DATADIRS[@]:-}"; do
         if [[ -n "$dd" ]] && [[ -d "$dd" ]]; then
-            "$PGBIN/pg_ctl" stop -D "$dd" -m immediate >/dev/null 2>&1 || true
-            rm -rf "$dd"
+            _xclaim_stop_and_remove_dir "$dd"
         fi
     done
     rm -rf "${XCLAIM_TMPFILES[@]:-}"
+    return $_rc
 }
 trap cleanup_all EXIT INT TERM
+
+# ---------------------------------------------------------------------------
+# Start main cluster
+# ---------------------------------------------------------------------------
+pg_xclaim_start_temp_cluster "bulk_concurrent"
+MAIN_PGDATA="$PGDATA"
+MAIN_PGPORT="$PGPORT"
+MAIN_PGHOST="$PGHOST"
+# Secondary cluster only (MAIN_PGDATA is owned by _lib.sh)
+ALL_DATADIRS=()
 
 xclaim_banner "$SCRIPT"
 
@@ -300,8 +303,7 @@ else
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "catastrophic_rollback_clean" "FAIL" "debug_count" "$DEBUG_CAP" "leaked entries")")
 fi
 
-"$PGBIN/pg_ctl" stop -D "$CAP_DATA" -m immediate >/dev/null 2>&1 || true
-rm -rf "$CAP_DATA"
+_xclaim_stop_and_remove_dir "$CAP_DATA"
 # Remove from ALL_DATADIRS so cleanup_all doesn't re-process it
 ALL_DATADIRS=("${ALL_DATADIRS[@]/$CAP_DATA}")
 

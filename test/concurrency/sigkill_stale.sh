@@ -1,40 +1,13 @@
 #!/usr/bin/env bash
 # test/concurrency/sigkill_stale.sh
-# Stale-owner reaper test.
-#
-# ============================================================================
-# DESIGN CHOICE: debug injection via xclaim.debug_inject_stale.
-# ============================================================================
-# Real SIGKILL of a backend is NOT used. Rationale:
-#
-#   When a PostgreSQL backend receives SIGKILL (kill -9), the postmaster detects
-#   the crash via SIGCHLD and initiates crash recovery. With default settings
-#   (restart_after_crash=on), the postmaster sends SIGQUIT to all remaining
-#   backends and restarts shared memory from scratch. This DESTROYS the stale
-#   entry we planted in shared memory before the recovery, making it impossible
-#   to observe the reaper code path.
-#
-#   With restart_after_crash=off, the postmaster marks the cluster "degraded"
-#   and subsequent backend connections may see inconsistent state, which is too
-#   fragile for CI.
-#
-#   Killing the psql client (not the backend) avoids the postmaster crash
-#   path but only if the connection is broken before the backend commits.
-#   In that case the txn rolls back normally via before_shmem_exit -- that
-#   exercises the disconnect-release path, NOT the stale-reaper code path.
-#
-#   CONCLUSION: debug-injection is the correct approach for the stale-reaper.
-#   xclaim.debug_inject_stale(scope, key) creates an XClaimEntry with
-#   owner_procno=INT32_MAX (out of range) and owner_token=0 (invalid sentinel),
-#   guaranteed stale via the reaper's procno bounds check. This directly
-#   exercises the reaper code path without cluster-stability concerns.
-# ============================================================================
+# Stale-owner reaper + xclaim_test_hooks hardening + stats() clamping test.
 #
 # Scenario:
-#   1. SELECT xclaim.debug_inject_stale(1, 700) -> entry appears in debug()
-#   2. SELECT xclaim.try(1, 700) -> reaper triggers, returns true
-#   3. xclaim.stats().reaped_stale > 0
-#   4. xclaim.debug() empty (stale entry cleaned up)
+#   1. Inject stale entry via xclaim_test_hooks -> visible in debug()
+#   2. xclaim.try(1, 700) -> reaper triggers, returns true, reaped_stale++
+#   3. xclaim.debug() empty after ROLLBACK (capacity_used = 0)
+#   4. Hardening of xclaim_test_inject_stale (NULL, live-key, non-superuser)
+#   5. xclaim.stats() capacity_pct clamping on out-of-range live_capacity
 #
 # HARD INVARIANTS: set -euo pipefail, /tmp cluster, ru_RU.UTF-8, trap cleanup
 set -euo pipefail
@@ -43,8 +16,12 @@ SCRIPT="sigkill_stale"
 LIB_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$LIB_DIR/_lib.sh"
 
-pg_xclaim_start_temp_cluster "sigkill_stale"
 trap pg_xclaim_stop_temp_cluster EXIT INT TERM
+xclaim_build_test_hooks
+XCLAIM_EXTRA_CONF="${XCLAIM_EXTRA_CONF:+$XCLAIM_EXTRA_CONF
+}lc_messages = 'C'"
+pg_xclaim_start_temp_cluster "sigkill_stale"
+xclaim_create_test_hooks_functions
 
 xclaim_banner "$SCRIPT"
 
@@ -52,97 +29,115 @@ PASS=0
 FAIL=0
 CSV_ROWS=()
 
-echo "NOTE: Using debug injection -- real SIGKILL infeasible due to"
-echo "      postmaster crash recovery semantics. See script header for rationale."
-echo ""
-
-# ---------------------------------------------------------------------------
-# Test 1: inject stale entry, verify it appears in debug()
-# ---------------------------------------------------------------------------
-echo "--- Test 1: inject stale entry ---"
-pg_xclaim_psql -X -A -t -c "SELECT xclaim.debug_inject_stale(1, 700);" >/dev/null 2>&1
-
-STALE_COUNT="$(pg_xclaim_psql -X -A -t \
-    -c "SELECT count(*) FROM xclaim.debug() WHERE key = 700;" \
-    2>/dev/null | tr -d ' ' || echo "0")"
-echo "  xclaim.debug() entries for key=700 after inject: $STALE_COUNT"
-
-if [[ "$STALE_COUNT" == "1" ]]; then
-    echo "  PASS: stale entry visible in debug()"
+pass() {
+    echo "  PASS: $4"
     PASS=$(( PASS + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "stale_injected" "PASS" "debug_count" "1" "entry present")")
-else
-    echo "  FAIL: expected 1 stale entry, got $STALE_COUNT" >&2
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "$1" "PASS" "$2" "$3" "$4")")
+}
+fail() {
+    echo "  FAIL: $4 (got $3)" >&2
     FAIL=$(( FAIL + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "stale_injected" "FAIL" "debug_count" "$STALE_COUNT" "inject failed")")
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "$1" "FAIL" "$2" "$3" "$4")")
+}
+
+echo "--- Test 1: inject stale entry via xclaim_test_hooks ---"
+pg_xclaim_psql -X -A -t -v ON_ERROR_STOP=1 -c "SELECT xclaim_test_inject_stale(1, 700);" >/dev/null
+
+STALE_COUNT="$(pg_xclaim_psql -X -A -t -v ON_ERROR_STOP=1 \
+    -c "SELECT count(*) FROM xclaim.debug() WHERE key = 700;" | tr -d ' ')"
+if [[ "$STALE_COUNT" == "1" ]]; then
+    pass "stale_injected" "debug_count" "1" "stale entry visible in debug()"
+else
+    fail "stale_injected" "debug_count" "$STALE_COUNT" "expected 1 stale entry"
 fi
 
-# ---------------------------------------------------------------------------
-# Test 2: try on stale key triggers reaper, returns true
-# ---------------------------------------------------------------------------
 echo "--- Test 2: try on stale key triggers reaper ---"
-
-REAPED_BEFORE="$(pg_xclaim_psql -X -A -t \
-    -c "SELECT reaped_stale FROM xclaim.stats();" \
-    2>/dev/null | tr -d ' ' || echo "0")"
-echo "  reaped_stale before: $REAPED_BEFORE"
-
-TRY_RESULT="$(pg_xclaim_psql -X -A -t 2>/dev/null <<'SQLB'
+REAPED_BEFORE="$(pg_xclaim_psql -X -A -t -v ON_ERROR_STOP=1 \
+    -c "SELECT reaped_stale FROM xclaim.stats();" | tr -d ' ')"
+TRY_VAL="$(pg_xclaim_psql -X -A -t -q -v ON_ERROR_STOP=1 <<'SQLB'
 BEGIN;
 SELECT xclaim.try(1, 700);
 ROLLBACK;
 SQLB
 )"
-
-TRY_VAL="$(echo "$TRY_RESULT" | grep -E '^(t|f)$' | head -1 || echo "unknown")"
-echo "  xclaim.try(1,700) on stale entry: $TRY_VAL"
-
 if [[ "$TRY_VAL" == "t" ]]; then
-    echo "  PASS: reaper allowed acquisition on stale entry"
-    PASS=$(( PASS + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "reaper_allows_try" "PASS" "result" "true" "reaper reaped stale")")
+    pass "reaper_allows_try" "result" "true" "reaper allowed acquisition on stale entry"
 else
-    echo "  FAIL: expected true (reaper should fire), got '$TRY_VAL'" >&2
-    FAIL=$(( FAIL + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "reaper_allows_try" "FAIL" "result" "$TRY_VAL" "reaper did not fire")")
+    fail "reaper_allows_try" "result" "$TRY_VAL" "expected true on stale entry"
 fi
 
-# ---------------------------------------------------------------------------
-# Test 3: reaped_stale counter incremented
-# ---------------------------------------------------------------------------
-echo "--- Test 3: reaped_stale counter incremented ---"
-REAPED_AFTER="$(pg_xclaim_psql -X -A -t \
-    -c "SELECT reaped_stale FROM xclaim.stats();" \
-    2>/dev/null | tr -d ' ' || echo "0")"
-echo "  reaped_stale after: $REAPED_AFTER"
-
-if (( REAPED_AFTER > REAPED_BEFORE )); then
-    echo "  PASS: reaped_stale incremented ($REAPED_BEFORE -> $REAPED_AFTER)"
-    PASS=$(( PASS + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "reaped_stale_counter" "PASS" "reaped_stale" "$REAPED_AFTER" "counter incremented")")
+echo "--- Test 3: reaped_stale counter incremented and no residual entry ---"
+STATS_AFTER="$(pg_xclaim_psql -X -A -t -F'|' -v ON_ERROR_STOP=1 \
+    -c "SELECT reaped_stale - $REAPED_BEFORE, capacity_used, (SELECT count(*) FROM xclaim.debug() WHERE key = 700) FROM xclaim.stats();")"
+if [[ "$STATS_AFTER" == "1|0|0" ]]; then
+    pass "reaped_clean" "delta_used_rows" "$STATS_AFTER" "reaped_stale +1, capacity_used 0, debug empty"
 else
-    echo "  FAIL: reaped_stale not incremented ($REAPED_BEFORE -> $REAPED_AFTER)" >&2
-    FAIL=$(( FAIL + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "reaped_stale_counter" "FAIL" "reaped_stale" "$REAPED_AFTER" "counter not incremented")")
+    fail "reaped_clean" "delta_used_rows" "$STATS_AFTER" "expected 1|0|0"
 fi
 
-# ---------------------------------------------------------------------------
-# Test 4: after reaper + rollback, debug() is clean
-# ---------------------------------------------------------------------------
-echo "--- Test 4: debug() clean after reaper + rollback ---"
-DEBUG_COUNT="$(pg_xclaim_psql -X -A -t \
-    -c "SELECT count(*) FROM xclaim.debug();" \
-    2>/dev/null | tr -d ' ' || echo "-1")"
-echo "  xclaim.debug() count = $DEBUG_COUNT"
+echo "--- Test 4: xclaim_test_inject_stale hardening ---"
+HARDEN_OUT="$(pg_xclaim_psql -X -A -t -q -v ON_ERROR_STOP=1 <<'SQLH'
+DO $$
+DECLARE
+    caught_null bool := false;
+    caught_live bool := false;
+BEGIN
+    BEGIN
+        PERFORM xclaim_test_inject_stale(NULL, 1);
+    EXCEPTION WHEN null_value_not_allowed THEN
+        caught_null := true;
+    END;
 
-if [[ "$DEBUG_COUNT" == "0" ]]; then
-    echo "  PASS: no leaked entries after reap"
-    PASS=$(( PASS + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "no_leak_after_reap" "PASS" "debug_count" "0" "clean")")
+    PERFORM xclaim.try(102, 7);
+    BEGIN
+        PERFORM xclaim_test_inject_stale(102, 7);
+    EXCEPTION WHEN object_in_use THEN
+        caught_live := true;
+    END;
+
+    IF NOT caught_null OR NOT caught_live THEN
+        RAISE EXCEPTION 'hardening failed: null=% live=%', caught_null, caught_live;
+    END IF;
+END;
+$$;
+CREATE ROLE xclaim_nosuper NOSUPERUSER NOLOGIN;
+GRANT EXECUTE ON FUNCTION xclaim_test_inject_stale(int4, int4) TO xclaim_nosuper;
+SET ROLE xclaim_nosuper;
+DO $$
+BEGIN
+    PERFORM xclaim_test_inject_stale(999, 1);
+    RAISE EXCEPTION 'non-superuser was allowed';
+EXCEPTION WHEN insufficient_privilege THEN
+    NULL;
+END;
+$$;
+RESET ROLE;
+REVOKE EXECUTE ON FUNCTION xclaim_test_inject_stale(int4, int4) FROM xclaim_nosuper;
+DROP ROLE xclaim_nosuper;
+SELECT 'ok';
+SQLH
+)"
+if [[ "$HARDEN_OUT" == "ok" ]]; then
+    pass "injector_hardening" "guards" "ok" "NULL, live-key and superuser guards enforced"
 else
-    echo "  FAIL: expected 0 entries, got $DEBUG_COUNT" >&2
-    FAIL=$(( FAIL + 1 ))
-    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "no_leak_after_reap" "FAIL" "debug_count" "$DEBUG_COUNT" "leaked")")
+    fail "injector_hardening" "guards" "$HARDEN_OUT" "injector hardening failed"
+fi
+
+echo "--- Test 5: xclaim.stats() capacity_pct clamping on out-of-range live_capacity ---"
+CLAMP_OUT="$(pg_xclaim_psql -X -A -t -F'|' -v ON_ERROR_STOP=1 <<'SQLC'
+SELECT xclaim_test_set_live_capacity(999999999);
+SELECT capacity_pct FROM xclaim.stats();
+SELECT xclaim_test_set_live_capacity(-50);
+SELECT capacity_pct FROM xclaim.stats();
+SELECT xclaim_test_set_live_capacity(0);
+SELECT capacity_pct FROM xclaim.stats();
+SQLC
+)"
+CLAMP_FLAT="$(echo "$CLAMP_OUT" | grep -E '^[0-9]+\.[0-9]+$' | paste -sd'|' -)"
+if [[ "$CLAMP_FLAT" == "999.99|0.00|0.00" ]]; then
+    pass "stats_pct_clamp" "pcts" "$CLAMP_FLAT" "xclaim.stats() clamps capacity_pct to [0.00, 999.99]"
+else
+    fail "stats_pct_clamp" "pcts" "$CLAMP_FLAT" "expected 999.99|0.00|0.00"
 fi
 
 xclaim_check_server_log "$SCRIPT" || FAIL=$(( FAIL + 1 ))
@@ -151,10 +146,6 @@ echo ""
 echo "=== CSV SUMMARY ==="
 echo "TIMESTAMP,SCRIPT,TEST,RESULT,METRIC_NAME,METRIC_VALUE,NOTES"
 for row in "${CSV_ROWS[@]}"; do echo "$row"; done
-echo ""
-echo "=== SIGKILL PATH CHOICE: debug injection ==="
-echo "    Real kill -9 is not viable: postmaster crash recovery destroys"
-echo "    shared memory before the reaper can observe a stale entry."
 echo ""
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 (( FAIL > 0 )) && exit 1 || exit 0

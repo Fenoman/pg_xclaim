@@ -20,11 +20,9 @@
 #   Test 3: one insert grows the set twice, and the second growth fails. The
 #           first growth replaced the bucket array, so the set has to come
 #           back to the grown array, not to the one the insert started with.
-#           The insert comes from xclaim.try_many, which inserts under the
-#           partition LWLock, so the ERROR reaches its PG_CATCH with the lock
-#           held. Afterwards statement_timeout still cancels a statement of
-#           the same session: the handler restored the interrupt holdoff
-#           count before it released the lock.
+#           The insert comes from xclaim.try_many during run pre-staging
+#           before LWLockAcquire, and statement_timeout still cancels a
+#           statement of the same session afterwards.
 #   Test 4: the first bucket array of a session does not fit. Every failed
 #           attempt leaves no memory context behind, and the first claim
 #           after the cap is lifted creates the set.
@@ -244,13 +242,16 @@ echo "--- Test 3: an insert that grows twice and fails the second growth keeps t
 # as its big-endian hex, and K_OF_J reads them back as the int8 that
 # xclaim.try receives.
 #
-# 27 colliders share bucket 0 of the 2^18 array and so of the 2^17 array.
-# 26 of them fill buckets 0..25, and the 27th probes past the long-probe limit
-# (25) in both arrays: it grows the set from 2^17 to 2^18 entries, and then
-# from 2^18 to 2^19. 30000 fillers lie outside buckets -64..63 of both arrays
-# and keep the fill at or above 0.1, the minimum for a long-probe growth, in
-# the 2^18 array. The cap is 20 MB. With 48-byte entries the first growth
-# needs 12 MB, the second 24 MB while the 12 MB array is still in use.
+# 27 colliders share bucket 1 of the 2^18 array and so of the 2^17 array
+# (partition_id = 1). 26 of them fill buckets 1..26, and the 27th probes past
+# the long-probe limit (25) in both arrays: it grows the set from 2^17 to 2^18
+# entries, and then from 2^18 to 2^19. 30000 fillers lie outside buckets
+# -64..63 of both arrays and keep the fill at or above 0.1, the minimum for a
+# long-probe growth, in the 2^18 array. Using bucket 1 (partition 1) lets
+# Test 6 acquire a fresh key in partition 0 first before partition 1 triggers
+# the long-probe FATAL out of memory. The cap is 20 MB. With 48-byte entries
+# the first growth needs 12 MB, the second 24 MB while the 12 MB array is still
+# in use.
 if [[ "$(printf '\001\000' | od -An -tu2 | tr -d ' ')" == "1" ]]; then
     PREFIX="$(q "SELECT lpad(to_hex(((oid::bigint & 255) << 24) | (((oid::bigint >> 8) & 255) << 16)
                          | (((oid::bigint >> 16) & 255) << 8) | ((oid::bigint >> 24) & 255)), 8, '0') || '01000000'
@@ -264,7 +265,7 @@ HASH_OF_J="uuid_hash(('$PREFIX' || lpad(to_hex(j), 16, '0'))::uuid)"
 q "CREATE TABLE grow_keys (role text NOT NULL, k bigint NOT NULL);"
 q "INSERT INTO grow_keys
    SELECT 'collider', $K_OF_J FROM (SELECT generate_series(1::bigint, 1000000000::bigint) AS j) s
-   WHERE ($HASH_OF_J & 262143) = 0 LIMIT 27;"
+   WHERE ($HASH_OF_J & 262143) = 1 LIMIT 27;"
 q "INSERT INTO grow_keys
    SELECT 'filler', $K_OF_J FROM (SELECT generate_series(1::bigint, 1000000::bigint) AS j) s
    WHERE ($HASH_OF_J & 131071) BETWEEN 64 AND 131007 LIMIT 30000;"
@@ -444,6 +445,67 @@ DO \$\$ BEGIN $GROW_LOOP END \$\$;"
             pass "fatal_oom" "rows" "0" "the backend exits on FATAL during a growth, the server survives and no claim stays behind"
         else
             fail "fatal_oom" "state" "fatal=$FATAL_SEEN size=${SIZE:-none} state=$STATE" "a growth must fail with FATAL, the server must survive and the exit must release every claim"
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Test 6: xclaim.try_many OOM with exit_on_error = on on the long-probe corpus
+#         (discriminates D02 pre-staging: without pre-staging, fresh_p0 and
+#         collider_27 in partition 0 would insert into XClaimHash before the
+#         second long-probe growth failed under LWLock, leaving an orphaned
+#         shared row and underflowing live_capacity on backend exit)
+# ---------------------------------------------------------------------------
+echo "--- Test 6: xclaim.try_many long-probe out of memory with exit_on_error = on ---"
+
+if ! server_alive; then
+    server_down "bulk_fatal_oom"
+else
+    FRESH_P0="$(q "SELECT $K_OF_J FROM (SELECT generate_series(3000001::bigint, 4000000::bigint) AS j) s
+                   WHERE ($HASH_OF_J & 131071) BETWEEN 64 AND 131007
+                     AND ($HASH_OF_J & 127) = 0
+                   LIMIT 1;")"
+    COLLIDER_27="$(q "SELECT k FROM grow_keys WHERE role = 'collider' ORDER BY k LIMIT 1;")"
+    ACQ_BEFORE="$(q "SELECT total_acquires FROM xclaim.stats();")"
+    MISSES_BEFORE="$(q "SELECT cleanup_misses FROM xclaim.stats();")"
+
+    run_capped $(( 20 * 1024 )) "SET exit_on_error = on;
+BEGIN;
+DO \$\$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN SELECT k FROM grow_keys WHERE role = 'collider' ORDER BY k OFFSET 1 LOOP
+        PERFORM xclaim.try(r.k);
+    END LOOP;
+    FOR r IN SELECT k FROM grow_keys WHERE role = 'filler' LOOP
+        PERFORM xclaim.try(r.k);
+    END LOOP;
+END \$\$;
+SELECT 'pre_held=' || xclaim.count();
+SELECT count(*) FROM unnest(xclaim.try_many(ARRAY[${FRESH_P0}::bigint, ${COLLIDER_27}::bigint]));
+COMMIT;"
+    FATAL_PID="$(sed -n 's/^pid=//p' "$XCLAIM_HOLDER_OUT")"
+    PRE_HELD="$(sed -n 's/^pre_held=//p' "$XCLAIM_HOLDER_OUT")"
+    GONE=no
+    if [[ -n "$FATAL_PID" ]] && xclaim_wait_backend_gone "$FATAL_PID"; then
+        GONE=yes
+    fi
+    if ! server_alive; then
+        server_down "bulk_fatal_oom"
+    elif [[ "$GONE" != "yes" ]]; then
+        fail "bulk_fatal_oom" "backend" "${FATAL_PID:-none}" "the backend of the session must exit after the FATAL"
+    else
+        SIZE="$(failed_request_size)"
+        FATAL_SEEN="$(grep -c '^FATAL:  out of memory' "$XCLAIM_HOLDER_OUT" || true)"
+        ACQ_DELTA="$(q "SELECT total_acquires - ${ACQ_BEFORE:-0} FROM xclaim.stats();")"
+        STATE="$(q "SELECT (SELECT count(*) FROM xclaim.debug_snapshot()) || '/' || capacity_used || '/' || (cleanup_misses - ${MISSES_BEFORE:-0}) FROM xclaim.stats();")"
+        echo "  pre_held: ${PRE_HELD:-none}, acquires_delta: $ACQ_DELTA, bulk FATAL lines: $FATAL_SEEN, failed request: ${SIZE:-none} bytes, shared rows/capacity_used/new cleanup_misses after the exit: $STATE"
+        # acquires_delta = 1 (capped_session's initial xclaim.try) + 30026 pre_held = 30027
+        if [[ "$PRE_HELD" == "30026" && "$ACQ_DELTA" == "30027" && "$FATAL_SEEN" == "1" && "$SIZE" == "$SECOND_GROWTH_BYTES" && "$STATE" == "0/0/0" ]]; then
+            pass "bulk_fatal_oom" "rows" "0" "try_many long-probe pre-stage FATAL ($SIZE B) after 30026 held claims leaves zero orphan rows, capacity_used 0 and cleanup_misses 0"
+        else
+            fail "bulk_fatal_oom" "state" "pre=${PRE_HELD:-none} acq=$ACQ_DELTA fatal=$FATAL_SEEN size=${SIZE:-none} state=$STATE" "try_many long-probe growth ($SECOND_GROWTH_BYTES B) must fail with FATAL before LWLock and leave state 0/0/0"
         fi
     fi
 fi

@@ -20,14 +20,15 @@ OBJS = \
 	src/pg_xclaim_stats.o \
 	src/pg_xclaim_session.o
 
-# Base install script plus the chain of update scripts. CREATE EXTENSION
-# reaches default_version (pg_xclaim.control) by running the base script
-# and then each update script in turn.
+# Base install script for default_version (pg_xclaim.control) plus the
+# update chain from 1.0.0-rc1. Fresh CREATE EXTENSION runs the 1.0.0-rc5
+# base script directly, while ALTER EXTENSION UPDATE walks the chain.
 DATA = \
-	sql/pg_xclaim--1.0.0-rc1.sql \
+	sql/pg_xclaim--1.0.0-rc5.sql \
 	sql/pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql \
 	sql/pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql \
-	sql/pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql
+	sql/pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql \
+	sql/pg_xclaim--1.0.0-rc4--1.0.0-rc5.sql
 
 # Regression test list. The main suite runs with
 # shared_preload_libraries='pg_xclaim' (test/regress.conf).
@@ -51,7 +52,6 @@ REGRESS = \
 	session_reset_public_grant \
 	bulk_array_shape \
 	sql_surface \
-	debug_inject_stale_hardening \
 	enabled_off_contract \
 	ensure_scope_first_claim \
 	extension_version \
@@ -64,8 +64,9 @@ REGRESS = \
 # PGXS installcheck would run against a running cluster without our preload.
 NO_INSTALLCHECK = 1
 
-# Strict compiler flags -- extension MUST build clean (-Wall -Wextra -Werror).
-PG_CFLAGS = -Wall -Wextra -Werror -Wno-unused-parameter -Wno-declaration-after-statement
+# Strict compiler flags -- extension MUST build clean (-Wall -Wextra -Werror)
+# while preserving extra flags passed via environment or command line.
+override PG_CFLAGS += -Wall -Wextra -Werror -Wno-unused-parameter -Wno-declaration-after-statement
 
 # Flat-file pg_regress artefacts removed by `make clean` via PGXS EXTRA_CLEAN
 # (`rm -f`). The results/ and log/ output directories are removed recursively
@@ -79,29 +80,35 @@ EXTRA_CLEAN = \
 # pg_config discovery: explicit override wins, otherwise look in PATH.
 PG_CONFIG ?= pg_config
 
-# Server-specific API, found in the server headers. Each name found defines
-# XCLAIM_HAVE_<name in upper case>.
+PGXS := $(shell $(PG_CONFIG) --pgxs)
+include $(PGXS)
+
+# Server-specific API, probed with the resolved PGXS $(CC) and $(CPPFLAGS)
+# after `include $(PGXS)`. `-include` avoids literal `#` inside make
+# variables (which GNU make < 4.3 treats as a comment). A baseline check on
+# postgres.h fails the build immediately if $(CC) or server headers are
+# unusable, so a broken toolchain cannot masquerade as missing API symbols.
 #
-# XactEvent values (access/xact.h). The switch in xclaim_xact_callback names
-# every event (-Wswitch under -Werror), so the headers decide which cases it
-# compiles:
+# XactEvent values (access/xact.h):
 #   XACT_EVENT_PRE_ABORT       Tantor SE, with XACT_EVENT_PARALLEL_PRE_ABORT
 #   XACT_EVENT_START           Postgres Pro Enterprise, autonomous transactions
 #   XACT_EVENT_COMMIT_COMMAND  Postgres Pro Enterprise, multimaster
 #
 # atx_mark_extension_as_incompatible (miscadmin.h), Postgres Pro Enterprise:
 # _PG_init refuses autonomous transactions with it.
-XCLAIM_INCLUDEDIR_SERVER := $(shell $(PG_CONFIG) --includedir-server)
-xclaim_probe = $(if $(shell grep -s -l -w $(1) $(XCLAIM_INCLUDEDIR_SERVER)/$(2)),-DXCLAIM_HAVE_$(shell echo $(1) | tr a-z A-Z))
-XCLAIM_PROBE_CPPFLAGS := \
+ifneq ($(if $(MAKECMDGOALS),$(filter-out clean distclean clean-test-dirs,$(MAKECMDGOALS)),build),)
+XCLAIM_PROBE_BASE_OK := $(shell printf 'void xclaim_probe_base(void);\n' | $(CC) $(CPPFLAGS) -x c -include postgres.h -fsyntax-only - >/dev/null 2>&1 && echo yes)
+ifeq ($(XCLAIM_PROBE_BASE_OK),)
+$(error Compiler probe failed on postgres.h using CC="$(CC)" - check PG_CONFIG, CC and server headers)
+endif
+xclaim_probe = $(if $(shell printf 'void xclaim_probe_fn(void); void xclaim_probe_fn(void) { (void)(%s); }\n' '$(1)' | $(CC) $(CPPFLAGS) -x c -include postgres.h -include $(2) -fsyntax-only - >/dev/null 2>&1 && echo yes),-DXCLAIM_HAVE_$(shell echo $(1) | tr a-z A-Z))
+override CPPFLAGS += $(strip \
 	$(call xclaim_probe,XACT_EVENT_PRE_ABORT,access/xact.h) \
+	$(call xclaim_probe,XACT_EVENT_PARALLEL_PRE_ABORT,access/xact.h) \
 	$(call xclaim_probe,XACT_EVENT_START,access/xact.h) \
 	$(call xclaim_probe,XACT_EVENT_COMMIT_COMMAND,access/xact.h) \
-	$(call xclaim_probe,atx_mark_extension_as_incompatible,miscadmin.h)
-PG_CPPFLAGS += $(strip $(XCLAIM_PROBE_CPPFLAGS))
-
-PGXS := $(shell $(PG_CONFIG) --pgxs)
-include $(PGXS)
+	$(call xclaim_probe,atx_mark_extension_as_incompatible,miscadmin.h))
+endif
 
 # -------------------------------------------------------------------------
 # pg_regress binary and bin directory (resolved after PGXS include)
@@ -244,6 +251,20 @@ installcheck-smoke: install
 installcheck-smoke-no-preload: install
 	bash $(CURDIR)/scripts/smoke_gate_no_preload.sh $(PG_CONFIG)
 
+# Install DATA SQL scripts first, then pg_xclaim.control, and only then remove
+# retired RC base scripts so an interrupted write never leaves default_version
+# pointing at an uninstalled SQL script or deletes an existing base script early.
+.PHONY: clean-stale-sql
+clean-stale-sql: all installdirs
+	$(INSTALL_DATA) $(addprefix $(srcdir)/, $(DATA)) '$(DESTDIR)$(datadir)/$(datamoduledir)/'
+	$(INSTALL_DATA) '$(srcdir)/pg_xclaim.control' '$(DESTDIR)$(datadir)/extension/'
+	rm -f '$(DESTDIR)$(datadir)/extension/pg_xclaim--1.0.0-rc1.sql' \
+		'$(DESTDIR)$(datadir)/extension/pg_xclaim--1.0.0-rc2.sql' \
+		'$(DESTDIR)$(datadir)/extension/pg_xclaim--1.0.0-rc3.sql' \
+		'$(DESTDIR)$(datadir)/extension/pg_xclaim--1.0.0-rc4.sql'
+
+install: clean-stale-sql
+
 # -------------------------------------------------------------------------
 # clean-test-dirs: recursive removal of pg_regress output directories.
 # Hooked onto PGXS `clean` because EXTRA_CLEAN uses `rm -f`, which leaves
@@ -252,8 +273,8 @@ installcheck-smoke-no-preload: install
 .PHONY: clean-test-dirs
 clean-test-dirs:
 	rm -rf test/results test/log \
-		test/capacity/results \
-		test/nonpreload/results \
-		test/lwlocks/results
+		test/capacity/results test/capacity/log \
+		test/nonpreload/results test/nonpreload/log \
+		test/lwlocks/results test/lwlocks/log
 
 clean: clean-test-dirs

@@ -27,10 +27,6 @@ SCOPE=1
 LIB_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$LIB_DIR/_lib.sh"
 
-# Need max_claims >= N_BACKENDS * KEYS_PER_BACKEND = 1,000,000 for all to fit
-# Use 1,100,000 to have headroom
-XCLAIM_MAX_CLAIMS=1100000 pg_xclaim_start_temp_cluster "stress10x100k"
-
 # Temp files/dirs registered here are removed even when an assertion aborts
 # the script early (set -e), not only on the success path.
 XCLAIM_TMPFILES=()
@@ -39,6 +35,10 @@ cleanup_stress() {
     pg_xclaim_stop_temp_cluster
 }
 trap cleanup_stress EXIT INT TERM
+
+# Need max_claims >= N_BACKENDS * KEYS_PER_BACKEND = 1,000,000 for all to fit
+# Use 1,100,000 to have headroom
+XCLAIM_MAX_CLAIMS=1100000 pg_xclaim_start_temp_cluster "stress10x100k"
 
 xclaim_banner "$SCRIPT"
 
@@ -211,23 +211,56 @@ fi
 # ---------------------------------------------------------------------------
 echo "--- Per-partition histogram (hash distribution sanity) ---"
 
-# Populate 10k keys in a single txn to get a histogram (smaller for speed)
-HIST_OUT="$(mktemp)"
-XCLAIM_TMPFILES+=("$HIST_OUT")
-pg_xclaim_psql -X -A -t 2>/dev/null >"$HIST_OUT" <<'SQLHIST'
+if [[ "$(printf '\001\000' | od -An -tu2 | tr -d ' ')" == "1" ]]; then
+    LE_INT4() { echo "regexp_replace(lpad(to_hex(($1)::bigint & 4294967295), 8, '0'), '(..)(..)(..)(..)', '\\4\\3\\2\\1')"; }
+    LE_INT8() { echo "regexp_replace(lpad(to_hex($1), 16, '0'), '(..)(..)(..)(..)(..)(..)(..)(..)', '\\8\\7\\6\\5\\4\\3\\2\\1')"; }
+    KEY_UUID_EXPR="(($(LE_INT4 'd.database_oid') || '02000000' || $(LE_INT8 '(((d.scope::bigint & 4294967295) << 32) | (d.key & 4294967295))'))::uuid)"
+else
+    KEY_UUID_EXPR="((lpad(to_hex(d.database_oid::bigint), 8, '0') || '00000002' || lpad(to_hex(((d.scope::bigint & 4294967295) << 32) | (d.key & 4294967295)), 16, '0'))::uuid)"
+fi
+
+HIST_STATS="$(pg_xclaim_psql -X -A -t -q -F'|' -v ON_ERROR_STOP=1 <<SQLHIST
 BEGIN;
-SELECT count(v) FROM unnest(
-    xclaim.try_many(99, ARRAY(SELECT generate_series(1, 10000)::int4))
+SELECT count(v) > 0 AS ok FROM unnest(
+    xclaim.try_many(1, ARRAY(SELECT generate_series(1, 100000)::int4))
 ) v WHERE v;
-SELECT count(*) FROM xclaim.debug() WHERE scope = 99;
+WITH cfg AS (
+    SELECT current_setting('pg_xclaim.num_partitions')::int AS nparts
+),
+part_counts AS (
+    SELECT (uuid_hash($KEY_UUID_EXPR) & (cfg.nparts - 1)) AS part_id, count(*) AS cnt
+    FROM xclaim.debug() d
+    CROSS JOIN cfg
+    WHERE d.scope = 1
+    GROUP BY 1
+)
+SELECT
+    (SELECT sum(cnt) FROM part_counts),
+    count(*),
+    (SELECT nparts FROM cfg),
+    min(cnt),
+    max(cnt),
+    round(stddev_pop(cnt), 2)
+FROM part_counts;
 ROLLBACK;
 SQLHIST
+)"
+HIST_LINE="$(echo "$HIST_STATS" | tail -n 1)"
+IFS='|' read -r HIST_TOTAL HIST_PARTS HIST_NPARTS HIST_MIN HIST_MAX HIST_STDDEV <<<"$HIST_LINE"
+HIST_MEAN=$(( 100000 / ${HIST_NPARTS:-128} ))
+HIST_LO=$(( HIST_MEAN * 60 / 100 ))
+HIST_HI=$(( HIST_MEAN * 140 / 100 ))
+echo "  Histogram (scope=1, 1..100000 across $HIST_NPARTS partitions): total=$HIST_TOTAL parts=$HIST_PARTS min=$HIST_MIN max=$HIST_MAX stddev=$HIST_STDDEV"
 
-HIST_ACQUIRED="$(grep -E '^[0-9]+$' "$HIST_OUT" | head -1 | tr -d ' ' || echo "0")"
-HIST_DEBUG="$(grep -E '^[0-9]+$' "$HIST_OUT" | sed -n '2p' | tr -d ' ' || echo "0")"
-rm -f "$HIST_OUT"
-echo "  Histogram scope: 10000 keys acquired=$HIST_ACQUIRED debug_count=$HIST_DEBUG"
-echo "  (Full per-partition breakdown requires scope query -- recorded in baseline CSV)"
+if [[ "$HIST_TOTAL" == "100000" && "$HIST_PARTS" == "$HIST_NPARTS" ]] && (( HIST_MIN >= HIST_LO && HIST_MAX <= HIST_HI )); then
+    echo "  PASS: uniform per-partition hash distribution (all $HIST_NPARTS partitions active)"
+    PASS=$(( PASS + 1 ))
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "partition_histogram" "PASS" "min_max_stddev" "${HIST_MIN}/${HIST_MAX}/${HIST_STDDEV}" "${HIST_PARTS}/${HIST_NPARTS} active")")
+else
+    echo "  FAIL: skewed or incomplete partition histogram: $HIST_LINE" >&2
+    FAIL=$(( FAIL + 1 ))
+    CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "partition_histogram" "FAIL" "min_max_stddev" "$HIST_LINE" "expected $HIST_NPARTS partitions within ${HIST_LO}..${HIST_HI}")")
+fi
 
 # Write histogram data to perf baseline.
 DOCS_PERF_DIR="${XCLAIM_BASELINE_DIR:-${TMPDIR:-/tmp}}"
@@ -246,6 +279,9 @@ BASELINE_FILE="$DOCS_PERF_DIR/baseline-${BASELINE_DATE}.csv"
     echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ'),$SCRIPT,total_wins,$TOTAL_WINS,total successful acquires"
     echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ'),$SCRIPT,advisory_locks,$ADVISORY_COUNT,should be 0"
     echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ'),$SCRIPT,capacity_errors,$CAP_ERRORS,should be 0"
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ'),$SCRIPT,partition_min,$HIST_MIN,100000-key sample"
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ'),$SCRIPT,partition_max,$HIST_MAX,100000-key sample"
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ'),$SCRIPT,partition_stddev,$HIST_STDDEV,100000-key sample"
     for row in "${CSV_ROWS[@]}"; do echo "$row"; done
 } > "$BASELINE_FILE"
 

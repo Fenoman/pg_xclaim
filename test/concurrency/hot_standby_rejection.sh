@@ -39,25 +39,37 @@ CSV_ROWS=()
 # ---------------------------------------------------------------------------
 echo "--- Setup: primary cluster with pg_xclaim ---"
 
-PRIMARY_DATA="$(mktemp -d "/tmp/pg_xclaim_${USER:-nobody}_$$.primary.XXXXXX")"
-PRIMARY_PORT="$(xclaim_free_port)"
-PRIMARY_SOCKET="$PRIMARY_DATA"
-
+PRIMARY_DATA=""
 STANDBY_DATA=""
+
+stop_and_remove_cluster() {
+    local dir="$1"
+    local st=0
+    if [[ -z "$dir" ]] || [[ ! -d "$dir" ]]; then
+        return 0
+    fi
+    "$PGBIN/pg_ctl" stop -D "$dir" -m immediate -w >/dev/null 2>&1 || true
+    if [[ ! -e "$dir/postmaster.pid" ]]; then
+        rm -rf "$dir"
+        return 0
+    fi
+    "$PGBIN/pg_ctl" status -D "$dir" >/dev/null 2>&1 || st=$?
+    if [[ "$st" -eq 3 ]]; then
+        rm -rf "$dir"
+    fi
+}
 
 cleanup_both() {
     local _rc=$?
-    if [[ -n "${STANDBY_DATA:-}" ]] && [[ -d "${STANDBY_DATA:-}" ]]; then
-        "$PGBIN/pg_ctl" stop -D "$STANDBY_DATA" -m immediate >/dev/null 2>&1 || true
-        rm -rf "$STANDBY_DATA"
-    fi
-    if [[ -d "$PRIMARY_DATA" ]]; then
-        "$PGBIN/pg_ctl" stop -D "$PRIMARY_DATA" -m immediate >/dev/null 2>&1 || true
-        rm -rf "$PRIMARY_DATA"
-    fi
+    stop_and_remove_cluster "${STANDBY_DATA:-}"
+    stop_and_remove_cluster "${PRIMARY_DATA:-}"
     return $_rc
 }
 trap cleanup_both EXIT INT TERM
+
+PRIMARY_DATA="$(mktemp -d "/tmp/pg_xclaim_${USER:-nobody}_$$.primary.XXXXXX")"
+PRIMARY_PORT="$(xclaim_free_port)"
+PRIMARY_SOCKET="$PRIMARY_DATA"
 
 # A hot standby refuses to recover unless these settings are at least the
 # primary's values. Both configs pin the same values: initdb may tune them
@@ -102,7 +114,8 @@ LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
     >/dev/null 2>&1
 
 "$PGBIN/psql" -h "$PRIMARY_SOCKET" -p "$PRIMARY_PORT" -U postgres -d postgres \
-    -c "CREATE EXTENSION IF NOT EXISTS pg_xclaim;" >/dev/null 2>&1
+    -X -q -v ON_ERROR_STOP=1 \
+    -c "CREATE EXTENSION IF NOT EXISTS pg_xclaim;"
 
 echo "  Primary started on port $PRIMARY_PORT"
 
@@ -150,42 +163,69 @@ touch "$STANDBY_DATA/standby.signal"
 # ---------------------------------------------------------------------------
 echo "--- Test 1: standby with pg_xclaim preload ---"
 
-# Start standby and capture log
-LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
-"$PGBIN/pg_ctl" start -D "$STANDBY_DATA" -w \
-    -l "$STANDBY_LOG" \
-    -o "-p $STANDBY_PORT" \
-    >/dev/null 2>&1 || true
-
-# Wait briefly for standby to start (or fail)
-sleep 2
-
-STANDBY_STARTED=false
-if "$PGBIN/pg_isready" -h "$STANDBY_SOCKET" -p "$STANDBY_PORT" -U postgres -q 2>/dev/null; then
+# Start standby and wait for readiness
+if ! LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 \
+    "$PGBIN/pg_ctl" start -D "$STANDBY_DATA" -w \
+        -l "$STANDBY_LOG" \
+        -o "-p $STANDBY_PORT" \
+        >/dev/null 2>&1; then
+    STANDBY_STARTED=false
+else
     STANDBY_STARTED=true
-    echo "  Standby started (checking SQL-level rejection)"
+fi
 
-    # Try xclaim.try() on standby -- must ERROR with hot-standby message
-    SQL_RESULT="$("$PGBIN/psql" -h "$STANDBY_SOCKET" -p "$STANDBY_PORT" \
-        -U postgres -d postgres \
-        -X -A -t \
-        -c "SELECT xclaim.try(1, 1);" \
-        2>&1)" || true
+if $STANDBY_STARTED && "$PGBIN/pg_isready" -h "$STANDBY_SOCKET" -p "$STANDBY_PORT" -U postgres -q 2>/dev/null; then
+    echo "  Standby started (checking SQL-level 0A000 rejection across all 9 xclaim.* functions)"
 
-    echo "  xclaim.try() on standby output:"
-    echo "$SQL_RESULT" | head -5 | sed 's/^/    /'
-
-    if echo "$SQL_RESULT" | grep -qiE "hot.standby|recovery|ERRCODE_FEATURE_NOT_SUPPORTED|not support"; then
-        echo "  PASS: standby correctly rejects xclaim.try() with hot-standby error"
+    REJECT_SUMMARY="$("$PGBIN/psql" -h "$STANDBY_SOCKET" -p "$STANDBY_PORT" \
+        -U postgres -d postgres -X -A -t -q -v ON_ERROR_STOP=1 <<'SQLS'
+DO $$
+DECLARE
+    fn_calls text[] := ARRAY[
+        'SELECT xclaim.try(1::int8)',
+        'SELECT xclaim.try(1, 1)',
+        'SELECT xclaim.try_many(ARRAY[1]::int8[])',
+        'SELECT xclaim.try_many(1, ARRAY[1]::int4[])',
+        'SELECT xclaim.count()',
+        'SELECT * FROM xclaim.stats()',
+        'SELECT * FROM xclaim.debug_snapshot()',
+        'SELECT * FROM xclaim.debug()',
+        'SELECT xclaim.session_reset()'
+    ];
+    stmt text;
+    err_msg text;
+    rejected int := 0;
+BEGIN
+    FOREACH stmt IN ARRAY fn_calls LOOP
+        BEGIN
+            EXECUTE stmt;
+            RAISE EXCEPTION 'function succeeded on hot standby: %', stmt;
+        EXCEPTION WHEN feature_not_supported THEN
+            GET STACKED DIAGNOSTICS err_msg = MESSAGE_TEXT;
+            IF SQLSTATE <> '0A000' OR position('pg_xclaim does not support hot-standby/recovery mode' in err_msg) = 0 THEN
+                RAISE EXCEPTION 'unexpected 0A000 message for %: [%] %', stmt, SQLSTATE, err_msg;
+            END IF;
+            rejected := rejected + 1;
+        END;
+    END LOOP;
+    IF rejected <> 9 THEN
+        RAISE EXCEPTION 'expected 9 rejections, got %', rejected;
+    END IF;
+END;
+$$;
+SELECT 'rejected_all=9';
+SQLS
+)"
+    if [[ "$REJECT_SUMMARY" == "rejected_all=9" ]]; then
+        echo "  PASS: standby rejects all 9 xclaim.* functions with SQLSTATE 0A000"
         PASS=$(( PASS + 1 ))
-        HOT_STANDBY_MSG="$(echo "$SQL_RESULT" | grep -iE "hot.standby|recovery|not support" | head -1)"
-        CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "standby_rejects_xclaim" "PASS" "result" "error" "hot-standby rejection at SQL level")")
+        HOT_STANDBY_MSG="SQLSTATE 0A000 across all 9 xclaim.* functions"
+        CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "standby_rejects_xclaim" "PASS" "rejected" "9" "all 9 functions rejected with 0A000")")
     else
-        echo "  FAIL: standby did not reject xclaim.try() with expected error" >&2
-        echo "  Output was: $SQL_RESULT" >&2
+        echo "  FAIL: standby did not reject all 9 functions: $REJECT_SUMMARY" >&2
         FAIL=$(( FAIL + 1 ))
-        HOT_STANDBY_MSG="NOT FOUND"
-        CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "standby_rejects_xclaim" "FAIL" "result" "no_error" "expected hot-standby rejection")")
+        HOT_STANDBY_MSG="INCOMPLETE REJECTION"
+        CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "standby_rejects_xclaim" "FAIL" "result" "$REJECT_SUMMARY" "expected 9 rejections")")
     fi
 else
     # pg_xclaim checks for recovery at SQL call time, so a standby with the
@@ -260,14 +300,53 @@ standby_sql() {
 }
 
 IN_RECOVERY="$(standby_sql "SELECT pg_is_in_recovery();")"
-"$PGBIN/pg_ctl" promote -D "$STANDBY_DATA" -w >/dev/null 2>&1 || true
-PROMOTED="$(standby_sql "SELECT NOT pg_is_in_recovery();")"
-CLAIMED="$(standby_sql "BEGIN; SELECT xclaim.try(1, 1); SELECT xclaim.count(); COMMIT;")"
-HELD_AFTER="$(standby_sql "SELECT xclaim.count();")"
-echo "  in recovery before promote: $IN_RECOVERY, promoted: $PROMOTED"
-echo "  try(1, 1) and count() in one transaction: $CLAIMED, count() after COMMIT: $HELD_AFTER"
 
-if [[ "$IN_RECOVERY" == "t" && "$PROMOTED" == "t" && "$CLAIMED" == "t 1" && "$HELD_AFTER" == "0" ]]; then
+# Open a persistent session BEFORE promotion, trigger the 0A000 standby
+# rejection in that backend, then promote and verify the SAME backend PID
+# serves claims without reconnect or restart (proving recovery is not cached).
+PROMO_FIFO="$STANDBY_DATA/promo.in"
+PROMO_OUT="$STANDBY_DATA/promo.out"
+mkfifo "$PROMO_FIFO"
+"$PGBIN/psql" -h "$STANDBY_SOCKET" -p "$STANDBY_PORT" -U postgres -d postgres -X -A -t -q \
+    < "$PROMO_FIFO" > "$PROMO_OUT" 2>&1 &
+PROMO_JOB=$!
+exec 8>"$PROMO_FIFO"
+cat >&8 <<'SQLPRE'
+DO $$
+BEGIN
+    PERFORM xclaim.try(1, 9);
+    PERFORM set_config('xclaim_test.pre_reject', 'unexpected_ok', false);
+EXCEPTION WHEN feature_not_supported THEN
+    PERFORM set_config('xclaim_test.pre_reject', 'rejected_0A000', false);
+END
+$$;
+SELECT 'pre_state=' || pg_backend_pid() || ':' || pg_is_in_recovery() || ':' || current_setting('xclaim_test.pre_reject');
+SQLPRE
+for _ in $(seq 1 200); do grep -q '^pre_state=' "$PROMO_OUT" && break; sleep 0.02; done
+
+"$PGBIN/pg_ctl" promote -D "$STANDBY_DATA" -w >/dev/null
+PROMOTED="$(standby_sql "SELECT NOT pg_is_in_recovery();")"
+
+echo "BEGIN; SELECT 'existing_sess=' || pg_backend_pid() || ':' || xclaim.try(1, 9) || ':' || cardinality(xclaim.try_many(ARRAY[10, 11]::int8[])) || ':' || xclaim.count(); COMMIT; SELECT 'existing_after=' || xclaim.count();" >&8
+exec 8>&-
+wait "$PROMO_JOB"
+
+PRE_STATE="$(sed -n 's/^pre_state=//p' "$PROMO_OUT")"
+PRE_PID="${PRE_STATE%%:*}"
+PRE_REST="${PRE_STATE#*:}"
+EXISTING_SESS="$(sed -n 's/^existing_sess=//p' "$PROMO_OUT")"
+POST_PID="${EXISTING_SESS%%:*}"
+POST_REST="${EXISTING_SESS#*:}"
+EXISTING_AFTER="$(sed -n 's/^existing_after=//p' "$PROMO_OUT")"
+CLAIMED="$(standby_sql "BEGIN; SELECT xclaim.try(1, 1); SELECT xclaim.count(); COMMIT;")"
+HELD_AFTER="$(standby_sql "SELECT capacity_used || ':' || cleanup_misses FROM xclaim.stats();")"
+echo "  in recovery before promote: $IN_RECOVERY, promoted: $PROMOTED"
+echo "  pre-existing session before->after promote (pid $PRE_PID->$POST_PID): $PRE_REST -> $POST_REST -> $EXISTING_AFTER"
+echo "  new session try(1, 1) and count(): $CLAIMED, stats capacity_used:cleanup_misses: $HELD_AFTER"
+
+if [[ "$IN_RECOVERY" == "t" && "$PROMOTED" == "t" && -n "$PRE_PID" && "$PRE_PID" == "$POST_PID" \
+      && "$PRE_REST" == "true:rejected_0A000" && "$POST_REST" == "true:2:3" && "$EXISTING_AFTER" == "0" \
+      && "$CLAIMED" == "t 1" && "$HELD_AFTER" == "0:0" ]]; then
     echo "  PASS: the promoted standby serves claims without a restart"
     PASS=$(( PASS + 1 ))
     CSV_ROWS+=("$(xclaim_csv_row "$SCRIPT" "promoted_standby_claims" "PASS" "result" "claimed" "claims work after promotion without a restart")")

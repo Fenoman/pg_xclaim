@@ -3,7 +3,7 @@
 # Error/abort releases claim.
 #
 # Scenario:
-#   Session A: BEGIN; xclaim.try(1, 400) -> true; RAISE EXCEPTION -> txn aborts
+#   Session A: BEGIN, xclaim.try(1, 400) -> true, RAISE EXCEPTION -> txn aborts
 #   Session B: xclaim.try(1, 400) -> true while A is still connected and its
 #              transaction block is still open in the aborted state
 #
@@ -20,8 +20,8 @@ SCRIPT="error_release"
 LIB_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$LIB_DIR/_lib.sh"
 
-pg_xclaim_start_temp_cluster "error_release"
 trap pg_xclaim_stop_temp_cluster EXIT INT TERM
+pg_xclaim_start_temp_cluster "error_release"
 
 xclaim_banner "$SCRIPT"
 

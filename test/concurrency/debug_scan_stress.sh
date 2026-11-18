@@ -32,8 +32,8 @@ N_WORKERS=5
 KEYS_PER_WORKER=1000
 SCAN_INTERVAL_S="0.1"
 
-pg_xclaim_start_temp_cluster "debug_stress"
 trap pg_xclaim_stop_temp_cluster EXIT INT TERM
+pg_xclaim_start_temp_cluster "debug_stress"
 
 xclaim_banner "$SCRIPT"
 

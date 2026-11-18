@@ -291,7 +291,7 @@ The action is one level up, not on the reaper itself:
 |-------|-----|
 | ERROR, FATAL or PANIC at transaction end or backend exit in the server log | Save those lines and `xclaim.stats()`, file an issue. |
 | `cleanup_misses` grows too | See P2 (section 5). |
-| Calls of `xclaim.debug_inject_stale()` | A test function that creates such rows on purpose. Remove it from non-test environments. |
+| Calls of `xclaim_test_inject_stale()` | The test-only `xclaim_test_hooks` module creates such rows on purpose. Remove it from non-test environments. |
 | None of the above | Save `xclaim.stats()`, `xclaim.debug_snapshot()` and the log, file an issue. |
 
 ### Post-mortem actions
@@ -406,11 +406,10 @@ extensions cannot extend.
 
 ### Mitigation
 
-There is no DBA-side fix here. Three options for the application:
+There is no DBA-side fix here. Safe options for the application:
 
-1. Move the lock-acquiring step out of the prepared transaction.
-2. Use `pg_try_advisory_xact_lock` directly on that path.
-3. Restructure the workflow so 2PC is not needed at all.
+1. Restructure the workflow so transactions holding `pg_xclaim` claims do not use two-phase commit (`PREPARE TRANSACTION`), for example via a transactional outbox or idempotent single-phase steps.
+2. When a specific low-cardinality keyspace genuinely requires persisting locks across `PREPARE TRANSACTION`, migrate that **entire keyspace** back to `pg_try_advisory_xact_lock` (within the `max_locks_per_transaction` budget). Never mix `pg_xclaim` and `pg_try_advisory_xact_lock` on the same keyspace, and never release claims before committing the protected changes - both break mutual exclusion.
 
 ---
 

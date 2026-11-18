@@ -36,8 +36,8 @@ log_min_messages = log
 XCLAIM_MAX_CLAIMS=4096
 XCLAIM_NUM_PARTITIONS=32
 
-pg_xclaim_start_temp_cluster "peak_warn"
 trap pg_xclaim_stop_temp_cluster EXIT INT TERM
+pg_xclaim_start_temp_cluster "peak_warn"
 
 xclaim_banner "$SCRIPT"
 
@@ -61,14 +61,17 @@ echo "--- Test 1: 32 claims (50%) -- must NOT log ---"
 
 HITS_BEFORE="$(count_log_hits)"
 
-pg_xclaim_psql -X -q <<'SQL' >/dev/null
+T1_CNT="$(pg_xclaim_psql -X -A -t -q -v ON_ERROR_STOP=1 <<'SQL'
 BEGIN;
-SELECT xclaim.try_many(ARRAY(SELECT generate_series(1, 32)::int4));
+SELECT (SELECT count(*) FROM unnest(xclaim.try_many(ARRAY(SELECT generate_series(1, 32)::int4))) AS u(ok) WHERE ok)
+       || ':' || xclaim.count();
 COMMIT;
 SQL
+)"
 
 HITS_AFTER="$(count_log_hits)"
-if xclaim_assert_eq "no LOG hint at 50% fill" "$HITS_AFTER" "$HITS_BEFORE"; then
+if xclaim_assert_eq "32 claims acquired at 50% fill" "$T1_CNT" "32:32" && \
+   xclaim_assert_eq "no LOG hint at 50% fill" "$HITS_AFTER" "$HITS_BEFORE"; then
     PASS=$((PASS+1))
 else
     FAIL=$((FAIL+1))

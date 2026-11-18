@@ -63,6 +63,10 @@ ALL_SCRIPTS=(
     "sigkill_stale"
     # owner reuse / token mismatch
     "owner_reuse"
+    # 8-way contention on the same stale key batch
+    "reaper_contention"
+    # cross-session DB/keyspace isolation and rc1->rc5 ALTER EXTENSION UPDATE + ACLs
+    "extension_upgrade"
     # per-backend peak watermark LOG hint
     "peak_warn"
     # the lowest accepted settings serve claims up to capacity
@@ -130,6 +134,9 @@ fi
 PASS_SCRIPTS=()
 FAIL_SCRIPTS=()
 SKIP_SCRIPTS=()
+PARTIAL_SKIP_SCRIPTS=()
+RUN_LOG="$(mktemp "/tmp/pg_xclaim_${USER:-nobody}_$$.suite.XXXXXX")"
+trap 'rm -f "$RUN_LOG"' EXIT
 SUITE_START_MS="$(python3 -c "import time; print(int(time.time() * 1000))")"
 
 echo "================================================================"
@@ -155,13 +162,23 @@ for script in "${SCRIPTS_TO_RUN[@]}"; do
 
     T_START="$(python3 -c "import time; print(int(time.time() * 1000))")"
     # Exit code 77 means the script does not run on this platform.
-    if bash "$SCRIPT_PATH"; then rc=0; else rc=$?; fi
+    set +e
+    bash "$SCRIPT_PATH" 2>&1 | tee "$RUN_LOG"
+    rc=${PIPESTATUS[0]}
+    set -e
     T_END="$(python3 -c "import time; print(int(time.time() * 1000))")"
     ELAPSED=$(( T_END - T_START ))
     echo ""
     if (( rc == 0 )); then
-        echo "[suite] PASS: $script  (${ELAPSED}ms)"
-        PASS_SCRIPTS+=("$script:${ELAPSED}ms")
+        sub_skip="$(grep -Eo 'RESULT: PASS=[0-9]+ FAIL=0 SKIP=[1-9][0-9]*' "$RUN_LOG" | tail -n 1 || true)"
+        if [[ -n "$sub_skip" ]]; then
+            echo "[suite] PASS (with subtest skip: $sub_skip): $script  (${ELAPSED}ms)"
+            PASS_SCRIPTS+=("$script:${ELAPSED}ms (${sub_skip})")
+            PARTIAL_SKIP_SCRIPTS+=("$script: $sub_skip")
+        else
+            echo "[suite] PASS: $script  (${ELAPSED}ms)"
+            PASS_SCRIPTS+=("$script:${ELAPSED}ms")
+        fi
     elif (( rc == 77 )); then
         echo "[suite] SKIP (not supported here): $script"
         SKIP_SCRIPTS+=("$script")
@@ -184,7 +201,15 @@ echo " Total wall time: ${SUITE_TOTAL_MS}ms"
 echo "================================================================"
 echo ""
 echo "PASSED (${#PASS_SCRIPTS[@]}):"
-for s in "${PASS_SCRIPTS[@]}"; do echo "  PASS: $s"; done
+if [[ ${#PASS_SCRIPTS[@]} -gt 0 ]]; then
+    for s in "${PASS_SCRIPTS[@]}"; do echo "  PASS: $s"; done
+fi
+
+if [[ ${#PARTIAL_SKIP_SCRIPTS[@]} -gt 0 ]]; then
+    echo ""
+    echo "PARTIAL SUBTEST SKIPS (${#PARTIAL_SKIP_SCRIPTS[@]}):"
+    for s in "${PARTIAL_SKIP_SCRIPTS[@]}"; do echo "  PARTIAL_SKIP: $s"; done
+fi
 
 if [[ ${#SKIP_SCRIPTS[@]} -gt 0 ]]; then
     echo ""

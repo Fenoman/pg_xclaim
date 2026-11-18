@@ -113,7 +113,11 @@ jobs:
         run: |
           set -euo pipefail
           PGC='${{ steps.pgcfg.outputs.pg_config }}'
-          bash scripts/smoke_gate_multi_preload.sh "$PGC"
+          rc=0
+          bash scripts/smoke_gate_multi_preload.sh "$PGC" || rc=$?
+          if [[ "$rc" -ne 0 && "$rc" -ne 77 ]]; then
+            exit "$rc"
+          fi
 
       - name: Regression suite (installcheck)
         shell: bash
@@ -143,13 +147,13 @@ jobs:
           PGC='${{ steps.pgcfg.outputs.pg_config }}'
           make PG_CONFIG="$PGC" installcheck-lwlocks
 
-      - name: Concurrency suite (--skip-slow)
+      - name: Concurrency suite
         shell: bash
         run: |
           set -euo pipefail
           PGC='${{ steps.pgcfg.outputs.pg_config }}'
           export PG_CONFIG="$PGC"
-          bash test/concurrency/run_concurrency_suite.sh --skip-slow
+          bash test/concurrency/run_concurrency_suite.sh
 
       - name: Bench try_many @ 750k (soft -- noisy on shared CI)
         shell: bash

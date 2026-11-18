@@ -10,7 +10,7 @@
 #   before B: B's try would reap a row left with the invalidated token.
 #
 #   Out-of-range owner:
-#   xclaim.debug_inject_stale writes a row with owner_procno = INT32_MAX and
+#   xclaim_test_inject_stale writes a row with owner_procno = INT32_MAX and
 #   owner_token 0. The reaper takes it over at the procno bounds check,
 #   before it compares pids or tokens.
 #
@@ -106,9 +106,9 @@ REAPED_BEFORE="$(pg_xclaim_psql -X -A -t \
     2>/dev/null | tr -d ' ' || echo "0")"
 
 # Inject a stale entry (owner_procno = INT32_MAX, owner_token 0)
-pg_xclaim_psql -X -A -t \
-    -c "SELECT xclaim.debug_inject_stale(1, 801);" \
-    >/dev/null 2>&1
+pg_xclaim_psql -X -A -t -v ON_ERROR_STOP=1 \
+    -c "SELECT xclaim_test_inject_stale(1, 801);" \
+    >/dev/null
 
 STALE_VISIBLE="$(pg_xclaim_psql -X -A -t \
     -c "SELECT count(*) FROM xclaim.debug() WHERE key = 801;" \

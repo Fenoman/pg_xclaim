@@ -62,8 +62,10 @@ answers "what does sorting cost without WAL?", **F vs E** answers
 ## Workload modes
 
 - `MODE=overlap` - every backend draws random keys from a shared
-  1M pool, ~52% pairwise overlap at N=8 K=100k. Models a production
-  scenario where different operations naturally overlap on accounts.
+  1M pool (~50.3% analytical overlap against at least one of the other 7
+  workers and ~9.5% pairwise with replacement at N=8 K=100k). Models a
+  production scenario where different
+  operations naturally overlap on accounts.
 - `MODE=disjoint` - every backend gets its own slice of the
   keyspace via a `worker_id` offset. Two concurrent backends never
   request the same key. Isolates the raw cost of the implementations
@@ -108,12 +110,15 @@ Claim-table rows (B, D, E, F) and C's row locks vanish when the
 subtransaction rolls back, while pg_xclaim claims survive the rollback
 and accumulate until the transaction ends, so with every iteration a
 growing share of A's acquisitions re-enters keys it already holds or
-conflicts with claims of other workers. A B or D worker that fails on
-a deadlock drops out without samples, while throughput (tx/sec in the
-tables is iterations per second across all workers) is computed for
-the full iteration count. The A and B-F numbers are therefore not
-directly comparable: they are an order of magnitude for this
-methodology, not a ratio of acquisition costs.
+conflicts with claims of other workers. In the recorded `2026-05-24`
+tables below, a B or D worker that hit a deadlock dropped out without
+samples while throughput (tx/sec in the tables is iterations per second
+across all workers) divided the full iteration count by wall time
+(`scripts/bench_alternatives.sh` flags partial scenarios as
+`*_INCOMPLETE` and counts `len(samples)` when all workers succeed). The
+A and B-F numbers are therefore not directly comparable: they are an
+order of magnitude for this methodology, not a ratio of acquisition
+costs.
 
 ---
 
@@ -130,7 +135,7 @@ contention, so the mode does not affect the result):
 | 10k   | 311  | 31  | 73   | 26   | 37   | 52   |
 | 100k  | 38   | 2.3 | 9.6  | 1.7  | 2.5  | 5.1  |
 
-### 8 concurrent backends - `overlap` (~52% overlap)
+### 8 concurrent backends - `overlap` (~50.3% overlap vs other workers, ~9.5% pairwise)
 
 Throughput, tx/sec (unreliable for B and D, see the deadlocks below):
 
@@ -158,7 +163,7 @@ Deadlocks (`pg_stat_database.deadlocks` delta per scenario):
 
 Important fairness caveat (C on overlap). C shows 223 tx/sec at
 K=100k, ahead of A (209), but this is an artifact of NOWAIT
-semantics. At ~52% overlap nearly every `FOR UPDATE NOWAIT`
+semantics. At ~50% overlap against the other 7 workers nearly every `FOR UPDATE NOWAIT`
 fails with `lock_not_available` on the first conflicting row,
 effectively acquiring **0 keys per iteration**. The iteration is
 short --> throughput is high --> but no business work was done. A
@@ -173,10 +178,11 @@ Deadlocks measured directly (not inferred from throughput collapse):
 B and D hit 7 deadlocks in every scenario, and each of them ends the
 transaction of one worker: the `EXCEPTION` block in
 `scripts/bench_alternatives.sh` catches only `XBENC` and
-`lock_not_available`. Such a worker drops out without samples, the
-script does not check worker exit statuses, and it computes
-throughput for the full 8 x 200 iterations. 7 deadlocks with 8
-workers mean that one worker reached the end. B and D throughput and
+`lock_not_available`. In the saved `2026-05-24` CSV, such a worker
+dropped out without samples while throughput divided the full `8 x 200`
+iterations by wall time (`scripts/bench_alternatives.sh` marks
+failed-worker scenarios `*_INCOMPLETE`). 7 deadlocks with 8
+workers in that CSV mean that one worker reached the end. B and D throughput and
 p95 in overlap mode are therefore unreliable, and the conclusions that
 rely on them are marked as such. Indirectly this shows at K=100k: the
 overlap throughput of B and D (18 and 14 tx/sec) is about 8 times

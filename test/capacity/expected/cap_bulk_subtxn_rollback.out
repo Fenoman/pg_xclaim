@@ -65,14 +65,20 @@ BEGIN;
 -- AND drops the paired local-set entries -- both sides MUST be cleared
 -- atomically with respect to the rollback.
 DO $$
+DECLARE
+    errs_before bigint;
+    errs_after  bigint;
 BEGIN
+    SELECT capacity_errors INTO errs_before FROM xclaim.stats();
     BEGIN
         PERFORM xclaim.try_many(7, ARRAY(SELECT generate_series(1, 100)::int4));
         RAISE EXCEPTION 'try_many returned without ERROR (unexpected)';
-    EXCEPTION WHEN others THEN
-        -- Caught the ERRCODE_CONFIGURATION_LIMIT_EXCEEDED. Outer xact
-        -- continues, and the catastrophic rollback already cleaned up.
-        NULL;
+    EXCEPTION WHEN configuration_limit_exceeded THEN
+        -- Caught ERRCODE_CONFIGURATION_LIMIT_EXCEEDED (53400) specifically.
+        SELECT capacity_errors INTO errs_after FROM xclaim.stats();
+        IF errs_after <= errs_before THEN
+            RAISE EXCEPTION 'expected capacity_errors to advance (% -> %)', errs_before, errs_after;
+        END IF;
     END;
 END $$;
 -- After caught error: strict consistency assertion. Local-set count

@@ -39,14 +39,15 @@ table below has passed. This protects against partial rollout.
 |---|------|---------|----------------|
 | 1 | Smoke gate | `bash scripts/smoke_gate.sh /path/to/pg_config` | exit 0, "SMOKE GATE PASS" |
 | 2 | Smoke gate (no preload) | `bash scripts/smoke_gate_no_preload.sh /path/to/pg_config` | exit 0, SQLSTATE 55000 matched |
-| 3 | Regress matrix | `bash scripts/run_regress_matrix.sh` | all targets green |
-| 4 | Bench budgets | `bash scripts/bench_try_many.sh` | both budgets PASS |
-| 5 | Baseline `LockManager` p99 | `pg_wait_sampling` 3-day capture | committed to `docs/perf/baseline-pre-migration-YYYY-MM-DD.csv` |
+| 3 | Smoke gate (multi-preload) | `bash scripts/smoke_gate_multi_preload.sh /path/to/pg_config` | exit 0 or 77 (SKIP) |
+| 4 | Regress matrix | `bash scripts/run_regress_matrix.sh` | all targets green |
+| 5 | Bench budgets | `bash scripts/bench_try_many.sh` | both budgets PASS |
+| 6 | Baseline `LockManager` p99 | `pg_wait_sampling` 3-day capture | committed to `docs/perf/baseline-pre-migration-YYYY-MM-DD.csv` |
 
 > All shell snippets in this runbook assume `set -euo pipefail`. When you
 > copy-paste into a script, prepend that line.
 
-> Locale: the scripts of gates 1-4 create temporary clusters with the
+> Locale: the scripts of gates 1-5 create temporary clusters with the
 > `ru_RU.UTF-8` locale, so that locale must be installed on the host
 > that runs them.
 
@@ -59,7 +60,7 @@ the planned maintenance window.
 
 | Stage | Action | Owner | Gate to next stage                                                                                                                                                                                                                         |
 |-------|--------|-------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 0 | Build `pg_xclaim.so` against the target PG major (16/17/18) on the build host: `make PG_CONFIG=... && sudo make PG_CONFIG=... install`. | Build | `smoke_gate.sh` exit 0 in CI (`.github/workflows/ci-pg-matrix.yml`). The `pg_xclaim.so`, `pg_xclaim.control`, `pg_xclaim--1.0.0-rc1.sql` and the update scripts `pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql`, `pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql` and `pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql` files are installed under `$(pg_config --pkglibdir)` and `$(pg_config --sharedir)/extension/`. |
+| 0 | Build `pg_xclaim.so` against the target PG major (16/17/18) on the build host: `make PG_CONFIG=... && sudo make PG_CONFIG=... install`. | Build | `smoke_gate.sh` exit 0 in CI (`.github/workflows/ci-pg-matrix.yml`). The `pg_xclaim.so`, `pg_xclaim.control`, `pg_xclaim--1.0.0-rc5.sql` and the update scripts `pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql` .. `pg_xclaim--1.0.0-rc4--1.0.0-rc5.sql` files are installed under `$(pg_config --pkglibdir)` and `$(pg_config --sharedir)/extension/`. |
 | 1 | Add `pg_xclaim` as the **last** entry in `shared_preload_libraries` (PostgreSQL invokes xact callbacks in LIFO order - the last one registered runs first) and the `pg_xclaim.*` GUCs in `postgresql.conf`. Restart the cluster. | DBA | server starts, log line `pg_xclaim: shared memory initialized (...)` is present, no `FATAL` during `_PG_init`.                                                                                                                             |
 | 2 | Run `CREATE EXTENSION pg_xclaim;` in every database that needs the new SQL surface. | DBA | `SELECT * FROM xclaim.stats();` returns a valid row in each database, `\dx pg_xclaim` shows the installed version.                                                                                                                         |
 | 3 | On the **dev cluster**: apply the per-site rewrite DDL (replace `pg_try_advisory_xact_lock(...)` with `xclaim.try(...)` in target functions). | DBA | The post-check finds zero remaining `pg_try_advisory_xact_lock` references on migrated paths, functional smoke tests pass.                                                                                                                 |
@@ -107,10 +108,8 @@ sudo make PG_CONFIG="$PG_CONFIG" install
 # Sanity: verify installed paths
 test -f "$($PG_CONFIG --pkglibdir)/pg_xclaim.so"
 test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim.control"
-test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc1.sql"
-test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql"
-test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql"
-test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql"
+test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc5.sql"
+test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc4--1.0.0-rc5.sql"
 ```
 
 For a multi-major matrix (16/17/18), repeat the `make clean` + `make` +
@@ -149,17 +148,28 @@ should follow:
 > passed" -- a partially migrated keyspace is worse than an
 > unmigrated one.
 
-- **One `CREATE OR REPLACE FUNCTION` per call site** - do not bundle
-  multiple function rewrites in a single transaction, an error in
-  one would roll back the rest.
-- **Each block wrapped in `BEGIN ... EXCEPTION WHEN OTHERS ... END`** -
-  log the failure and continue, so one bad identifier does not kill
-  the whole migration.
-- **Post-check**: after the run, scan `pg_proc.prosrc` for any
-  remaining `pg_try_advisory_xact_lock\s*\(` on paths that should
-  already be migrated.
-- **Logs to file** + `set -e` in bash - so you can quickly show the
-  DBA "these 3 functions failed, the rest are OK".
+- **Pause new work dispatch and drain before cutover:** until the
+  migration transaction commits, concurrent sessions keep executing the
+  old function bodies with `pg_try_advisory_xact_lock`. Pause queue
+  consumers / workers touching the migrating conflict domain for the
+  cutover window first, wait until no active worker transactions remain
+  in `pg_stat_activity` (`state <> 'idle'`), then verify zero held
+  advisory locks on that scope (`objsubid = 2 AND classid = <scope>` for
+  two-arg pair calls, or `objsubid = 1` for single-arg calls) in the
+  target database
+  (`SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND objsubid = 2 AND classid = <scope>`
+  for a pair scope, or `AND objsubid = 1` when migrating single-arg calls).
+- **One atomic transaction per keyspace (scope):** execute all
+  `CREATE OR REPLACE FUNCTION` / `PROCEDURE` rewrites that share a
+  conflict keyspace inside a single transaction without swallowing
+  errors via `EXCEPTION WHEN OTHERS`, so any routine failure rolls back
+  the entire keyspace together.
+- **Post-check before `COMMIT`:** scan `pg_proc` (`pg_get_functiondef`)
+  inside the same transaction for residual `pg_try_advisory_xact_lock\s*\(`
+  on the migrated keyspace, `RAISE EXCEPTION` if any remain, and resume
+  paused workers only after `COMMIT`.
+- **Logs to file** + `set -euo pipefail` and `-v ON_ERROR_STOP=1` in the
+  rollout script.
 
 Run it across every database in the cluster that uses the extension
 (`SELECT datname FROM pg_database WHERE datistemplate = false`),
@@ -193,13 +203,12 @@ headroom to raise the GUC before a rehash lands on the hot path. The
 set grows earlier when a key lands too far from its bucket (a long
 probe): from a fill of about 0.65 in large sets. Inside a run of keys
 of one partition in `xclaim.try_many` the keys start their probes from
-1/`num_partitions` of the buckets, and such a growth starts from a
-fill of about 0.1, runs under the partition lock and can come before
-the 75% line. This is how, above all, a set grows that the backend has
-not grown to the needed size before: after a shrink (§9) a large
-`xclaim.try_many` gives the set, before its first lock, twice the room
-the claims of the transaction need, up to the largest size the set
-shrank from. Example log line:
+1/`num_partitions` of the buckets, so such a growth starts from a fill
+of about 0.1 during unlocked pre-staging before the partition lock is
+taken and can come before the 75% line. After a shrink (§9) a large
+`xclaim.try_many` expands the set on its first distinct new key (with no
+lock held) toward twice the room the claims of the transaction need, up
+to the largest size the set shrank from. Example log line:
 
 ```
 LOG:  pg_xclaim: per-backend live claims (12345) crossed 75% of
@@ -319,41 +328,44 @@ correctness is not the priority.
 
 ### 5.2 Level 2 -- Code rollback (no restart)
 
+- **Partial rollback of a single conflict domain (other domains stay on `xclaim.*`):**
+  pause new work dispatch and wait for active worker transactions on the rolling-back domain to finish (`pg_stat_activity`), verify zero held claims on that domain in `xclaim.debug_snapshot()` for the target database (or, when `num_partitions > 192` makes `debug_snapshot()` unavailable, confirm all transactions of that domain have exited in `pg_stat_activity`), and apply the domain's atomic rollback DDL in one transaction (`ON_ERROR_STOP=1`). **Keep `pg_xclaim.enabled = on`** so remaining domains on `xclaim.*` preserve mutual exclusion.
+- **Full rollback of all `xclaim.*` domains across the cluster:**
+
 ```bash
 set -euo pipefail
 PGHOST=...; PGPORT=...; PGUSER=postgres
-DBS=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -At -c \
-    "SELECT datname FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres');")
 
-# Step 1: stop user traffic (in the application or the pooler), and
-# only then engage soft rollback: with live traffic the kill switch
-# removes mutual exclusion for every key (§4)
+# Step 1: stop user traffic across all migrated domains and apply rollback DDL
+# to every connectable database while pg_xclaim.enabled remains on (so a DDL
+# error in one database never leaves remaining databases unprotected)
+while IFS= read -r db; do
+    [[ -z "$db" ]] && continue
+    echo "=== Applying per-site rollback to $db ==="
+    psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" \
+         -v ON_ERROR_STOP=1 -f /path/to/your/rollback_rewrite.sql \
+         2>&1 | tee "/tmp/pg_xclaim_rollback_${db// /_}_$(date +%Y%m%d_%H%M%S).log"
+done < <(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -At -c \
+    "SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname;")
+
+# Step 2 (ONLY after rollback DDL succeeded in EVERY database): set pg_xclaim.enabled = off
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
      -v ON_ERROR_STOP=1 \
      -c "ALTER SYSTEM SET pg_xclaim.enabled = off" \
      -c "SELECT pg_reload_conf()"
-
-# Step 2: apply per-site rollback DDL (inverse of the forward rewrite --
-# restores pg_try_advisory_xact_lock(...) calls in target functions)
-for db in $DBS; do
-    echo "=== Applying per-site rollback to $db ==="
-    psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" \
-         -v ON_ERROR_STOP=1 -f /path/to/your/rollback_rewrite.sql \
-         2>&1 | tee "/tmp/pg_xclaim_rollback_${db}_$(date +%Y%m%d_%H%M%S).log"
-done
 ```
 
-After completion: callers use advisory locks again. Resume user traffic
-once the script has finished without errors: the rollback DDL has gone
-through in every database. `pg_xclaim.enabled=off` ensures no parallel
-claim acquisition until the next deploy.
+After all domains in every database have rolled back to advisory locks without errors, resume user traffic. `pg_xclaim.enabled = off` prevents accidental claim acquisitions until the library is removed in Level 3.
 
 ### 5.3 Level 3 -- Full rollback (restart required)
 
 1. Apply the per-site rollback DDL first (Level 2 above).
 2. During the next maintenance window:
-   1. In every database that has the extension installed, run
-      `DROP EXTENSION pg_xclaim CASCADE;`.
+   1. In every database that has the extension installed, inspect
+      `pg_depend` for any user objects referencing `xclaim.*` (such as
+      monitoring views over `xclaim.stats()`), migrate or drop them
+      explicitly, and run `DROP EXTENSION pg_xclaim;` without `CASCADE`
+      so dependent DBA views are never dropped silently.
    2. Edit `postgresql.conf` and remove `pg_xclaim` from
       `shared_preload_libraries`.
    3. Optionally remove the `pg_xclaim.*` GUC lines.
@@ -926,8 +938,9 @@ Remediation:
 1. Check the server log for ERROR, FATAL and PANIC at transaction end
    and backend exit, including those from other extensions' callbacks,
    and whether `cleanup_misses` grows at the same time (10.5).
-2. Check that nothing calls `xclaim.debug_inject_stale()`: it is a test
-   function that creates such entries on purpose.
+2. Check whether the test-only `xclaim_test_hooks` module is loaded on
+   the stand (`xclaim_test_inject_stale()` creates such entries on
+   purpose).
 3. Save `xclaim.stats()`, `xclaim.debug_snapshot()` and the log, and
    file an issue.
 4. If the rate is < 1/min, nothing is urgent: the reaper frees a key on

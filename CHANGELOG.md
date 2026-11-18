@@ -7,6 +7,98 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [1.0.0-rc5] - 2026-11-18
+
+### Removed
+
+- **`xclaim.debug_inject_stale(int4, int4)` removed from the production
+  extension.** The test-only stale-entry injector lived in `pg_xclaim.so`
+  and the `xclaim` schema: a superuser call in a scratch database followed
+  by `DROP DATABASE` left an unowned shared entry and its `live_capacity`
+  slot until server restart, and the C body lacked `CHECK_FOR_INTERRUPTS()`.
+  The helper now lives in `test/modules/xclaim_test_hooks` as
+  `xclaim_test_inject_stale(int4, int4)` (never installed into production
+  images), and `pg_xclaim--1.0.0-rc4--1.0.0-rc5.sql` drops
+  `xclaim.debug_inject_stale(int4, int4)` when upgrading from earlier
+  release candidates.
+
+### Changed
+
+- **Extension version `1.0.0-rc5` and SQL install/upgrade packaging.**
+  `pg_xclaim.control` advances `default_version` to `1.0.0-rc5`, replacing
+  `sql/pg_xclaim--1.0.0-rc1.sql` with `sql/pg_xclaim--1.0.0-rc5.sql` as the
+  fresh-install base script and adding `sql/pg_xclaim--1.0.0-rc4--1.0.0-rc5.sql`
+  to the upgrade chain (`rc1 -> rc2 -> rc3 -> rc4 -> rc5`). `make install`
+  now runs `clean-stale-sql` after installing `DATA` and `pg_xclaim.control`,
+  removing retired `pg_xclaim--1.0.0-rc[1-4].sql` base scripts so
+  `pg_available_extension_versions` reports only `1.0.0-rc5`.
+- **`WARN`-mode capacity exhaustion message punctuation.** The two `WARNING`
+  messages emitted when `pg_xclaim.on_capacity_exhaustion = 'warn'` hits
+  `max_claims` now use a comma instead of a semicolon (`pg_xclaim: max_claims
+  (%d) exhausted, treating as conflict` and `pg_xclaim: %d additional slot(s)
+  hit max_claims (%d) in this bulk call, per-slot WARNINGs suppressed`).
+  Log-scraping alerts matching the semicolon text should update their pattern.
+
+### Fixed
+
+- **Zero backend allocations under a partition `LWLock` in
+  `xclaim.try_many`.** Even after reserving for the 0.9 fill threshold,
+  inserting keys of one partition run into `XClaimLocalSet` under the
+  partition lock triggered `simplehash` rehashes by probe distance
+  (`SH_GROW_MAX_DIB`). Those rehashes stretched partition lock hold times
+  and, when an out-of-memory error became `FATAL` (`exit_on_error = on`),
+  skipped `PG_CATCH` rollback, leaving an orphaned shared entry and a
+  permanent `live_capacity` deficit until server restart. Each partition
+  run now pre-stages its unheld unique keys in `XClaimLocalSet` as
+  `XCLAIM_LOCAL_STAGED` before `LWLockAcquire` (reserving room only when a
+  distinct new key approaches `grow_threshold`, so repeating already-held
+  keys never grows the bucket array), flips acquired keys to
+  `XCLAIM_LOCAL_HELD` in place under the lock with zero allocations
+  (enforced by an `Assert` in `xcl_local_allocate()`), demotes rolled-back
+  pre-staged keys back to `XCLAIM_LOCAL_STAGED` when a nested `try_many`
+  fails inside an `emit_log_hook`, and drops unacquired staged entries after
+  `LWLockRelease`. Test 6 of `test/concurrency/local_grow_oom.sh` and Tests
+  6-7 of `test/concurrency/hook_error_paths.sh` cover these paths.
+- **`xclaim.try_many` runs context and interrupt guards before empty-array
+  and `pg_xclaim.enabled = off` short-circuits.** `xclaim_try_many_preflight()`
+  runs `CHECK_FOR_INTERRUPTS()`, `IsTransactionState()`, and
+  `IsParallelWorker()` uniformly on every call before checking empty arrays
+  or `pg_xclaim.enabled = off`, and every early return releases detoasted
+  copies via `PG_FREE_IF_COPY`.
+- **Partition-grouped rollback on `xclaim.try_many` failure and `PREPARE`
+  staging cleanup.** Error rollback in `xclaim_try_many_internal` walks
+  contiguous `partition_id` runs (`<= num_partitions` lock cycles),
+  verifies the saved `(procno, lxid, token)` triple before `HASH_REMOVE`,
+  decrements `live_capacity` only for rows actually removed (including
+  reaped stale slots, without any transient `live_capacity` decrement
+  during takeover), and runs before unstaging `0..max_staged_end`. On a
+  zero-claim `PREPARE TRANSACTION`, `XACT_EVENT_PREPARE` wipes any
+  leftover non-held `XCLAIM_LOCAL_STAGED` entries from `XClaimLocalSet` so
+  prepared-transaction `saved_lxid` values cannot linger.
+- **`xclaim.stats()` clamps `capacity_pct` to `[0.00, 999.99]`.** The SQL
+  return type is `numeric(5,2)`, so diagnostic injection or any counter
+  overshoot past `999.99%` or below `-999.99%` raised `22003 numeric field
+  overflow` (and negative drift reported negative percentages) instead of a
+  bounded monitoring gauge.
+- **Build flags and feature probes in `Makefile`.** `override PG_CFLAGS +=`
+  preserves caller `PG_CFLAGS` from both environment and command line while
+  keeping `-Wall -Wextra -Werror`. Header feature detection now uses
+  compiler syntax checks instead of `grep` (ignoring matches inside C
+  comments) and probes `XACT_EVENT_PARALLEL_PRE_ABORT` independently of
+  `XACT_EVENT_PRE_ABORT`. `make clean` removes `log/` directories under
+  `test/capacity`, `test/nonpreload`, and `test/lwlocks`.
+- **Documentation and test-suite hardening.** Clarified the SQL ACL model
+  on `xclaim.debug()` (`REVOKE ALL FROM PUBLIC`, delegable via `GRANT
+  EXECUTE`), updated `hot-path-analysis` and `COMPARISON` wording, fixed
+  silent `psql` failure masking in perf scripts and `bench_alternatives.sh`,
+  fixed temp-cluster trap ordering across concurrency tests, measured pure
+  server-side `COMMIT` time in `grouped_cleanup_50k.sh`, added a real
+  128-partition occupancy histogram to `stress_10x100k.sh`, expanded
+  `nonpreload_smoke.sql` and `hot_standby_rejection.sh` (all 9 functions +
+  live `pg_ctl promote`), enabled `max_prepared_transactions` in
+  `pg_regress` for positive 2PC after zero-claim transactions, and added
+  `reaper_contention.sh` and `extension_upgrade.sh`.
+
 ## [1.0.0-rc4] - 2026-11-13
 
 ### Fixed
@@ -391,7 +483,8 @@ extension passes the full test matrix on PostgreSQL 16, 17, and 18.
   and `PREPARE TRANSACTION` is rejected with `0A000`.
 - Not supported on hot-standby replicas or Windows.
 
-[Unreleased]: https://github.com/Fenoman/pg_xclaim/compare/v1.0.0-rc4...HEAD
+[Unreleased]: https://github.com/Fenoman/pg_xclaim/compare/v1.0.0-rc5...HEAD
+[1.0.0-rc5]: https://github.com/Fenoman/pg_xclaim/compare/v1.0.0-rc4...v1.0.0-rc5
 [1.0.0-rc4]: https://github.com/Fenoman/pg_xclaim/compare/v1.0.0-rc3...v1.0.0-rc4
 [1.0.0-rc3]: https://github.com/Fenoman/pg_xclaim/compare/v1.0.0-rc2...v1.0.0-rc3
 [1.0.0-rc2]: https://github.com/Fenoman/pg_xclaim/compare/v1.0.0-rc1...v1.0.0-rc2

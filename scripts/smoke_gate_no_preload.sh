@@ -48,8 +48,14 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
 ')"
 
 cleanup() {
-    "$PGCTL" stop -D "$DATADIR" -m immediate >/dev/null 2>&1 || true
-    rm -rf "$DATADIR"
+    local st=0
+    "$PGCTL" stop -D "$DATADIR" -m immediate -w >/dev/null 2>&1 || true
+    if [[ ! -e "$DATADIR/postmaster.pid" ]]; then
+        rm -rf "$DATADIR"
+        return 0
+    fi
+    "$PGCTL" status -D "$DATADIR" >/dev/null 2>&1 || st=$?
+    [[ "$st" -eq 3 ]] && rm -rf "$DATADIR" || true
 }
 trap cleanup EXIT INT TERM
 

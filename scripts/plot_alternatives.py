@@ -121,7 +121,7 @@ STRINGS = {
         "ov_title": "Throughput under concurrency without key conflicts "
                     "(8 backends, disjoint keyspace)",
         "ov_note": "Disjoint mode -- worker-shard keys, no conflicts. "
-                   "NOWAIT fail-fast cannot 'cheat' here; raw implementation "
+                   "NOWAIT fail-fast cannot 'cheat' here, so raw implementation "
                    "cost is exposed.",
         "full_data": "full data",
         "tr_throughput": "Throughput (tx/sec, log scale)",
@@ -149,8 +149,8 @@ STRINGS = {
         "ylabel_tx": "Транзакций/сек (суммарно по 8 бэкендам)",
         "ov_title": "Пропускная способность при конкуренции без конфликтов ключей "
                     "(8 бэкендов, disjoint-пространство ключей)",
-        "ov_note": "Режим disjoint — ключи шардированы по воркерам, без конфликтов. "
-                   "Fail-fast NOWAIT здесь не может «сжульничать»; видна чистая "
+        "ov_note": "Режим disjoint - ключи шардированы по воркерам, без конфликтов. "
+                   "Fail-fast NOWAIT здесь не может \"сжульничать\", видна чистая "
                    "стоимость реализации.",
         "full_data": "полные данные",
         "tr_throughput": "Пропускная способность (tx/sec, лог. шкала)",
@@ -169,9 +169,9 @@ STRINGS = {
         "so_crossover": "При высоком K sorted (пунктир) опускается НИЖЕ unsorted (сплошная):\n"
                         "детерминированный порядок захвата убивает deadlock'и, но\n"
                         "сериализует на пересекающихся ключах.",
-        "so_lowk": "При низком K: sort нейтрален\nили даёт небольшой выигрыш\n(cache locality).",
+        "so_lowk": "При низком K: sort нейтрален\nили дает небольшой выигрыш\n(cache locality).",
         "so_deadlocks": "Deadlock'ов на сценарий:  B={B}  D={D}  E={E}  F={F}\n"
-                        "Sort устраняет deadlock'и — но лекарство не бесплатно.",
+                        "Sort устраняет deadlock'и - но лекарство не бесплатно.",
     },
 }
 
@@ -214,6 +214,14 @@ def load(path):
                 continue
             impl = r["impl"]
             K = int(r["K"])
+            bad_suffix = next(
+                (s for s in ("_INCOMPLETE", "_FAILED") if impl.endswith(s)),
+                None,
+            )
+            if bad_suffix is not None:
+                base_impl = impl[: -len(bad_suffix)]
+                rows.get(base_impl, {}).pop(K, None)
+                continue
             rows.setdefault(impl, {})[K] = {
                 "tx": float(r["throughput_tx_per_sec"]),
                 "p95": float(r["p95_ms"]),
@@ -274,7 +282,7 @@ def plot_overview(disjoint, out, lang):
 
     fig.text(
         0.5, 0.012,
-        f"{COMMON_FOOT}; {S['full_data']}: {DISJOINT_CITE}",
+        f"{COMMON_FOOT}. {S['full_data']}: {DISJOINT_CITE}",
         ha="center", fontsize=7.5, color="#555",
     )
     fig.subplots_adjust(bottom=0.11, top=0.93, left=0.07, right=0.985)
@@ -357,7 +365,7 @@ def plot_tradeoffs(disjoint, overlap, out, lang):
                bbox_to_anchor=(0.5, 0.945), fontsize=9, frameon=False)
     fig.text(
         0.5, 0.012,
-        f"{COMMON_FOOT}; {S['full_data']}: docs/perf/bench-alternatives-20260524-*.csv",
+        f"{COMMON_FOOT}. {S['full_data']}: docs/perf/bench-alternatives-20260524-*.csv",
         ha="center", fontsize=7.5, color="#555",
     )
     fig.subplots_adjust(bottom=0.13, top=0.86, left=0.06, right=0.985, wspace=0.26)
@@ -433,7 +441,7 @@ def plot_sorted(overlap, out, lang):
 
     fig.text(
         0.5, 0.012,
-        f"{COMMON_FOOT}, log_lock_waits=on; {S['full_data']}: {OVERLAP_CITE}",
+        f"{COMMON_FOOT}, log_lock_waits=on. {S['full_data']}: {OVERLAP_CITE}",
         ha="center", fontsize=7.5, color="#555",
     )
     fig.subplots_adjust(bottom=0.11, top=0.90, left=0.07, right=0.985)

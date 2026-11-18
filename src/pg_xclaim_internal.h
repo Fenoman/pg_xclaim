@@ -48,10 +48,10 @@
  * XClaimForm
  *      Out-of-band discriminator (mirrors pg_locks.objsubid pattern). Set
  *      by every key-construction site: the scalar entry points
- *      (xclaim_try_solo / xclaim_try_pair), the bulk try_many unpack
- *      loops, and the xclaim.debug_inject_stale test helper. The enum
- *      value 0 is intentionally invalid so a forgotten populate of a
- *      memset'd key fails closed instead of colliding with a real form.
+ *      (xclaim_try_solo / xclaim_try_pair) and the bulk try_many unpack
+ *      loops. The enum value 0 is intentionally invalid so a forgotten
+ *      populate of a memset'd key fails closed instead of colliding with
+ *      a real form.
  */
 typedef enum XClaimForm
 {

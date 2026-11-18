@@ -40,14 +40,15 @@
 |---|------|---------|----------------------|
 | 1 | Smoke gate | `bash scripts/smoke_gate.sh /path/to/pg_config` | exit 0, "SMOKE GATE PASS" |
 | 2 | Smoke gate (без preload) | `bash scripts/smoke_gate_no_preload.sh /path/to/pg_config` | exit 0, SQLSTATE 55000 совпал |
-| 3 | Regress matrix | `bash scripts/run_regress_matrix.sh` | все targets зеленые |
-| 4 | Bench-budgets | `bash scripts/bench_try_many.sh` | оба бюджета PASS |
-| 5 | Baseline `LockManager` p99 | 3-дневный capture через `pg_wait_sampling` | закоммичен в `docs/perf/baseline-pre-migration-YYYY-MM-DD.csv` |
+| 3 | Smoke gate (multi-preload) | `bash scripts/smoke_gate_multi_preload.sh /path/to/pg_config` | exit 0 или 77 (SKIP) |
+| 4 | Regress matrix | `bash scripts/run_regress_matrix.sh` | все targets зеленые |
+| 5 | Bench-budgets | `bash scripts/bench_try_many.sh` | оба бюджета PASS |
+| 6 | Baseline `LockManager` p99 | 3-дневный capture через `pg_wait_sampling` | закоммичен в `docs/perf/baseline-pre-migration-YYYY-MM-DD.csv` |
 
 > Все shell-сниппеты в этом ранбуке подразумевают `set -euo pipefail`.
 > При копировании в скрипт добавьте эту строку в начало.
 
-> Локаль: скрипты шагов 1-4 создают временные кластеры с локалью
+> Локаль: скрипты шагов 1-5 создают временные кластеры с локалью
 > `ru_RU.UTF-8`, поэтому на хосте, где их запускают, эта локаль должна
 > быть установлена.
 
@@ -60,7 +61,7 @@
 
 | Этап | Действие | Ответственный | Критерий перехода к следующему                                                                                                                                                                                              |
 |------|----------|---------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 0 | Собрать `pg_xclaim.so` под целевой PG-major (16/17/18) на build-хосте: `make PG_CONFIG=... && sudo make PG_CONFIG=... install`. | Build | `smoke_gate.sh` exit 0 в CI (`.github/workflows/ci-pg-matrix.yml`). Файлы `pg_xclaim.so`, `pg_xclaim.control`, `pg_xclaim--1.0.0-rc1.sql` и скрипты обновления `pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql`, `pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql` и `pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql` установлены в `$(pg_config --pkglibdir)` и `$(pg_config --sharedir)/extension/`. |
+| 0 | Собрать `pg_xclaim.so` под целевой PG-major (16/17/18) на build-хосте: `make PG_CONFIG=... && sudo make PG_CONFIG=... install`. | Build | `smoke_gate.sh` exit 0 в CI (`.github/workflows/ci-pg-matrix.yml`). Файлы `pg_xclaim.so`, `pg_xclaim.control`, `pg_xclaim--1.0.0-rc5.sql` и скрипты обновления `pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql` .. `pg_xclaim--1.0.0-rc4--1.0.0-rc5.sql` установлены в `$(pg_config --pkglibdir)` и `$(pg_config --sharedir)/extension/`. |
 | 1 | Добавить `pg_xclaim` в `shared_preload_libraries` **последним** элементом списка (PG вызывает xact-callback'и в LIFO-порядке - последний зарегистрированный отрабатывает первым) и GUC'и `pg_xclaim.*` в `postgresql.conf`. Перезапустить кластер. | DBA | сервер стартует, в логе строка `pg_xclaim: shared memory initialized (...)`, нет `FATAL` во время `_PG_init`.                                                                                                               |
 | 2 | Выполнить `CREATE EXTENSION pg_xclaim;` в каждой базе, которой нужен новый SQL surface. | DBA | `SELECT * FROM xclaim.stats();` возвращает валидную строку в каждой базе, `\dx pg_xclaim` показывает установленную версию.                                                                                                  |
 | 3 | На **dev-кластере**: пересобрать функции по местам вызова (заменить `pg_try_advisory_xact_lock(...)` на `xclaim.try(...)` в целевых функциях). | DBA | Пост-проверка не находит остаточных ссылок на `pg_try_advisory_xact_lock` на мигрированных путях, функциональные smoke-тесты проходят.                                                                                      |
@@ -109,10 +110,8 @@ sudo make PG_CONFIG="$PG_CONFIG" install
 # Sanity: проверить установленные пути
 test -f "$($PG_CONFIG --pkglibdir)/pg_xclaim.so"
 test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim.control"
-test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc1.sql"
-test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc1--1.0.0-rc2.sql"
-test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc2--1.0.0-rc3.sql"
-test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql"
+test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc5.sql"
+test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc4--1.0.0-rc5.sql"
 ```
 
 Для multi-major матрицы (16/17/18) повторить последовательность
@@ -151,17 +150,29 @@ test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc3--1.0.0-rc4.sql"
 > просто "сколько функций прошло" - частично мигрированный keyspace
 > хуже, чем немигрированный.
 
-- **Один `CREATE OR REPLACE FUNCTION` на одно место вызова** - не
-  объединять переписывание нескольких функций в одну транзакцию,
-  иначе ошибка в одной откатит остальные.
-- **Каждый блок в `BEGIN ... EXCEPTION WHEN OTHERS ... END`** -
-  логировать сбой и продолжать, не давая одному кривому identifier
-  сорвать всю миграцию.
-- **Пост-проверка**: после прогона сканировать `pg_proc.prosrc` на
-  остаточные `pg_try_advisory_xact_lock\s*\(` в путях, которые
-  должны быть уже мигрированы.
-- **Логи в файл** + `set -e` в bash - чтобы можно было быстро
-  показать DBA "вот эти 3 функции упали, остальные ОК".
+- **Пауза выдачи новых задач и дренаж перед переключением:** пока
+  транзакция миграции не закоммичена, новые сессии продолжают исполнять
+  старые определения функций с `pg_try_advisory_xact_lock`. Перед
+  запуском миграции приостановить фоновые воркеры / очереди по
+  мигрируемому домену на время окна переключения, дождитесь завершения
+  всех активных запросов этих воркеров в `pg_stat_activity`
+  (`state <> 'idle'`), затем внутри окна убедитесь, что по целевому scope
+  (`objsubid = 2 AND classid = <scope>` для двухаргументной формы или
+  `objsubid = 1` для одноаргументной) в базе нет удерживаемых
+  advisory-блокировок
+  (`SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND objsubid = 2 AND classid = <scope>`
+  для парного scope, либо `AND objsubid = 1` при миграции одноаргументных вызовов).
+- **Одна атомарная транзакция на каждый keyspace (scope):** все
+  `CREATE OR REPLACE FUNCTION` / `PROCEDURE`, разделяющие один и тот же
+  конфликтный домен ключей, выполняются внутри одной транзакции без
+  подавления ошибок через `EXCEPTION WHEN OTHERS`, чтобы сбой любой
+  рутины откатил весь keyspace целиком.
+- **Пост-проверка**: в конце транзакции (до `COMMIT`) сканировать
+  `pg_proc` (`pg_get_functiondef`) на остаточные `pg_try_advisory_xact_lock\s*\(`
+  по мигрированному keyspace и выбрасывать `RAISE EXCEPTION` при любом
+  остатке, после успешного `COMMIT` возобновить фоновые воркеры.
+- **Логи в файл** + `set -euo pipefail` и `-v ON_ERROR_STOP=1` в
+  скрипте раскатки.
 
 Прогонять надо во всех базах кластера, которые используют
 расширение (`SELECT datname FROM pg_database WHERE datistemplate = false`),
@@ -196,13 +207,12 @@ pgwatch.
 далеко от своего бакета (длинная проба): в больших наборах с
 заполнения около 0.65. Внутри серии ключей одной партиции у
 `xclaim.try_many` ключи начинают пробы с 1/`num_partitions` бакетов, и
-такой рост начинается уже с заполнения около 0.1, идет под
-блокировкой партиции и может опередить строку про 75%. Так растет прежде
-всего набор, который бэкенд еще не наращивал до нужного размера: после
-сжатия (§9)
-большой `xclaim.try_many` до первой блокировки дает набору вдвое больше
+такой рост начинается уже с заполнения около 0.1 на этапе локального
+staging до захвата блокировки партиции и может опередить строку про 75%.
+После сжатия (§9) большой `xclaim.try_many` на первом новом ключе без
+блокировки партиции расширяет набор к целевому размеру (вдвое больше
 места, чем нужно claim'ам транзакции, но не больше наибольшего размера,
-с которого набор сжимался. Пример строки лога:
+с которого набор сжимался). Пример строки лога:
 
 ```
 LOG:  pg_xclaim: per-backend live claims (12345) crossed 75% of
@@ -328,43 +338,45 @@ SELECT pg_reload_conf();
 
 ### 5.2 Level 2 - Code rollback (без restart)
 
+- **Частичный откат одного домена (остальные домены продолжают использовать `xclaim.*`):**
+  остановите выдачу новых задач и дождитесь завершения активных транзакций только по откатываемому домену (`pg_stat_activity`), убедитесь в отсутствии удерживаемых ключей этого домена в `xclaim.debug_snapshot()` по целевой БД (а при `num_partitions > 192`, где `debug_snapshot()` недоступен, дождитесь полного завершения всех транзакций этого домена в `pg_stat_activity`), затем примените атомарный откатный DDL домена в одной транзакции (`ON_ERROR_STOP=1`). **Не выключайте `pg_xclaim.enabled`**, иначе остальные домены на `xclaim.*` потеряют взаимное исключение.
+- **Полный откат всех доменов кластера с `xclaim.*` на advisory-блокировки:**
+
 ```bash
 set -euo pipefail
 PGHOST=...; PGPORT=...; PGUSER=postgres
-DBS=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -At -c \
-    "SELECT datname FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres');")
 
-# Шаг 1: остановить клиентский трафик (в приложении или в пулере) и
-# только потом включить soft rollback: при живом трафике выключатель
-# снимает взаимное исключение для всех ключей (§4)
+# Шаг 1: остановить клиентский трафик во всех мигрированных доменах и
+# применить откатный DDL ко всем подключенным БД при включенном pg_xclaim.enabled = on
+# (чтобы при ошибке DDL в одной БД остальные не остались без взаимного исключения)
+while IFS= read -r db; do
+    [[ -z "$db" ]] && continue
+    echo "=== Применяем откатный DDL по местам вызова к $db ==="
+    psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" \
+         -v ON_ERROR_STOP=1 -f /path/to/your/rollback_rewrite.sql \
+         2>&1 | tee "/tmp/pg_xclaim_rollback_${db// /_}_$(date +%Y%m%d_%H%M%S).log"
+done < <(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -At -c \
+    "SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname;")
+
+# Шаг 2 (только после успешного прохождения DDL во ВСЕХ базах): выключить pg_xclaim.enabled
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
      -v ON_ERROR_STOP=1 \
      -c "ALTER SYSTEM SET pg_xclaim.enabled = off" \
      -c "SELECT pg_reload_conf()"
-
-# Шаг 2: применить откатный DDL по местам вызова (обратный к
-# forward-пересборке - восстанавливает вызовы
-# pg_try_advisory_xact_lock(...) в целевых функциях)
-for db in $DBS; do
-    echo "=== Применяем откатный DDL по местам вызова к $db ==="
-    psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" \
-         -v ON_ERROR_STOP=1 -f /path/to/your/rollback_rewrite.sql \
-         2>&1 | tee "/tmp/pg_xclaim_rollback_${db}_$(date +%Y%m%d_%H%M%S).log"
-done
 ```
 
-После завершения вызывающие снова используют advisory-локи.
-Клиентский трафик возвращайте, когда скрипт завершился без ошибок:
-откатный DDL прошел во всех базах. `pg_xclaim.enabled=off`
-гарантирует, что параллельный захват claim'ов не происходит до
-следующего деплоя.
+После полного отката всех доменов во всех базах клиентский трафик возвращается на advisory-блокировки, а `pg_xclaim.enabled = off` предотвращает случайные новые захваты до вывода библиотеки в Level 3.
 
 ### 5.3 Level 3 - полный откат (требуется restart)
 
 1. Сначала применить откатный DDL по местам вызова (Level 2 выше).
 2. В следующем maintenance-окне:
-   1. В каждой базе с установленным расширением выполнить
-      `DROP EXTENSION pg_xclaim CASCADE;`.
+   1. В каждой базе с установленным расширением проверить внешние
+      зависимости от объектов `xclaim.*` (например, пользовательские
+      мониторинговые `VIEW` поверх `xclaim.stats()` через `pg_depend`),
+      перевести или удалить их осознанно и выполнить
+      `DROP EXTENSION pg_xclaim;` без `CASCADE`, чтобы не снести
+      пользовательские представления вслепую.
    2. Отредактировать `postgresql.conf` и убрать `pg_xclaim` из
       `shared_preload_libraries`.
    3. Опционально удалить строки GUC `pg_xclaim.*`.
@@ -948,8 +960,9 @@ FATAL:  pg_xclaim.expected_claims_per_backend (N) must be <= pg_xclaim.max_claim
 1. Проверьте лог сервера на ERROR, FATAL и PANIC при завершении
    транзакций и выходе бэкендов, в том числе от колбэков других
    расширений, и не растет ли одновременно `cleanup_misses` (10.5).
-2. Проверьте, не вызывается ли `xclaim.debug_inject_stale()`: это
-   тестовая функция, она создает такие записи намеренно.
+2. Проверьте, не подключен ли на стенде тестовый модуль
+   `xclaim_test_hooks` (вызовы `xclaim_test_inject_stale()` создают
+   такие записи намеренно).
 3. Сохраните `xclaim.stats()`, `xclaim.debug_snapshot()` и лог и
    заведите issue.
 4. Если скорость < 1/мин, срочных действий не нужно: reaper

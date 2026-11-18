@@ -95,6 +95,8 @@ fi
 PGBIN="$("$PG_CONFIG_BIN" --bindir)"
 PG_MAJOR="$("$PG_CONFIG_BIN" --version 2>/dev/null | awk '{print $2}' | awk -F. '{print $1}')"
 PGDATA="$(mktemp -d "/tmp/pg_xclaim_flame_${USER:-root}_$$.XXXXXX")"
+RUN_SCRATCH="$(mktemp -d "/tmp/pg_xclaim_flame_scratch_${USER:-root}_$$.XXXXXX")"
+chmod 700 "$RUN_SCRATCH"
 
 # Free-port probe -- python3 is available on Linux CI/dev hosts. A blind
 # random port pick can collide with an in-use port and fail boot.
@@ -119,8 +121,15 @@ mkdir -p "$OUT_DIR"
 chown -R "$RUN_USER":"$(id -gn "$RUN_USER")" "$PGDATA"
 
 cleanup() {
-    runuser -u "$RUN_USER" -- "$PGBIN/pg_ctl" stop -D "$PGDATA" -m immediate >/dev/null 2>&1 || true
-    rm -rf "${PGDATA:?}"
+    local st=0
+    runuser -u "$RUN_USER" -- "$PGBIN/pg_ctl" stop -D "$PGDATA" -m immediate -w >/dev/null 2>&1 || true
+    rm -rf "${RUN_SCRATCH:?}"
+    if [[ ! -e "$PGDATA/postmaster.pid" ]]; then
+        rm -rf "${PGDATA:?}"
+        return 0
+    fi
+    runuser -u "$RUN_USER" -- "$PGBIN/pg_ctl" status -D "$PGDATA" >/dev/null 2>&1 || st=$?
+    [[ "$st" -eq 3 ]] && rm -rf "${PGDATA:?}" || true
 }
 trap cleanup EXIT INT TERM
 
@@ -161,6 +170,7 @@ pg_xclaim.max_claims = 4194304
 pg_xclaim.num_partitions = 128
 pg_xclaim.expected_claims_per_backend = 1048576
 log_min_messages = warning
+lc_messages = 'C'
 logging_collector = off
 max_connections = 64
 CONF
@@ -175,7 +185,7 @@ echo "record_flamegraphs: cluster up (PG $PG_MAJOR on port $PGPORT)"
 # --- Scenario runner ------------------------------------------------------
 run_scenario() {
     local NAME="$1" SQL="$2" WINDOW="$3" CONCURRENT="${4:-0}"
-    local PERF="/tmp/${NAME}_${$}.perf.data"
+    local PERF="$RUN_SCRATCH/${NAME}.perf.data"
     local SVG="$OUT_DIR/$NAME.svg"
 
     echo ""
@@ -185,26 +195,54 @@ run_scenario() {
     sleep 1
 
     SCENARIO_PSQL_PIDS=()
+    local ERR_LOG="$RUN_SCRATCH/${NAME}_psql_err.log"
+    : > "$ERR_LOG"
     if [[ "$CONCURRENT" -eq 0 ]]; then
-        runuser -u "$RUN_USER" -- "$PGBIN/psql" -h "$PGSOCKET" -p "$PGPORT" \
-            -U postgres -d postgres -c "$SQL" >/dev/null 2>&1 || true
+        if ! LC_MESSAGES=C runuser -u "$RUN_USER" -- "$PGBIN/psql" -X -h "$PGSOCKET" -p "$PGPORT" \
+            -U postgres -d postgres -v ON_ERROR_STOP=1 -c "$SQL" >/dev/null 2>"$ERR_LOG"; then
+            echo "record_flamegraphs: scenario $NAME psql failed:" >&2
+            cat "$ERR_LOG" >&2
+            kill "$PERF_PID" 2>/dev/null || true
+            wait "$PERF_PID" 2>/dev/null || true
+            rm -f "$ERR_LOG" "$PERF"
+            return 1
+        fi
     else
         local w
         for w in $(seq 1 "$CONCURRENT"); do
-            runuser -u "$RUN_USER" -- "$PGBIN/psql" -h "$PGSOCKET" -p "$PGPORT" \
-                -U postgres -d postgres -c "$SQL" >/dev/null 2>&1 &
+            LC_MESSAGES=C runuser -u "$RUN_USER" -- "$PGBIN/psql" -X -h "$PGSOCKET" -p "$PGPORT" \
+                -U postgres -d postgres -v ON_ERROR_STOP=1 -c "$SQL" >/dev/null 2>>"$ERR_LOG" &
             SCENARIO_PSQL_PIDS+=("$!")
         done
     fi
 
-    wait "$PERF_PID" 2>/dev/null || true
-    # Kill exactly the psql clients this scenario spawned (by PID), never a
-    # `pkill -f` pattern that could also match unrelated psql processes.
+    local PERF_RC=0
+    wait "$PERF_PID" 2>/dev/null || PERF_RC=$?
+    local WORKER_EARLY_ERR=0
     if [[ "${#SCENARIO_PSQL_PIDS[@]}" -gt 0 ]]; then
-        kill "${SCENARIO_PSQL_PIDS[@]}" 2>/dev/null || true
-        wait "${SCENARIO_PSQL_PIDS[@]}" 2>/dev/null || true
+        local wpid wrc
+        for wpid in "${SCENARIO_PSQL_PIDS[@]}"; do
+            wrc=0
+            kill "$wpid" 2>/dev/null || true
+            wait "$wpid" 2>/dev/null || wrc=$?
+            if [[ "$wrc" -ne 0 && "$wrc" -ne 143 ]]; then
+                WORKER_EARLY_ERR=1
+            fi
+        done
         SCENARIO_PSQL_PIDS=()
     fi
+    if [[ "$PERF_RC" -ne 0 ]]; then
+        echo "record_flamegraphs: scenario $NAME perf record exited with $PERF_RC" >&2
+        rm -f "$ERR_LOG" "$PERF"
+        return 1
+    fi
+    if [[ "$WORKER_EARLY_ERR" -ne 0 ]] || { grep -vE 'terminating connection|canceling statement|connection to server was lost' "$ERR_LOG" | grep -qE 'psql:|ERROR:|FATAL:|PANIC:'; }; then
+        echo "record_flamegraphs: scenario $NAME worker error:" >&2
+        cat "$ERR_LOG" >&2
+        rm -f "$ERR_LOG" "$PERF"
+        return 1
+    fi
+    rm -f "$ERR_LOG"
     sleep 1
 
     echo "  perf data: $(stat -c%s "$PERF") bytes"

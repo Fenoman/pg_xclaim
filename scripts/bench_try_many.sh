@@ -107,8 +107,14 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
 PGSOCKET="$PGDATA"
 
 cleanup() {
-    "$PGCTL" stop -D "$PGDATA" -m immediate >/dev/null 2>&1 || true
-    rm -rf "${PGDATA:?}"
+    local st=0
+    "$PGCTL" stop -D "$PGDATA" -m immediate -w >/dev/null 2>&1 || true
+    if [[ ! -e "$PGDATA/postmaster.pid" ]]; then
+        rm -rf "${PGDATA:?}"
+        return 0
+    fi
+    "$PGCTL" status -D "$PGDATA" >/dev/null 2>&1 || st=$?
+    [[ "$st" -eq 3 ]] && rm -rf "${PGDATA:?}" || true
 }
 trap cleanup EXIT INT TERM
 
@@ -197,6 +203,29 @@ result_value() {
 # expects each to equal $N.
 CLAIM_COUNTS_SQL="SELECT 'local=' || xclaim.count(); SELECT 'shared=' || capacity_used FROM xclaim.stats();"
 
+check_clean_stats() {
+    local phase="$1"
+    local outvar="$2"
+    local st ce cm rs cu sr zcheck
+    if ! st="$("$PSQL" -h "$PGSOCKET" -p "$PGPORT" -U postgres -d postgres \
+        -X -At -F '|' -v ON_ERROR_STOP=1 \
+        -c "SELECT capacity_errors, cleanup_misses, reaped_stale, capacity_used, (SELECT count(*) FROM xclaim.debug_snapshot()) FROM xclaim.stats();" 2>&1)"; then
+        echo "bench: xclaim.stats() query failed after $phase: $st" >&2
+        exit 2
+    fi
+    IFS='|' read -r ce cm rs cu sr <<<"$st"
+    for zcheck in "capacity_errors:$ce" "cleanup_misses:$cm" "reaped_stale:$rs" \
+                  "capacity_used:$cu" "snapshot_rows:$sr"; do
+        if [[ "${zcheck#*:}" != "0" ]]; then
+            echo "  FAIL [$phase] ${zcheck%%:*} = '${zcheck#*:}' (expected 0)" >&2
+            SEMANTIC_OK=0
+        fi
+    done
+    printf -v "$outvar" '%s' "$st"
+}
+
+SEMANTIC_OK=1
+
 # ---------------------------------------------------------------------------
 # Bench 1: SCALAR API -- xclaim.try(1, g) over generate_series(1, N)
 # ---------------------------------------------------------------------------
@@ -213,6 +242,8 @@ SCALAR_COUNT="$(result_value "$SCALAR_RESULT" wins)"
 SCALAR_LOCAL="$(result_value "$SCALAR_RESULT" local)"
 SCALAR_SHARED="$(result_value "$SCALAR_RESULT" shared)"
 echo "  -> ${SCALAR_MS}ms  true=$SCALAR_COUNT local=$SCALAR_LOCAL shared=$SCALAR_SHARED"
+check_clean_stats "SCALAR" SCALAR_STATS
+echo "  -> post-SCALAR stats (capacity_errors|cleanup_misses|reaped_stale|capacity_used|snapshot_rows): $SCALAR_STATS"
 
 # ---------------------------------------------------------------------------
 # Bench 2: BULK API -- xclaim.try_many(1, ARRAY(1..N))
@@ -231,6 +262,8 @@ BULK_COUNT="$(result_value "$BULK_RESULT" wins)"
 BULK_LOCAL="$(result_value "$BULK_RESULT" local)"
 BULK_SHARED="$(result_value "$BULK_RESULT" shared)"
 echo "  -> ${BULK_MS}ms  true=$BULK_COUNT local=$BULK_LOCAL shared=$BULK_SHARED"
+check_clean_stats "BULK" BULK_STATS
+echo "  -> post-BULK stats (capacity_errors|cleanup_misses|reaped_stale|capacity_used|snapshot_rows): $BULK_STATS"
 
 # ---------------------------------------------------------------------------
 # Bench 3: BASELINE -- pg_try_advisory_xact_lock(1, g) over generate_series
@@ -254,16 +287,10 @@ fi
 echo "  -> ${ADV_MS}ms  count=$ADV_COUNT"
 
 # ---------------------------------------------------------------------------
-# Stats snapshot
+# Final Stats snapshot
 # ---------------------------------------------------------------------------
-if ! STATS="$("$PSQL" -h "$PGSOCKET" -p "$PGPORT" -U postgres -d postgres \
-    -X -At -F '|' -v ON_ERROR_STOP=1 \
-    -c "SELECT capacity_errors, cleanup_misses, reaped_stale FROM xclaim.stats();" 2>&1)"; then
-    echo "bench: xclaim.stats() query failed: $STATS" >&2
-    exit 2
-fi
-echo "[bench] xclaim.stats() (capacity_errors|cleanup_misses|reaped_stale): $STATS"
-CAPACITY_ERRORS="$(cut -d'|' -f1 <<<"$STATS")"
+check_clean_stats "FINAL" STATS
+echo "[bench] xclaim.stats() (capacity_errors|cleanup_misses|reaped_stale|capacity_used|snapshot_rows): $STATS"
 
 # ---------------------------------------------------------------------------
 # Verdict + CSV
@@ -273,20 +300,15 @@ PASS_BULK=0
 [[ "$SCALAR_MS" =~ ^[0-9]+$ ]] && (( SCALAR_MS <= BUDGET_SCALAR_MS )) && PASS_SCALAR=1
 [[ "$BULK_MS"   =~ ^[0-9]+$ ]] && (( BULK_MS   <= BUDGET_BULK_MS   )) && PASS_BULK=1
 
-# Semantic gate: every count equals N and no capacity error happened.
+# Semantic gate: every count equals N and no capacity error, reap or leak happened.
 # Soft mode does not apply here.
-SEMANTIC_OK=1
 for check in "scalar true:$SCALAR_COUNT" "scalar local:$SCALAR_LOCAL" "scalar shared:$SCALAR_SHARED" \
              "bulk true:$BULK_COUNT" "bulk local:$BULK_LOCAL" "bulk shared:$BULK_SHARED"; do
     if [[ "${check#*:}" != "$N" ]]; then
-        echo "  FAIL  ${check%%:*} = '${check#*:}' (expected $N)" >&2
+        echo "  FAIL  ${check#*:} != $N for ${check%%:*}" >&2
         SEMANTIC_OK=0
     fi
 done
-if [[ "$CAPACITY_ERRORS" != "0" ]]; then
-    echo "  FAIL  capacity_errors = '$CAPACITY_ERRORS' (expected 0)" >&2
-    SEMANTIC_OK=0
-fi
 
 echo ""
 echo "================================================================"

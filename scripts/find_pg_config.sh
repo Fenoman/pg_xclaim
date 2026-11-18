@@ -55,8 +55,7 @@ _xclaim_probe_pg_config_major() {
     # Strip suffixes (.X.Y, devel, betaN, rcN) -> integer major.
     major="$(printf '%s\n' "$out" \
         | awk '{print $2}' \
-        | awk -F. '{print $1}' \
-        | tr -dc '0-9' || true)"
+        | grep -Eo '^[0-9]+' || true)"
     [[ -n "$major" ]] || return 1
     [[ "$major" == "$want_major" ]]
 }

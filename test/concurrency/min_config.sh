@@ -24,8 +24,8 @@ XCLAIM_MAX_CLAIMS=32
 XCLAIM_NUM_PARTITIONS=32
 XCLAIM_EXTRA_CONF="pg_xclaim.expected_claims_per_backend = 32
 lc_messages = 'C'"
-pg_xclaim_start_temp_cluster "min_config"
 trap pg_xclaim_stop_temp_cluster EXIT INT TERM
+pg_xclaim_start_temp_cluster "min_config"
 
 xclaim_banner "$SCRIPT"
 

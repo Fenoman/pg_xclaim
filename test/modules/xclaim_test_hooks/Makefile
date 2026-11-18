@@ -5,7 +5,8 @@ MODULES = xclaim_test_hooks
 
 XCLAIM_SRC ?= ../../../src
 PG_CPPFLAGS = -I$(XCLAIM_SRC)
-PG_CFLAGS = -Wall -Wextra -Werror -Wno-unused-parameter -Wno-declaration-after-statement
+override PG_CFLAGS += -Wall -Wextra -Werror -Wno-unused-parameter -Wno-declaration-after-statement
+override with_llvm = no
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

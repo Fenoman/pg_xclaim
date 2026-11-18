@@ -311,7 +311,7 @@ Mac run: 378 ms for scalar and 288 ms for bulk on 750k keys.
 | 25.9% | `hash_search_with_hash_value` | HASH_FIND + HASH_REMOVE in cleanup loop + HASH_ENTER_NULL during acquire (dominates because cleanup walks all 2.5M entries) |
 | 20.0% | `xclaim_local_lookup_with_hash` | reentrancy lookup in the acquire phase, one for each of the 2.5M keys. The cleanup walks the local set with the simplehash iterator, which is not counted here |
 |  6.6% | `xclaim_local_cleanup_held` | self-time of the group-by-partition cleanup driver (gather + sort + per-partition sweep) |
-|  2.7% | `xclaim_local_insert_held` | local-set insert after successful shared insert |
+|  2.7% | `xclaim_local_insert_held` | local-set insert frame in `cleanup-commit.svg` (corresponds to `xclaim_local_stage` + `xclaim_local_note_held`) |
 |  2.7% | `ExecInterpExpr` | executor expression dispatch |
 |  2.4% | `xclaim_try_many_internal` | self-time of the bulk driver |
 |  2.1% | `[libc.so.6]` | libc symbols without debug |
@@ -417,7 +417,7 @@ counter.
 
 | Category | Scalar | Bulk | Cleanup | Contention | What it is |
 |----------|-------:|-----:|--------:|-----------:|------------|
-| **Local simplehash** (`xclaim_local_lookup_with_hash`, `xclaim_local_insert_held`, `xclaim_local_cleanup_held`) | ~39% | ~12% | ~29% | ~7% | reentrancy fast-path + local-set insert + group-by-partition cleanup. The key hash is not here: `hash_bytes` is counted in the shared dynahash row |
+| **Local simplehash** (`xclaim_local_lookup_with_hash`, `xclaim_local_stage`, `xclaim_local_note_held`, `xclaim_local_cleanup_held`) | ~39% | ~12% | ~29% | ~7% | reentrancy fast-path + local-set staging/promotion + group-by-partition cleanup. The key hash is not here: `hash_bytes` is counted in the shared dynahash row |
 | **Shared dynahash** (`hash_search_with_hash_value` + `hash_bytes`) | ~12.5% | ~5% | ~28% | ~16% | partitioned shared hash under partition LWLock |
 | **PG executor / plpgsql** (`ExecInterpExpr`, tuplestore, SRF dispatch) | - | - | - | - | function-call dispatch, FOR-loop machinery, tuplestore I/O. The category is open-ended, and its share cannot be recovered from the published profiles |
 | **xclaim driver self-time** (`xclaim_try_internal`, `xclaim_try_many_internal`, `xclaim_is_stale_owner`) | ~2% | ~3% | ~3% | **~10%** | self-time + stale-owner reaper (the latter spikes under contention) |
@@ -425,23 +425,15 @@ counter.
 | **Kernel page-zero + faults** (`clear_page_rep`, `asm_exc_page_fault`) | <1% | ~2% | ~3% | ~3% | first-touch zero-fill on fresh palloc pages + page-fault entry |
 | **libc opaque** (`[libc.so.6]`) | ~3% | ~5% | ~2% | ~5% | memcpy/memset/strlen - install `libc6-dbg` to resolve |
 | **Atomic counters** (`__atomic_*`) | - | - | - | - | per-backend stat slots + live_capacity. On x86_64 these are inline `lock`-prefixed instructions inside the calling functions: no frames of their own, so the profile gives no share for them |
-| **LWLock acquire/release** | not in top 15 | not in top 15 | not in top 15 | not in top 15 | partition lock cycles (<= num_partitions=128). `LWLockAcquire` and `LWLockRelease` are not in the top 15, so each is at most the 15th row of the scenario table: 1.4% in scalar, 2.1% in bulk, 1.1% in cleanup, 1.2% in concurrent |
+| **LWLock acquire/release** | not in top 15 | not in top 15 | not in top 15 | not in top 15 | on the normal path (without `warn` capacity misses, chunks exceeding `max_claims + 64`, or the OOM one-by-one cleanup fallback), at most `num_partitions` (128) lock cycles per call in `bulk` and `cleanup`, one cycle per claim in `scalar`. Each of `LWLockAcquire` and `LWLockRelease` stays at or below the 15th row of the scenario table (1.4% in scalar, 2.1% in bulk, 1.1% in cleanup, 1.2% in concurrent) |
 
 ---
 
 ## Architectural validation
 
-The profile confirms three core promises and cannot check item 2:
+The profile is consistent with the batch and cleanup lock bounds and cannot check item 2:
 
-1. **LWLock cycles are bounded by `num_partitions`, not by entry
-   count.** `LWLockRelease` does not appear in the top 15 of any of
-   the four scenarios, so it is at most the 15th row of each table:
-   1.4% in scalar, 2.1% in bulk, 1.1% in cleanup, 1.2% in concurrent.
-   That is a lower bound on the group-cleanup cost: the 2.5M entries
-   of the cleanup scenario pass through <= 128 LWLock cycles (default
-   `num_partitions`), not 2.5M. The group-by-partition cleanup
-   invariant holds - confirmed directly with resolved pg_xclaim
-   symbols.
+1. **Low `LWLock` share on bulk acquire and grouped cleanup.** Neither `LWLockAcquire` nor `LWLockRelease` appears in the top 15 of any of the four scenarios (upper bound on each leaf share is the 15th row: 1.4% in scalar, 2.1% in bulk, 1.1% in cleanup, 1.2% in concurrent). On the normal path (no `warn` capacity misses, per-partition chunks <= `max_claims + 64`, and no OOM one-by-one cleanup fallback), `bulk` and `cleanup` pass through <= `num_partitions` (128) `LWLock` cycles, a bound guaranteed directly by the partition-grouped code path.
 
 2. **The profile does not show the atomic counters.** The
    `__atomic_*` operations (the x86_64 lock prefix) are inlined into
@@ -515,6 +507,7 @@ sudo git clone https://github.com/brendangregg/FlameGraph /opt/FlameGraph
 
 # Build pg_xclaim with frame pointers + debug info
 PG=/usr/lib/postgresql/17/bin/pg_config
+make PG_CONFIG=$PG clean
 PG_CFLAGS="-O2 -g -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer" \
   make PG_CONFIG=$PG -j"$(nproc)"
 sudo make PG_CONFIG=$PG install
