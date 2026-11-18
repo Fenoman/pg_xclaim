@@ -50,7 +50,11 @@
 
 > Локаль: скрипты шагов 1-5 создают временные кластеры с локалью
 > `ru_RU.UTF-8`, поэтому на хосте, где их запускают, эта локаль должна
-> быть установлена.
+> быть установлена. Шаг 5 (`scripts/bench_try_many.sh`) замеряет сквозное
+> время процесса `psql` вместе с материализацией массива на 750 000
+> элементов и `ROLLBACK` (бюджет 500 мс откалиброван под выделенное
+> железо, для разделяемых 2-vCPU VM используйте флаг `--soft`, который
+> оставляет жесткой семантическую проверку 750k / 0 ошибок / 0 утечек).
 
 ---
 
@@ -120,11 +124,68 @@ test -f "$($PG_CONFIG --sharedir)/extension/pg_xclaim--1.0.0-rc4--1.0.0-rc5.sql"
 их не пересобирает, и в каталог следующего мажора ставится чужая
 `pg_xclaim.so`, которую сервер отвергнет при загрузке (`PG_MODULE_MAGIC`).
 
-Обновление уже установленного расширения: поставить новую сборку тем же
-`make install`, перезапустить сервер (библиотека грузится через
-`shared_preload_libraries`) и в каждой базе с расширением выполнить
-`ALTER EXTENSION pg_xclaim UPDATE;`. Изменения по версиям - в
+Обновление уже установленного расширения на том же мажоре PostgreSQL:
+поставить новую сборку тем же `make install`, перезапустить сервер
+(библиотека грузится через `shared_preload_libraries`) и в каждой базе с
+расширением выполнить `ALTER EXTENSION pg_xclaim UPDATE;` (базы с
+`datallowconn = false`, где установлено расширение, нужно временно
+открыть и обновить до возврата трафика). В контейнерных и Ansible
+обновляторах недопустим автоматический откат ошибки `ALTER EXTENSION
+UPDATE` на `DROP EXTENSION + CREATE EXTENSION`, иначе сбрасываются
+кастомные ACL схемы и функций (готовый патч - см.
+`docs/postgrespro-docker-acl-patch.md`). Изменения по версиям - в
 `CHANGELOG.md`.
+
+### 2.2 Мажорное обновление PostgreSQL (`pg_upgrade`)
+
+В `1.0.0-rc5` из `pg_xclaim.so` и схемы `xclaim` удалена тестовая функция
+`xclaim.debug_inject_stale(int4, int4)` (C-символ
+`xclaim_debug_inject_stale`). `pg_upgrade --check` проверяет только
+наличие файла `$libdir/pg_xclaim`, а сам `pg_upgrade` (`pg_dump
+--binary-upgrade`) пересоздает функции расширения по старому каталогу
+`pg_proc`. Поэтому совмещать переход с `1.0.0-rc1..rc4` на `1.0.0-rc5` и
+`pg_upgrade` в один шаг нельзя: восстановление схемы упадет на
+отсутствующем C-символе `xclaim_debug_inject_stale`.
+
+Обязательный порядок перед `pg_upgrade` на новый мажор с `pg_xclaim >=
+1.0.0-rc5`:
+
+1. На **текущем (старом)** мажоре установить пакет/сборку `pg_xclaim
+   1.0.0-rc5` и перезапустить PostgreSQL.
+2. В каждой базе старого кластера, где установлен `pg_xclaim`, выполнить
+   `ALTER EXTENSION pg_xclaim UPDATE TO '1.0.0-rc5';`.
+3. Проверить по всем нешаблонным базам старого кластера, что нигде не
+   осталось старой версии расширения и C-символа
+   `xclaim_debug_inject_stale`:
+
+```bash
+set -euo pipefail
+PGHOST=...; PGPORT=...; PGUSER=postgres
+
+DBS_RAW="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -At -v ON_ERROR_STOP=1 \
+    -c "SELECT datname || '|' || datallowconn FROM pg_database WHERE NOT datistemplate ORDER BY datname;")"
+[[ -n "$DBS_RAW" ]] || { echo "ERROR: empty database list" >&2; exit 1; }
+
+while IFS='|' read -r db allow; do
+    [[ -z "$db" ]] && continue
+    if [[ "$allow" != "t" ]]; then
+        echo "ERROR: database '$db' has datallowconn=false - inspect and update it before pg_upgrade" >&2
+        exit 1
+    fi
+    state="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" -X -At -v ON_ERROR_STOP=1 -c "
+        SELECT COALESCE((SELECT extversion FROM pg_extension WHERE extname = 'pg_xclaim'), 'absent')
+               || '|' ||
+               (SELECT count(*) FROM pg_proc WHERE probin = '\$libdir/pg_xclaim' AND prosrc = 'xclaim_debug_inject_stale');")"
+    if [[ "$state" != "absent|0" && "$state" != "1.0.0-rc5|0" ]]; then
+        echo "ERROR: database '$db' is not ready for pg_upgrade (extversion|stale_sym = $state)" >&2
+        exit 1
+    fi
+done <<< "$DBS_RAW"
+```
+
+4. Только после прохождения этой проверки остановить старый кластер и
+   выполнить `pg_upgrade` на новый мажор PostgreSQL с `pg_xclaim
+   1.0.0-rc5`.
 
 ### 2.1 Пересборка функций по местам вызова
 
@@ -345,21 +406,49 @@ SELECT pg_reload_conf();
 ```bash
 set -euo pipefail
 PGHOST=...; PGPORT=...; PGUSER=postgres
+# Явный список прикладных БД, где раскатаны вызовы xclaim.* (без служебной postgres, если там нет прикладных схем)
+MIGRATED_DBS=(app_db)
+
+(( ${#MIGRATED_DBS[@]} > 0 )) || { echo "ERROR: MIGRATED_DBS must not be empty" >&2; exit 1; }
+
+# Шаг 0: синхронно получить список всех нешаблонных БД (ошибка psql сразу прерывает скрипт по set -e)
+ALL_DBS_RAW="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -At -v ON_ERROR_STOP=1 \
+    -c "SELECT datname || '|' || datallowconn FROM pg_database WHERE NOT datistemplate ORDER BY datname;")"
+[[ -n "$ALL_DBS_RAW" ]] || { echo "ERROR: pg_database query returned no rows" >&2; exit 1; }
 
 # Шаг 1: остановить клиентский трафик во всех мигрированных доменах и
-# применить откатный DDL ко всем подключенным БД при включенном pg_xclaim.enabled = on
+# применить откатный DDL к каждой целевой прикладной БД при включенном pg_xclaim.enabled = on
 # (чтобы при ошибке DDL в одной БД остальные не остались без взаимного исключения)
-while IFS= read -r db; do
-    [[ -z "$db" ]] && continue
+for db in "${MIGRATED_DBS[@]}"; do
     echo "=== Применяем откатный DDL по местам вызова к $db ==="
-    psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" \
+    psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" -X \
          -v ON_ERROR_STOP=1 -f /path/to/your/rollback_rewrite.sql \
          2>&1 | tee "/tmp/pg_xclaim_rollback_${db// /_}_$(date +%Y%m%d_%H%M%S).log"
-done < <(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -At -c \
-    "SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname;")
+done
 
-# Шаг 2 (только после успешного прохождения DDL во ВСЕХ базах): выключить pg_xclaim.enabled
-psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+# Шаг 2: убедиться по ВСЕМ нешаблонным БД кластера, что вне самого расширения pg_xclaim
+# не осталось ни одной функции/процедуры с вызовами xclaim.try / xclaim.try_many
+while IFS='|' read -r db allow; do
+    [[ -z "$db" ]] && continue
+    if [[ "$allow" != "t" ]]; then
+        echo "ERROR: database '$db' has datallowconn=false - cannot verify zero xclaim call sites" >&2
+        exit 1
+    fi
+    left="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" -X -At -v ON_ERROR_STOP=1 -c "
+        SELECT count(*)
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'xclaim')
+          AND p.prokind IN ('f', 'p')
+          AND pg_get_functiondef(p.oid) ~* 'xclaim\.(try|try_many)\s*\(';")"
+    if [[ "$left" != "0" ]]; then
+        echo "ERROR: database '$db' still has $left routine(s) calling xclaim.try/try_many - aborting disable" >&2
+        exit 1
+    fi
+done <<< "$ALL_DBS_RAW"
+
+# Шаг 3 (только после подтвержденного отсутствия вызовов во ВСЕХ базах): выключить pg_xclaim.enabled
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
      -v ON_ERROR_STOP=1 \
      -c "ALTER SYSTEM SET pg_xclaim.enabled = off" \
      -c "SELECT pg_reload_conf()"

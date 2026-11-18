@@ -213,11 +213,13 @@ xclaim_handle_capacity_exhaustion(const XClaimKey *lk)
              * separately from `conflicts` so operators can distinguish
              * real contention from sizing pressure.
              *
-             * In the bulk path, subsequent slot failures within the
-             * same xclaim.try_many call have their ereport suppressed
-             * (see xclaim_bulk_warn_* statics at the top of this TU).
-             * The slot-failure COUNTER still increments unconditionally
-             * -- xclaim.stats().capacity_warnings remains exact for
+             * In the bulk path, subsequent slot failures while
+             * xclaim_bulk_warn_context_active is set (including any
+             * nested xclaim.try triggered from emit_log_hook during that
+             * bulk call) have their ereport suppressed (see
+             * xclaim_bulk_warn_* statics at the top of this TU). The
+             * slot-failure COUNTER still increments unconditionally --
+             * xclaim.stats().capacity_warnings remains exact for
              * sizing-pressure observability.
              */
             pg_atomic_fetch_add_u64(&XClaimCtl->capacity_warnings, 1);

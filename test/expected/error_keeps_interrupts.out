@@ -12,8 +12,8 @@
 -- ERROR (SQLSTATE 53400) while the tuplestore spills to disk, with no
 -- partition LWLock held. Only the SQLSTATE is printed: the message text
 -- differs between major versions. The PG_CATCH of xclaim.try_many, which
--- releases a partition LWLock, is checked by Test 3 of
--- test/concurrency/local_grow_oom.sh (Linux).
+-- releases a held partition LWLock, is checked by
+-- test/capacity/sql/cap_bulk_rollback.sql and test/concurrency/hook_error_paths.sh.
 \set VERBOSITY terse
 CREATE EXTENSION IF NOT EXISTS pg_xclaim;
 NOTICE:  extension "pg_xclaim" already exists, skipping

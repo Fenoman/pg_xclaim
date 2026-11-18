@@ -49,7 +49,11 @@ table below has passed. This protects against partial rollout.
 
 > Locale: the scripts of gates 1-5 create temporary clusters with the
 > `ru_RU.UTF-8` locale, so that locale must be installed on the host
-> that runs them.
+> that runs them. Gate 5 (`scripts/bench_try_many.sh`) times the full
+> `psql` subprocess including 750,000-element array construction and
+> `ROLLBACK` (the 500 ms budget targets dedicated hardware, pass `--soft`
+> on shared 2-vCPU CI/VMs to keep the semantic 750k / 0-error / 0-leak
+> gate strict without failing on VM scheduling jitter).
 
 ---
 
@@ -118,11 +122,68 @@ For a multi-major matrix (16/17/18), repeat the `make clean` + `make` +
 rebuild them, and the next major's directory gets a `pg_xclaim.so` built for
 another major, which the server rejects at load (`PG_MODULE_MAGIC`).
 
-To update an installed extension: install the new build with the same
-`make install`, restart the server (the library is loaded through
-`shared_preload_libraries`), and run `ALTER EXTENSION pg_xclaim UPDATE;`
-in every database that has the extension. Per-version changes are listed
-in `CHANGELOG.md`.
+To update an installed extension on the same PostgreSQL major: install
+the new build with the same `make install`, restart the server (the
+library is loaded through `shared_preload_libraries`), and run
+`ALTER EXTENSION pg_xclaim UPDATE;` in every database that has the
+extension (temporarily enabling any database with `datallowconn = false`
+where `pg_xclaim` is installed before reopening user traffic). Container
+entrypoints and Ansible updaters must never fall back to `DROP EXTENSION +
+CREATE EXTENSION` on an `ALTER EXTENSION UPDATE` error, or custom schema
+and function ACLs will be reset (see `docs/postgrespro-docker-acl-patch.md`
+for the update-only patch). Per-version changes are listed in
+`CHANGELOG.md`.
+
+### 2.2 PostgreSQL major-version upgrades (`pg_upgrade`)
+
+Release `1.0.0-rc5` removes the test-only `xclaim.debug_inject_stale(int4,
+int4)` function and its `xclaim_debug_inject_stale` C symbol from
+`pg_xclaim.so`. Because `pg_upgrade --check` verifies shared library
+filenames (`$libdir/pg_xclaim`) rather than individual C symbols, while
+`pg_upgrade` (`pg_dump --binary-upgrade`) replays every `CREATE FUNCTION`
+still present in the old cluster's `pg_proc` catalog, combining an upgrade
+from `1.0.0-rc1..rc4` to `1.0.0-rc5` with `pg_upgrade` in a single step
+fails during schema restore with `could not find function
+"xclaim_debug_inject_stale"`.
+
+Required sequence before running `pg_upgrade` onto a new PostgreSQL major
+with `pg_xclaim >= 1.0.0-rc5`:
+
+1. Install `pg_xclaim 1.0.0-rc5` on the **current (old)** PostgreSQL major
+   and restart PostgreSQL.
+2. Run `ALTER EXTENSION pg_xclaim UPDATE TO '1.0.0-rc5';` in every
+   database of the old cluster where `pg_xclaim` is installed.
+3. Verify across all non-template databases of the old cluster that no
+   older `extversion` or `xclaim_debug_inject_stale` symbol reference
+   remains:
+
+```bash
+set -euo pipefail
+PGHOST=...; PGPORT=...; PGUSER=postgres
+
+DBS_RAW="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -At -v ON_ERROR_STOP=1 \
+    -c "SELECT datname || '|' || datallowconn FROM pg_database WHERE NOT datistemplate ORDER BY datname;")"
+[[ -n "$DBS_RAW" ]] || { echo "ERROR: empty database list" >&2; exit 1; }
+
+while IFS='|' read -r db allow; do
+    [[ -z "$db" ]] && continue
+    if [[ "$allow" != "t" ]]; then
+        echo "ERROR: database '$db' has datallowconn=false - inspect and update it before pg_upgrade" >&2
+        exit 1
+    fi
+    state="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" -X -At -v ON_ERROR_STOP=1 -c "
+        SELECT COALESCE((SELECT extversion FROM pg_extension WHERE extname = 'pg_xclaim'), 'absent')
+               || '|' ||
+               (SELECT count(*) FROM pg_proc WHERE probin = '\$libdir/pg_xclaim' AND prosrc = 'xclaim_debug_inject_stale');")"
+    if [[ "$state" != "absent|0" && "$state" != "1.0.0-rc5|0" ]]; then
+        echo "ERROR: database '$db' is not ready for pg_upgrade (extversion|stale_sym = $state)" >&2
+        exit 1
+    fi
+done <<< "$DBS_RAW"
+```
+
+4. Only after this preflight passes, stop the old cluster and run
+   `pg_upgrade` onto the new PostgreSQL major with `pg_xclaim 1.0.0-rc5`.
 
 ### 2.1 Apply per-site rewrite DDL
 
@@ -335,21 +396,49 @@ correctness is not the priority.
 ```bash
 set -euo pipefail
 PGHOST=...; PGPORT=...; PGUSER=postgres
+# Explicit list of application databases where xclaim.* call sites were deployed (excluding maintenance DBs without app schemas)
+MIGRATED_DBS=(app_db)
+
+(( ${#MIGRATED_DBS[@]} > 0 )) || { echo "ERROR: MIGRATED_DBS must not be empty" >&2; exit 1; }
+
+# Step 0: synchronously fetch all non-template databases (a psql failure aborts immediately under set -e)
+ALL_DBS_RAW="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -At -v ON_ERROR_STOP=1 \
+    -c "SELECT datname || '|' || datallowconn FROM pg_database WHERE NOT datistemplate ORDER BY datname;")"
+[[ -n "$ALL_DBS_RAW" ]] || { echo "ERROR: pg_database query returned no rows" >&2; exit 1; }
 
 # Step 1: stop user traffic across all migrated domains and apply rollback DDL
-# to every connectable database while pg_xclaim.enabled remains on (so a DDL
-# error in one database never leaves remaining databases unprotected)
-while IFS= read -r db; do
-    [[ -z "$db" ]] && continue
+# to each target application database while pg_xclaim.enabled remains on (so a
+# DDL error in one database never leaves remaining databases unprotected)
+for db in "${MIGRATED_DBS[@]}"; do
     echo "=== Applying per-site rollback to $db ==="
-    psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" \
+    psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" -X \
          -v ON_ERROR_STOP=1 -f /path/to/your/rollback_rewrite.sql \
          2>&1 | tee "/tmp/pg_xclaim_rollback_${db// /_}_$(date +%Y%m%d_%H%M%S).log"
-done < <(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -At -c \
-    "SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname;")
+done
 
-# Step 2 (ONLY after rollback DDL succeeded in EVERY database): set pg_xclaim.enabled = off
-psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+# Step 2: verify across ALL non-template databases in the cluster that zero user
+# functions/procedures outside the xclaim extension still call xclaim.try / xclaim.try_many
+while IFS='|' read -r db allow; do
+    [[ -z "$db" ]] && continue
+    if [[ "$allow" != "t" ]]; then
+        echo "ERROR: database '$db' has datallowconn=false - cannot verify zero xclaim call sites" >&2
+        exit 1
+    fi
+    left="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" -X -At -v ON_ERROR_STOP=1 -c "
+        SELECT count(*)
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'xclaim')
+          AND p.prokind IN ('f', 'p')
+          AND pg_get_functiondef(p.oid) ~* 'xclaim\.(try|try_many)\s*\(';")"
+    if [[ "$left" != "0" ]]; then
+        echo "ERROR: database '$db' still has $left routine(s) calling xclaim.try/try_many - aborting disable" >&2
+        exit 1
+    fi
+done <<< "$ALL_DBS_RAW"
+
+# Step 3 (ONLY after zero xclaim call sites are confirmed across EVERY database): set pg_xclaim.enabled = off
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
      -v ON_ERROR_STOP=1 \
      -c "ALTER SYSTEM SET pg_xclaim.enabled = off" \
      -c "SELECT pg_reload_conf()"

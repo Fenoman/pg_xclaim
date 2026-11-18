@@ -451,7 +451,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # Test 6: xclaim.try_many OOM with exit_on_error = on on the long-probe corpus
-#         (discriminates D02 pre-staging: without pre-staging, fresh_p0 and
+#         (discriminates unlocked pre-staging: without pre-staging, fresh_p0 and
 #         collider_27 in partition 0 would insert into XClaimHash before the
 #         second long-probe growth failed under LWLock, leaving an orphaned
 #         shared row and underflowing live_capacity on backend exit)

@@ -96,7 +96,7 @@ include $(PGXS)
 #
 # atx_mark_extension_as_incompatible (miscadmin.h), Postgres Pro Enterprise:
 # _PG_init refuses autonomous transactions with it.
-ifneq ($(if $(MAKECMDGOALS),$(filter-out clean distclean clean-test-dirs,$(MAKECMDGOALS)),build),)
+ifneq ($(if $(MAKECMDGOALS),$(filter-out clean distclean clean-test-dirs uninstall installcheck installcheck-capacity installcheck-nonpreload installcheck-lwlocks,$(MAKECMDGOALS)),build),)
 XCLAIM_PROBE_BASE_OK := $(shell printf 'void xclaim_probe_base(void);\n' | $(CC) $(CPPFLAGS) -x c -include postgres.h -fsyntax-only - >/dev/null 2>&1 && echo yes)
 ifeq ($(XCLAIM_PROBE_BASE_OK),)
 $(error Compiler probe failed on postgres.h using CC="$(CC)" - check PG_CONFIG, CC and server headers)

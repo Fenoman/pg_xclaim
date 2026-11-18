@@ -20,7 +20,10 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   `xclaim_test_inject_stale(int4, int4)` (never installed into production
   images), and `pg_xclaim--1.0.0-rc4--1.0.0-rc5.sql` drops
   `xclaim.debug_inject_stale(int4, int4)` when upgrading from earlier
-  release candidates.
+  release candidates. Clusters running `1.0.0-rc1..rc4` must install
+  `1.0.0-rc5` and run `ALTER EXTENSION pg_xclaim UPDATE` on their current
+  PostgreSQL major before running `pg_upgrade` to a newer major (see
+  `docs/runbook_en.md` §2.2).
 
 ### Changed
 
