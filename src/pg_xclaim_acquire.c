@@ -134,8 +134,8 @@
 /* the actual signal ("you ran out of room"). The flags below collapse  */
 /* the per-slot stream into one detail WARNING + one tail summary       */
 /* WARNING, set/reset at the bulk driver's entry, normal exit, and the  */
-/* PG_CATCH error path. Single-key xclaim.try is unaffected (each call  */
-/* is its own statement, so no rate-limit is needed).                   */
+/* PG_CATCH error path. Standalone single-key xclaim.try calls run with */
+/* xclaim_bulk_warn_context_active == false and emit one WARNING each.  */
 /*                                                                      */
 /* The `capacity_warnings` stats counter is INTENTIONALLY incremented   */
 /* on every failed slot regardless of suppression: operators sizing     */
@@ -213,12 +213,14 @@ xclaim_handle_capacity_exhaustion(const XClaimKey *lk)
              * separately from `conflicts` so operators can distinguish
              * real contention from sizing pressure.
              *
-             * In the bulk path, subsequent slot failures while
+             * In the bulk path, once xclaim_bulk_warn_emitted_this_call
+             * is set after the first detail WARNING returns from
+             * ereport, subsequent slot failures while
              * xclaim_bulk_warn_context_active is set (including any
-             * nested xclaim.try triggered from emit_log_hook during that
-             * bulk call) have their ereport suppressed (see
-             * xclaim_bulk_warn_* statics at the top of this TU). The
-             * slot-failure COUNTER still increments unconditionally --
+             * nested xclaim.try triggered after that point) have their
+             * ereport suppressed (see xclaim_bulk_warn_* statics at the
+             * top of this TU). The slot-failure COUNTER still
+             * increments unconditionally --
              * xclaim.stats().capacity_warnings remains exact for
              * sizing-pressure observability.
              */

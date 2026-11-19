@@ -136,57 +136,6 @@ UPDATE` на `DROP EXTENSION + CREATE EXTENSION`, иначе сбрасываю�
 `docs/postgrespro-docker-acl-patch.md`). Изменения по версиям - в
 `CHANGELOG.md`.
 
-### 2.2 Мажорное обновление PostgreSQL (`pg_upgrade`)
-
-В `1.0.0-rc5` из `pg_xclaim.so` и схемы `xclaim` удалена тестовая функция
-`xclaim.debug_inject_stale(int4, int4)` (C-символ
-`xclaim_debug_inject_stale`). `pg_upgrade --check` проверяет только
-наличие файла `$libdir/pg_xclaim`, а сам `pg_upgrade` (`pg_dump
---binary-upgrade`) пересоздает функции расширения по старому каталогу
-`pg_proc`. Поэтому совмещать переход с `1.0.0-rc1..rc4` на `1.0.0-rc5` и
-`pg_upgrade` в один шаг нельзя: восстановление схемы упадет на
-отсутствующем C-символе `xclaim_debug_inject_stale`.
-
-Обязательный порядок перед `pg_upgrade` на новый мажор с `pg_xclaim >=
-1.0.0-rc5`:
-
-1. На **текущем (старом)** мажоре установить пакет/сборку `pg_xclaim
-   1.0.0-rc5` и перезапустить PostgreSQL.
-2. В каждой базе старого кластера, где установлен `pg_xclaim`, выполнить
-   `ALTER EXTENSION pg_xclaim UPDATE TO '1.0.0-rc5';`.
-3. Проверить по всем нешаблонным базам старого кластера, что нигде не
-   осталось старой версии расширения и C-символа
-   `xclaim_debug_inject_stale`:
-
-```bash
-set -euo pipefail
-PGHOST=...; PGPORT=...; PGUSER=postgres
-
-DBS_RAW="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -At -v ON_ERROR_STOP=1 \
-    -c "SELECT datname || '|' || datallowconn FROM pg_database WHERE NOT datistemplate ORDER BY datname;")"
-[[ -n "$DBS_RAW" ]] || { echo "ERROR: empty database list" >&2; exit 1; }
-
-while IFS='|' read -r db allow; do
-    [[ -z "$db" ]] && continue
-    if [[ "$allow" != "t" ]]; then
-        echo "ERROR: database '$db' has datallowconn=false - inspect and update it before pg_upgrade" >&2
-        exit 1
-    fi
-    state="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" -X -At -v ON_ERROR_STOP=1 -c "
-        SELECT COALESCE((SELECT extversion FROM pg_extension WHERE extname = 'pg_xclaim'), 'absent')
-               || '|' ||
-               (SELECT count(*) FROM pg_proc WHERE probin = '\$libdir/pg_xclaim' AND prosrc = 'xclaim_debug_inject_stale');")"
-    if [[ "$state" != "absent|0" && "$state" != "1.0.0-rc5|0" ]]; then
-        echo "ERROR: database '$db' is not ready for pg_upgrade (extversion|stale_sym = $state)" >&2
-        exit 1
-    fi
-done <<< "$DBS_RAW"
-```
-
-4. Только после прохождения этой проверки остановить старый кластер и
-   выполнить `pg_upgrade` на новый мажор PostgreSQL с `pg_xclaim
-   1.0.0-rc5`.
-
 ### 2.1 Пересборка функций по местам вызова
 
 Замена `pg_try_advisory_xact_lock(...)` на `xclaim.try(...)` - это
@@ -238,6 +187,58 @@ done <<< "$DBS_RAW"
 Прогонять надо во всех базах кластера, которые используют
 расширение (`SELECT datname FROM pg_database WHERE datistemplate = false`),
 исключая `postgres` и системные.
+
+### 2.2 Мажорное обновление PostgreSQL (`pg_upgrade`)
+
+В `1.0.0-rc5` из `pg_xclaim.so` и схемы `xclaim` удалена тестовая функция
+`xclaim.debug_inject_stale(int4, int4)` (C-символ
+`xclaim_debug_inject_stale`). `pg_upgrade --check` проверяет только
+наличие файла `$libdir/pg_xclaim`, а сам `pg_upgrade` (`pg_dump
+--binary-upgrade`) пересоздает функции расширения по старому каталогу
+`pg_proc` для всех переносимых баз, включая `template1` и пользовательские
+шаблоны. Поэтому совмещать переход с `1.0.0-rc1..rc4` на `1.0.0-rc5` и
+`pg_upgrade` в один шаг нельзя: восстановление схемы упадет на
+отсутствующем C-символе `xclaim_debug_inject_stale`.
+
+Обязательный порядок перед `pg_upgrade` на новый мажор с `pg_xclaim >=
+1.0.0-rc5`:
+
+1. На **текущем (старом)** мажоре установить пакет/сборку `pg_xclaim
+   1.0.0-rc5` и перезапустить PostgreSQL.
+2. В каждой базе старого кластера, где установлен `pg_xclaim` (включая
+   `template1` и пользовательские шаблоны, если расширение ставилось туда),
+   выполнить `ALTER EXTENSION pg_xclaim UPDATE TO '1.0.0-rc5';`.
+3. Проверить по всем базам старого кластера (кроме штатно закрытого
+   `template0`), что нигде не осталось старой версии расширения и C-символа
+   `xclaim_debug_inject_stale`:
+
+```bash
+set -euo pipefail
+PGHOST=...; PGPORT=...; PGUSER=postgres
+
+DBS_RAW="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -At -F '|' -v ON_ERROR_STOP=1 \
+    -c "SELECT datallowconn, datname FROM pg_database WHERE NOT (datname = 'template0' AND datistemplate AND NOT datallowconn) ORDER BY datname;")"
+[[ -n "$DBS_RAW" ]] || { echo "ERROR: empty database list" >&2; exit 1; }
+
+while IFS='|' read -r allow db; do
+    [[ -z "$db" ]] && continue
+    if [[ "$allow" != "t" ]]; then
+        echo "ERROR: database '$db' has datallowconn=false - inspect and update it before pg_upgrade" >&2
+        exit 1
+    fi
+    state="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" -X -At -F '|' -v ON_ERROR_STOP=1 -c "
+        SELECT COALESCE((SELECT extversion FROM pg_extension WHERE extname = 'pg_xclaim'), 'absent'),
+               (SELECT count(*) FROM pg_proc WHERE probin = '\$libdir/pg_xclaim' AND prosrc = 'xclaim_debug_inject_stale');")"
+    if [[ "$state" != "absent|0" && "$state" != "1.0.0-rc5|0" ]]; then
+        echo "ERROR: database '$db' is not ready for pg_upgrade (extversion|stale_sym = $state)" >&2
+        exit 1
+    fi
+done <<< "$DBS_RAW"
+```
+
+4. Только после прохождения этой проверки остановить старый кластер и
+   выполнить `pg_upgrade` на новый мажор PostgreSQL с `pg_xclaim
+   1.0.0-rc5`.
 
 ---
 
@@ -411,10 +412,33 @@ MIGRATED_DBS=(app_db)
 
 (( ${#MIGRATED_DBS[@]} > 0 )) || { echo "ERROR: MIGRATED_DBS must not be empty" >&2; exit 1; }
 
-# Шаг 0: синхронно получить список всех нешаблонных БД (ошибка psql сразу прерывает скрипт по set -e)
-ALL_DBS_RAW="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -At -v ON_ERROR_STOP=1 \
-    -c "SELECT datname || '|' || datallowconn FROM pg_database WHERE NOT datistemplate ORDER BY datname;")"
+# Шаг 0: до первого DDL синхронно получить список всех баз кластера (кроме штатно
+# закрытого template0), включая template1 и пользовательские шаблоны, и проверить
+# доступность каждой базы (ошибка psql сразу прерывает скрипт по set -e)
+ALL_DBS_RAW="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -At -F '|' -v ON_ERROR_STOP=1 \
+    -c "SELECT datallowconn, datname FROM pg_database WHERE NOT (datname = 'template0' AND datistemplate AND NOT datallowconn) ORDER BY datname;")"
 [[ -n "$ALL_DBS_RAW" ]] || { echo "ERROR: pg_database query returned no rows" >&2; exit 1; }
+
+CONNECTABLE_DBS=()
+while IFS='|' read -r allow db; do
+    [[ -z "$db" ]] && continue
+    if [[ "$allow" != "t" ]]; then
+        echo "ERROR: database '$db' has datallowconn=false - inspect it before applying rollback DDL" >&2
+        exit 1
+    fi
+    CONNECTABLE_DBS+=("$db")
+done <<< "$ALL_DBS_RAW"
+
+for target_db in "${MIGRATED_DBS[@]}"; do
+    found=0
+    for db in "${CONNECTABLE_DBS[@]}"; do
+        [[ "$db" == "$target_db" ]] && found=1 && break
+    done
+    if (( found == 0 )); then
+        echo "ERROR: MIGRATED_DBS entry '$target_db' not found among connectable databases" >&2
+        exit 1
+    fi
+done
 
 # Шаг 1: остановить клиентский трафик во всех мигрированных доменах и
 # применить откатный DDL к каждой целевой прикладной БД при включенном pg_xclaim.enabled = on
@@ -426,26 +450,126 @@ for db in "${MIGRATED_DBS[@]}"; do
          2>&1 | tee "/tmp/pg_xclaim_rollback_${db// /_}_$(date +%Y%m%d_%H%M%S).log"
 done
 
-# Шаг 2: убедиться по ВСЕМ нешаблонным БД кластера, что вне самого расширения pg_xclaim
-# не осталось ни одной функции/процедуры с вызовами xclaim.try / xclaim.try_many
-while IFS='|' read -r db allow; do
-    [[ -z "$db" ]] && continue
-    if [[ "$allow" != "t" ]]; then
-        echo "ERROR: database '$db' has datallowconn=false - cannot verify zero xclaim call sites" >&2
-        exit 1
-    fi
-    left="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" -X -At -v ON_ERROR_STOP=1 -c "
-        SELECT count(*)
+# Шаг 2: убедиться по ВСЕМ базам кластера (включая template1 и пользовательские шаблоны),
+# что вне самого расширения pg_xclaim не осталось исполняемых вызовов xclaim.try / try_many.
+# Проверка удаляет строчные (--) и вложенные блочные (/* ... */) комментарии с учетом кавычек,
+# сохраняя строковые литералы для EXECUTE, и выводит имена всех совпавших функций при отказе.
+for db in "${CONNECTABLE_DBS[@]}"; do
+    psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" -X -q -v ON_ERROR_STOP=1 <<'SQL'
+DO $chk$
+DECLARE
+    r record;
+    tok text;
+    parts text[];
+    cleaned text;
+    in_sq boolean;
+    sq_esc boolean;
+    prev_e boolean;
+    in_dq boolean;
+    in_lc boolean;
+    bc_depth int;
+    dq_tag text;
+    hits text[] := ARRAY[]::text[];
+BEGIN
+    FOR r IN
+        SELECT format('%I.%I(%s)', ns.nspname, p.proname, pg_get_function_identity_arguments(p.oid)) AS sig,
+               COALESCE(NULLIF(p.prosrc, ''), pg_get_function_sqlbody(p.oid), '') AS body
         FROM pg_proc p
-        JOIN pg_namespace n ON n.oid = p.pronamespace
-        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'xclaim')
+        JOIN pg_namespace ns ON ns.oid = p.pronamespace
+        JOIN pg_language l ON l.oid = p.prolang
+        WHERE ns.nspname NOT IN ('pg_catalog', 'information_schema', 'xclaim')
           AND p.prokind IN ('f', 'p')
-          AND pg_get_functiondef(p.oid) ~* 'xclaim\.(try|try_many)\s*\(';")"
-    if [[ "$left" != "0" ]]; then
-        echo "ERROR: database '$db' still has $left routine(s) calling xclaim.try/try_many - aborting disable" >&2
-        exit 1
-    fi
-done <<< "$ALL_DBS_RAW"
+          AND l.lanname NOT IN ('internal', 'c')
+          AND COALESCE(NULLIF(p.prosrc, ''), pg_get_function_sqlbody(p.oid), '') ~* 'xclaim'
+        ORDER BY 1
+    LOOP
+        parts := ARRAY[]::text[];
+        in_sq := false; sq_esc := false; prev_e := false;
+        in_dq := false; in_lc := false; bc_depth := 0; dq_tag := NULL;
+
+        FOR tok IN
+            SELECT m[1]
+            FROM regexp_matches(
+                r.body,
+                '(--|\n|/\*|\*/|''''|\\[^\n]|""|\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$|[A-Za-z_][A-Za-z0-9_$]+|[^-*/\n''"$\\A-Za-z_]+|.)',
+                'g'
+            ) AS m
+        LOOP
+            IF in_lc THEN
+                IF tok = E'\n' THEN
+                    in_lc := false;
+                    parts := array_append(parts, tok);
+                END IF;
+            ELSIF bc_depth > 0 THEN
+                IF tok = '/*' THEN
+                    bc_depth := bc_depth + 1;
+                ELSIF tok = '*/' THEN
+                    bc_depth := bc_depth - 1;
+                    IF bc_depth = 0 THEN
+                        parts := array_append(parts, ' ');
+                    END IF;
+                END IF;
+            ELSIF dq_tag IS NOT NULL THEN
+                parts := array_append(parts, tok);
+                IF tok = dq_tag THEN
+                    dq_tag := NULL;
+                END IF;
+            ELSIF in_sq THEN
+                parts := array_append(parts, tok);
+                IF tok = '''' THEN
+                    in_sq := false; sq_esc := false;
+                ELSIF NOT sq_esc AND left(tok, 1) = '\' AND right(tok, 1) = '''' THEN
+                    in_sq := false;
+                END IF;
+            ELSIF in_dq THEN
+                parts := array_append(parts, tok);
+                IF tok = '"' THEN
+                    in_dq := false;
+                END IF;
+            ELSE
+                IF tok = '--' THEN
+                    in_lc := true; prev_e := false;
+                    parts := array_append(parts, ' ');
+                ELSIF tok = '/*' THEN
+                    bc_depth := 1; prev_e := false;
+                    parts := array_append(parts, ' ');
+                ELSIF tok = '''' THEN
+                    in_sq := true; sq_esc := prev_e; prev_e := false;
+                    parts := array_append(parts, tok);
+                ELSIF tok = '''''' THEN
+                    prev_e := false;
+                    parts := array_append(parts, tok);
+                ELSIF tok = '"' THEN
+                    in_dq := true; prev_e := false;
+                    parts := array_append(parts, tok);
+                ELSIF left(tok, 1) = '$' AND right(tok, 1) = '$' AND char_length(tok) >= 2 THEN
+                    dq_tag := tok; prev_e := false;
+                    parts := array_append(parts, tok);
+                ELSE
+                    prev_e := (tok = 'E' OR tok = 'e');
+                    parts := array_append(parts, tok);
+                END IF;
+            END IF;
+        END LOOP;
+
+        IF bc_depth <> 0 OR in_sq OR in_dq OR dq_tag IS NOT NULL THEN
+            cleaned := r.body;
+        ELSE
+            cleaned := array_to_string(parts, '');
+        END IF;
+        IF cleaned ~* '"?xclaim"?\s*\.\s*"?(try|try_many)"?\s*\(' THEN
+            hits := array_append(hits, r.sig);
+        END IF;
+    END LOOP;
+
+    IF cardinality(hits) > 0 THEN
+        RAISE EXCEPTION 'database % still has % routine(s) calling xclaim.try/try_many: %',
+            current_database(), cardinality(hits), array_to_string(hits, ', ');
+    END IF;
+END;
+$chk$;
+SQL
+done
 
 # Шаг 3 (только после подтвержденного отсутствия вызовов во ВСЕХ базах): выключить pg_xclaim.enabled
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
@@ -454,7 +578,7 @@ psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
      -c "SELECT pg_reload_conf()"
 ```
 
-После полного отката всех доменов во всех базах клиентский трафик возвращается на advisory-блокировки, а `pg_xclaim.enabled = off` предотвращает случайные новые захваты до вывода библиотеки в Level 3.
+Если в прикладных функциях встречаются неквалифицированные вызовы `try(...)` / `try_many(...)` через `SET search_path = xclaim`, дополнительно сверьте их с утвержденным перечнем откатного DDL. После полного отката всех доменов во всех базах клиентский трафик возвращается на advisory-блокировки, а `pg_xclaim.enabled = off` предотвращает случайные новые захваты до вывода библиотеки в Level 3.
 
 ### 5.3 Level 3 - полный откат (требуется restart)
 

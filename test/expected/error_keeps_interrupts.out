@@ -11,9 +11,10 @@
 -- temp_file_limit = 0 and a small work_mem, a large result fails with an
 -- ERROR (SQLSTATE 53400) while the tuplestore spills to disk, with no
 -- partition LWLock held. Only the SQLSTATE is printed: the message text
--- differs between major versions. The PG_CATCH of xclaim.try_many, which
--- releases a held partition LWLock, is checked by
--- test/capacity/sql/cap_bulk_rollback.sql and test/concurrency/hook_error_paths.sh.
+-- differs between major versions. The PG_CATCH of xclaim.try around
+-- LWLockAcquire is checked by test/concurrency/hook_error_paths.sh, and
+-- xclaim.try_many PG_CATCH rollback is checked by
+-- test/capacity/sql/cap_bulk_rollback.sql.
 \set VERBOSITY terse
 CREATE EXTENSION IF NOT EXISTS pg_xclaim;
 NOTICE:  extension "pg_xclaim" already exists, skipping

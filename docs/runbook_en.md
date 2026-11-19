@@ -134,57 +134,6 @@ and function ACLs will be reset (see `docs/postgrespro-docker-acl-patch.md`
 for the update-only patch). Per-version changes are listed in
 `CHANGELOG.md`.
 
-### 2.2 PostgreSQL major-version upgrades (`pg_upgrade`)
-
-Release `1.0.0-rc5` removes the test-only `xclaim.debug_inject_stale(int4,
-int4)` function and its `xclaim_debug_inject_stale` C symbol from
-`pg_xclaim.so`. Because `pg_upgrade --check` verifies shared library
-filenames (`$libdir/pg_xclaim`) rather than individual C symbols, while
-`pg_upgrade` (`pg_dump --binary-upgrade`) replays every `CREATE FUNCTION`
-still present in the old cluster's `pg_proc` catalog, combining an upgrade
-from `1.0.0-rc1..rc4` to `1.0.0-rc5` with `pg_upgrade` in a single step
-fails during schema restore with `could not find function
-"xclaim_debug_inject_stale"`.
-
-Required sequence before running `pg_upgrade` onto a new PostgreSQL major
-with `pg_xclaim >= 1.0.0-rc5`:
-
-1. Install `pg_xclaim 1.0.0-rc5` on the **current (old)** PostgreSQL major
-   and restart PostgreSQL.
-2. Run `ALTER EXTENSION pg_xclaim UPDATE TO '1.0.0-rc5';` in every
-   database of the old cluster where `pg_xclaim` is installed.
-3. Verify across all non-template databases of the old cluster that no
-   older `extversion` or `xclaim_debug_inject_stale` symbol reference
-   remains:
-
-```bash
-set -euo pipefail
-PGHOST=...; PGPORT=...; PGUSER=postgres
-
-DBS_RAW="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -At -v ON_ERROR_STOP=1 \
-    -c "SELECT datname || '|' || datallowconn FROM pg_database WHERE NOT datistemplate ORDER BY datname;")"
-[[ -n "$DBS_RAW" ]] || { echo "ERROR: empty database list" >&2; exit 1; }
-
-while IFS='|' read -r db allow; do
-    [[ -z "$db" ]] && continue
-    if [[ "$allow" != "t" ]]; then
-        echo "ERROR: database '$db' has datallowconn=false - inspect and update it before pg_upgrade" >&2
-        exit 1
-    fi
-    state="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" -X -At -v ON_ERROR_STOP=1 -c "
-        SELECT COALESCE((SELECT extversion FROM pg_extension WHERE extname = 'pg_xclaim'), 'absent')
-               || '|' ||
-               (SELECT count(*) FROM pg_proc WHERE probin = '\$libdir/pg_xclaim' AND prosrc = 'xclaim_debug_inject_stale');")"
-    if [[ "$state" != "absent|0" && "$state" != "1.0.0-rc5|0" ]]; then
-        echo "ERROR: database '$db' is not ready for pg_upgrade (extversion|stale_sym = $state)" >&2
-        exit 1
-    fi
-done <<< "$DBS_RAW"
-```
-
-4. Only after this preflight passes, stop the old cluster and run
-   `pg_upgrade` onto the new PostgreSQL major with `pg_xclaim 1.0.0-rc5`.
-
 ### 2.1 Apply per-site rewrite DDL
 
 Replacing `pg_try_advisory_xact_lock(...)` with `xclaim.try(...)` is
@@ -235,6 +184,59 @@ should follow:
 Run it across every database in the cluster that uses the extension
 (`SELECT datname FROM pg_database WHERE datistemplate = false`),
 excluding `postgres` and system DBs.
+
+### 2.2 PostgreSQL major-version upgrades (`pg_upgrade`)
+
+Release `1.0.0-rc5` removes the test-only `xclaim.debug_inject_stale(int4,
+int4)` function and its `xclaim_debug_inject_stale` C symbol from
+`pg_xclaim.so`. Because `pg_upgrade --check` verifies shared library
+filenames (`$libdir/pg_xclaim`) rather than individual C symbols, while
+`pg_upgrade` (`pg_dump --binary-upgrade`) replays every `CREATE FUNCTION`
+still present in the old cluster's `pg_proc` catalog across all upgraded
+databases including `template1` and custom templates, combining an upgrade
+from `1.0.0-rc1..rc4` to `1.0.0-rc5` with `pg_upgrade` in a single step
+fails during schema restore with `could not find function
+"xclaim_debug_inject_stale"`.
+
+Required sequence before running `pg_upgrade` onto a new PostgreSQL major
+with `pg_xclaim >= 1.0.0-rc5`:
+
+1. Install `pg_xclaim 1.0.0-rc5` on the **current (old)** PostgreSQL major
+   and restart PostgreSQL.
+2. Run `ALTER EXTENSION pg_xclaim UPDATE TO '1.0.0-rc5';` in every
+   database of the old cluster where `pg_xclaim` is installed (including
+   `template1` and any custom templates if the extension was installed
+   there).
+3. Verify across all databases of the old cluster (except standard
+   unconnectable `template0`) that no older `extversion` or
+   `xclaim_debug_inject_stale` symbol reference remains:
+
+```bash
+set -euo pipefail
+PGHOST=...; PGPORT=...; PGUSER=postgres
+
+DBS_RAW="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -At -F '|' -v ON_ERROR_STOP=1 \
+    -c "SELECT datallowconn, datname FROM pg_database WHERE NOT (datname = 'template0' AND datistemplate AND NOT datallowconn) ORDER BY datname;")"
+[[ -n "$DBS_RAW" ]] || { echo "ERROR: empty database list" >&2; exit 1; }
+
+while IFS='|' read -r allow db; do
+    [[ -z "$db" ]] && continue
+    if [[ "$allow" != "t" ]]; then
+        echo "ERROR: database '$db' has datallowconn=false - inspect and update it before pg_upgrade" >&2
+        exit 1
+    fi
+    state="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" -X -At -F '|' -v ON_ERROR_STOP=1 -c "
+        SELECT COALESCE((SELECT extversion FROM pg_extension WHERE extname = 'pg_xclaim'), 'absent'),
+               (SELECT count(*) FROM pg_proc WHERE probin = '\$libdir/pg_xclaim' AND prosrc = 'xclaim_debug_inject_stale');")"
+    if [[ "$state" != "absent|0" && "$state" != "1.0.0-rc5|0" ]]; then
+        echo "ERROR: database '$db' is not ready for pg_upgrade (extversion|stale_sym = $state)" >&2
+        exit 1
+    fi
+done <<< "$DBS_RAW"
+```
+
+4. Only after this preflight passes, stop the old cluster and run
+   `pg_upgrade` onto the new PostgreSQL major with `pg_xclaim 1.0.0-rc5`.
 
 ---
 
@@ -401,10 +403,33 @@ MIGRATED_DBS=(app_db)
 
 (( ${#MIGRATED_DBS[@]} > 0 )) || { echo "ERROR: MIGRATED_DBS must not be empty" >&2; exit 1; }
 
-# Step 0: synchronously fetch all non-template databases (a psql failure aborts immediately under set -e)
-ALL_DBS_RAW="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -At -v ON_ERROR_STOP=1 \
-    -c "SELECT datname || '|' || datallowconn FROM pg_database WHERE NOT datistemplate ORDER BY datname;")"
+# Step 0: before running any DDL, synchronously fetch all cluster databases (except
+# standard unconnectable template0), including template1 and custom templates, and
+# confirm every database is connectable (a psql failure aborts immediately under set -e)
+ALL_DBS_RAW="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -At -F '|' -v ON_ERROR_STOP=1 \
+    -c "SELECT datallowconn, datname FROM pg_database WHERE NOT (datname = 'template0' AND datistemplate AND NOT datallowconn) ORDER BY datname;")"
 [[ -n "$ALL_DBS_RAW" ]] || { echo "ERROR: pg_database query returned no rows" >&2; exit 1; }
+
+CONNECTABLE_DBS=()
+while IFS='|' read -r allow db; do
+    [[ -z "$db" ]] && continue
+    if [[ "$allow" != "t" ]]; then
+        echo "ERROR: database '$db' has datallowconn=false - inspect it before applying rollback DDL" >&2
+        exit 1
+    fi
+    CONNECTABLE_DBS+=("$db")
+done <<< "$ALL_DBS_RAW"
+
+for target_db in "${MIGRATED_DBS[@]}"; do
+    found=0
+    for db in "${CONNECTABLE_DBS[@]}"; do
+        [[ "$db" == "$target_db" ]] && found=1 && break
+    done
+    if (( found == 0 )); then
+        echo "ERROR: MIGRATED_DBS entry '$target_db' not found among connectable databases" >&2
+        exit 1
+    fi
+done
 
 # Step 1: stop user traffic across all migrated domains and apply rollback DDL
 # to each target application database while pg_xclaim.enabled remains on (so a
@@ -416,35 +441,136 @@ for db in "${MIGRATED_DBS[@]}"; do
          2>&1 | tee "/tmp/pg_xclaim_rollback_${db// /_}_$(date +%Y%m%d_%H%M%S).log"
 done
 
-# Step 2: verify across ALL non-template databases in the cluster that zero user
-# functions/procedures outside the xclaim extension still call xclaim.try / xclaim.try_many
-while IFS='|' read -r db allow; do
-    [[ -z "$db" ]] && continue
-    if [[ "$allow" != "t" ]]; then
-        echo "ERROR: database '$db' has datallowconn=false - cannot verify zero xclaim call sites" >&2
-        exit 1
-    fi
-    left="$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" -X -At -v ON_ERROR_STOP=1 -c "
-        SELECT count(*)
+# Step 2: verify across ALL cluster databases (including template1 and custom templates)
+# that zero user routines outside the xclaim extension still contain executable calls to
+# xclaim.try / xclaim.try_many. Line (--) and nested block (/* ... */) comments are
+# stripped with quote awareness while keeping string literals for dynamic EXECUTE, and
+# any offending routine signatures are listed in the error message.
+for db in "${CONNECTABLE_DBS[@]}"; do
+    psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$db" -X -q -v ON_ERROR_STOP=1 <<'SQL'
+DO $chk$
+DECLARE
+    r record;
+    tok text;
+    parts text[];
+    cleaned text;
+    in_sq boolean;
+    sq_esc boolean;
+    prev_e boolean;
+    in_dq boolean;
+    in_lc boolean;
+    bc_depth int;
+    dq_tag text;
+    hits text[] := ARRAY[]::text[];
+BEGIN
+    FOR r IN
+        SELECT format('%I.%I(%s)', ns.nspname, p.proname, pg_get_function_identity_arguments(p.oid)) AS sig,
+               COALESCE(NULLIF(p.prosrc, ''), pg_get_function_sqlbody(p.oid), '') AS body
         FROM pg_proc p
-        JOIN pg_namespace n ON n.oid = p.pronamespace
-        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'xclaim')
+        JOIN pg_namespace ns ON ns.oid = p.pronamespace
+        JOIN pg_language l ON l.oid = p.prolang
+        WHERE ns.nspname NOT IN ('pg_catalog', 'information_schema', 'xclaim')
           AND p.prokind IN ('f', 'p')
-          AND pg_get_functiondef(p.oid) ~* 'xclaim\.(try|try_many)\s*\(';")"
-    if [[ "$left" != "0" ]]; then
-        echo "ERROR: database '$db' still has $left routine(s) calling xclaim.try/try_many - aborting disable" >&2
-        exit 1
-    fi
-done <<< "$ALL_DBS_RAW"
+          AND l.lanname NOT IN ('internal', 'c')
+          AND COALESCE(NULLIF(p.prosrc, ''), pg_get_function_sqlbody(p.oid), '') ~* 'xclaim'
+        ORDER BY 1
+    LOOP
+        parts := ARRAY[]::text[];
+        in_sq := false; sq_esc := false; prev_e := false;
+        in_dq := false; in_lc := false; bc_depth := 0; dq_tag := NULL;
 
-# Step 3 (ONLY after zero xclaim call sites are confirmed across EVERY database): set pg_xclaim.enabled = off
+        FOR tok IN
+            SELECT m[1]
+            FROM regexp_matches(
+                r.body,
+                '(--|\n|/\*|\*/|''''|\\[^\n]|""|\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$|[A-Za-z_][A-Za-z0-9_$]+|[^-*/\n''"$\\A-Za-z_]+|.)',
+                'g'
+            ) AS m
+        LOOP
+            IF in_lc THEN
+                IF tok = E'\n' THEN
+                    in_lc := false;
+                    parts := array_append(parts, tok);
+                END IF;
+            ELSIF bc_depth > 0 THEN
+                IF tok = '/*' THEN
+                    bc_depth := bc_depth + 1;
+                ELSIF tok = '*/' THEN
+                    bc_depth := bc_depth - 1;
+                    IF bc_depth = 0 THEN
+                        parts := array_append(parts, ' ');
+                    END IF;
+                END IF;
+            ELSIF dq_tag IS NOT NULL THEN
+                parts := array_append(parts, tok);
+                IF tok = dq_tag THEN
+                    dq_tag := NULL;
+                END IF;
+            ELSIF in_sq THEN
+                parts := array_append(parts, tok);
+                IF tok = '''' THEN
+                    in_sq := false; sq_esc := false;
+                ELSIF NOT sq_esc AND left(tok, 1) = '\' AND right(tok, 1) = '''' THEN
+                    in_sq := false;
+                END IF;
+            ELSIF in_dq THEN
+                parts := array_append(parts, tok);
+                IF tok = '"' THEN
+                    in_dq := false;
+                END IF;
+            ELSE
+                IF tok = '--' THEN
+                    in_lc := true; prev_e := false;
+                    parts := array_append(parts, ' ');
+                ELSIF tok = '/*' THEN
+                    bc_depth := 1; prev_e := false;
+                    parts := array_append(parts, ' ');
+                ELSIF tok = '''' THEN
+                    in_sq := true; sq_esc := prev_e; prev_e := false;
+                    parts := array_append(parts, tok);
+                ELSIF tok = '''''' THEN
+                    prev_e := false;
+                    parts := array_append(parts, tok);
+                ELSIF tok = '"' THEN
+                    in_dq := true; prev_e := false;
+                    parts := array_append(parts, tok);
+                ELSIF left(tok, 1) = '$' AND right(tok, 1) = '$' AND char_length(tok) >= 2 THEN
+                    dq_tag := tok; prev_e := false;
+                    parts := array_append(parts, tok);
+                ELSE
+                    prev_e := (tok = 'E' OR tok = 'e');
+                    parts := array_append(parts, tok);
+                END IF;
+            END IF;
+        END LOOP;
+
+        IF bc_depth <> 0 OR in_sq OR in_dq OR dq_tag IS NOT NULL THEN
+            cleaned := r.body;
+        ELSE
+            cleaned := array_to_string(parts, '');
+        END IF;
+        IF cleaned ~* '"?xclaim"?\s*\.\s*"?(try|try_many)"?\s*\(' THEN
+            hits := array_append(hits, r.sig);
+        END IF;
+    END LOOP;
+
+    IF cardinality(hits) > 0 THEN
+        RAISE EXCEPTION 'database % still has % routine(s) calling xclaim.try/try_many: %',
+            current_database(), cardinality(hits), array_to_string(hits, ', ');
+    END IF;
+END;
+$chk$;
+SQL
+done
+
+# Step 3 (ONLY after zero executable xclaim calls are confirmed across EVERY database): set pg_xclaim.enabled = off
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
      -v ON_ERROR_STOP=1 \
      -c "ALTER SYSTEM SET pg_xclaim.enabled = off" \
      -c "SELECT pg_reload_conf()"
 ```
 
-After all domains in every database have rolled back to advisory locks without errors, resume user traffic. `pg_xclaim.enabled = off` prevents accidental claim acquisitions until the library is removed in Level 3.
+If any application routine invokes unqualified `try(...)` / `try_many(...)` via `SET search_path = xclaim`, verify those sites against your approved rollback DDL list as well. After all domains in every database have rolled back to advisory locks without errors, resume user traffic. `pg_xclaim.enabled = off` prevents accidental claim acquisitions until the library is removed in Level 3.
 
 ### 5.3 Level 3 -- Full rollback (restart required)
 
